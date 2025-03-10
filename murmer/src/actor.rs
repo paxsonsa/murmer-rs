@@ -1,6 +1,8 @@
 //! Core actor traits and types for the actor system.
+use crate::context::Context;
 
 use super::message::Message;
+pub use async_trait::async_trait;
 
 /// Errors that can occur during actor operations
 #[derive(thiserror::Error, Debug)]
@@ -20,18 +22,19 @@ pub enum ActorError {
 /// - Maintain private state
 /// - Can send messages to other actors
 /// - Have a lifecycle managed by the system
+#[async_trait]
 pub trait Actor: Unpin + Sized + Send + 'static {
     /// Called when the actor is started but before it begins processing messages.
     /// Use this to perform any initialization.
-    fn started(&mut self, _ctx: &mut Context) {}
+    async fn started(&mut self, _ctx: &mut Context<Self>) {}
 
     /// Called when the actor is about to be shut down, before processing remaining messages.
     /// Use this to prepare for shutdown.
-    fn stopping(&mut self, _ctx: &mut Context) {}
+    async fn stopping(&mut self, _ctx: &mut Context<Self>) {}
 
     /// Called after the actor has been shut down and finished processing messages.
     /// Use this for final cleanup.
-    fn stopped(&mut self, _ctx: &mut Context) {}
+    async fn stopped(&mut self, _ctx: &mut Context<Self>) {}
 }
 
 /// A trait for handling specific message types.
@@ -44,14 +47,5 @@ where
     M: Message,
 {
     /// Handle a message of type M and return a result of type M::Result
-    fn handle(&mut self, ctx: &mut Context, message: M) -> M::Result;
+    fn handle(&mut self, ctx: &mut Context<Self>, message: M) -> M::Result;
 }
-
-/// Provides context and capabilities to actors during message handling.
-///
-/// The context gives actors access to:
-/// - Their own address for self-messaging
-/// - The actor system
-/// - Other runtime capabilities
-#[derive(Default)]
-pub struct Context {}

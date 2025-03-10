@@ -14,7 +14,7 @@ impl Actor for FakeActor {}
 async fn test_receptionist_lifecycle() {
     let mut receptionist = ReceptionistActor::default();
     let actor = FakeActor;
-    let context = Context {};
+    let context = Context::new();
 
     let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
     let actor = Arc::new(Mutex::new(actor));
@@ -28,7 +28,7 @@ async fn test_receptionist_lifecycle() {
         endpoint: endpoint.clone(),
     };
 
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     let _ = receptionist.handle(&mut ctx, message);
 
     let message = Lookup { key: key.clone() };
@@ -57,7 +57,7 @@ async fn test_receptionist_lifecycle() {
 async fn test_receptionist_subscription() {
     let mut receptionist = ReceptionistActor::default();
     let actor = FakeActor;
-    let context = Context {};
+    let context = Context::new();
 
     let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
     let actor = Arc::new(Mutex::new(actor));
@@ -72,13 +72,13 @@ async fn test_receptionist_subscription() {
         endpoint: endpoint.clone(),
     };
 
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     let _ = receptionist.handle(&mut ctx, message);
 
     // Create a subscription to the key
     let message = Subscribe { key: key.clone() };
 
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     let mut listing = receptionist
         .handle(&mut ctx, message)
         .expect("subscribe failed");
@@ -92,7 +92,7 @@ async fn test_receptionist_subscription() {
 
     // Register another actor to the receptionist
     let actor = FakeActor;
-    let context = Context {};
+    let context = Context::new();
 
     let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
     let actor = Arc::new(Mutex::new(actor));
@@ -106,7 +106,7 @@ async fn test_receptionist_subscription() {
         key: key.clone(),
         endpoint: endpoint.clone(),
     };
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     let _ = receptionist.handle(&mut ctx, message);
 
     // Expect to receive the next registered update
@@ -121,7 +121,7 @@ async fn test_receptionist_subscription() {
 async fn test_receptionist_subscription_stream() {
     let mut receptionist = ReceptionistActor::default();
     let actor = FakeActor;
-    let context = Context {};
+    let context = Context::new();
 
     let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
     let actor = Arc::new(Mutex::new(actor));
@@ -135,20 +135,20 @@ async fn test_receptionist_subscription_stream() {
         key: key.clone(),
         endpoint: endpoint_a.clone(),
     };
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     let _ = receptionist.handle(&mut ctx, message);
 
     // Create a subscription to the key
     let message = Subscribe { key: key.clone() };
 
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     let mut listing = receptionist
         .handle(&mut ctx, message)
         .expect("subscribe failed");
 
     // Register another actor to the receptionist
     let actor = FakeActor;
-    let context = Context {};
+    let context = Context::new();
 
     let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
     let actor = Arc::new(Mutex::new(actor));
@@ -162,14 +162,14 @@ async fn test_receptionist_subscription_stream() {
         key: key.clone(),
         endpoint: endpoint_b.clone(),
     };
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     let _ = receptionist.handle(&mut ctx, message);
 
     let message = Deregister {
         key: key.clone(),
         endpoint: endpoint_b.clone(),
     };
-    let mut ctx = Context {};
+    let mut ctx = Context::new();
     receptionist
         .handle(&mut ctx, message)
         .then_some(())

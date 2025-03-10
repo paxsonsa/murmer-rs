@@ -1,5 +1,7 @@
 //! Message traits and envelope types for actor communication.
 
+use crate::context::Context;
+
 use super::actor::*;
 use tokio::sync::oneshot;
 
@@ -14,7 +16,7 @@ pub trait Message: Send + 'static {
 }
 
 pub trait EnvelopeProxy<A: Actor>: Send {
-    fn handle(&mut self, ctx: &mut Context, actor: &mut A);
+    fn handle(&mut self, ctx: &mut Context<A>, actor: &mut A);
 }
 
 pub struct Envelope<A: Actor>(pub Box<dyn EnvelopeProxy<A> + Send>);
@@ -42,7 +44,7 @@ where
     A: Actor + Handler<M>,
     M: Message,
 {
-    fn handle(&mut self, ctx: &mut Context, actor: &mut A) {
+    fn handle(&mut self, ctx: &mut Context<A>, actor: &mut A) {
         let Some(tx) = self.tx.take() else {
             return;
         };

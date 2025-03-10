@@ -9,7 +9,6 @@ use parking_lot::RwLock;
 use std::any::{Any, TypeId};
 use std::fmt::Debug;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, sync::atomic::AtomicUsize};
@@ -18,7 +17,10 @@ use tokio::{
     task_local,
 };
 
+use crate::context::Context;
+
 use super::actor::*;
+use super::cluster;
 use super::id::Id;
 use super::mailbox::*;
 use super::message::*;
@@ -39,6 +41,10 @@ pub enum SystemError {
     /// Indicates a failure to spawn a new actor
     #[error("Failed to spawn actor")]
     SpawnError,
+
+    /// Indicates some cluster-related error
+    #[error("Cluster error: {0}")]
+    ClusterError(#[from] cluster::ClusterError),
 }
 
 /// Internal trait for actor supervisors
@@ -63,19 +69,16 @@ trait SystemSupervisor: Send + Sync {
 struct SystemContext {
     /// Unique identifier for this system instance
     id: SystemId,
-    /// Configuration options for the actor system
-    config: Config,
     /// Registry of all active actor supervisors
     supervisors: HashMap<Arc<Id>, Box<dyn SystemSupervisor>>,
 }
 
 impl SystemContext {
     /// Creates a new system context with a unique system ID
-    fn new(config: Config) -> Self {
+    fn new() -> Self {
         let id = NEXT_SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self {
             id,
-            config,
             supervisors: HashMap::new(),
         }
     }
@@ -109,15 +112,9 @@ impl SystemContext {
 /// including locally.
 ///
 #[derive(Clone)]
-enum Config {
-    Local {
-        name: String,
-    },
-    Clustered {
-        name: String,
-        addrs: Vec<SocketAddr>,
-        peers: Vec<SocketAddr>,
-    },
+enum Mode {
+    Local { name: String },
+    Clustered(cluster::Cluster),
 }
 
 /// The actor system that manages actor lifecycles and message delivery.
@@ -137,15 +134,17 @@ enum Config {
 /// actor.send(MyMessage).await?;
 /// ```
 #[derive(Clone)]
-pub struct System {
-    /// Thread-safe shared system context.
-    context: Arc<RwLock<SystemContext>>,
-
-    /// Configuration options for the actor system
-    config: Config,
-
-    /// Handle to the systems receptionist actor
-    receptionist: Receptionist,
+pub enum System {
+    Local {
+        name: String,
+        context: Arc<RwLock<SystemContext>>,
+        receptionist: Receptionist,
+    },
+    Clustered {
+        cluster: cluster::Cluster,
+        context: Arc<RwLock<SystemContext>>,
+        receptionist: Receptionist,
+    },
 }
 
 impl System {
@@ -158,49 +157,57 @@ impl System {
     }
 
     pub fn local<S: AsRef<str> + Into<String>>(name: S) -> Self {
-        let config = Config::Local { name: name.into() };
-        Self::new(config)
-    }
-
-    pub fn clustered<S: AsRef<str> + Into<String>>(
-        name: S,
-        addrs: Vec<SocketAddr>,
-        peers: Vec<SocketAddr>,
-    ) -> Self {
-        let config = Config::Clustered {
-            name: name.into(),
-            addrs,
-            peers,
-        };
-        Self::new(config)
-    }
-
-    fn new(config: Config) -> Self {
-        // Create a receptionist stack for the system.
         let actor = ReceptionistActor::default();
-        let supervisor = Supervisor::construct(actor);
-        let receptionist = Receptionist::new(supervisor.endpoint());
+        let receptionist_supervisor = Supervisor::construct(actor);
+        let receptionist = Receptionist::new(receptionist_supervisor.endpoint());
 
         // Create the system context and system handle
-        let context = Arc::new(RwLock::new(SystemContext::new(config.clone())));
-        let system = Self {
+        let context = Arc::new(RwLock::new(SystemContext::new()));
+
+        Self::Local {
+            name: name.into(),
             context,
-            config,
+            receptionist,
+        }
+    }
+
+    pub fn clustered(config: cluster::Config) -> Result<Self, SystemError> {
+        let actor = cluster::ClusterActor::new(config)?;
+        let cluster_supervisor = Supervisor::construct(actor);
+        let cluster = cluster::Cluster::new(cluster_supervisor.endpoint());
+
+        // Create a receptionist stack for the system.
+        let actor = ReceptionistActor::default();
+        let receptionist_supervisor = Supervisor::construct(actor);
+        let receptionist = Receptionist::new(receptionist_supervisor.endpoint());
+
+        // Create the system context and system handle
+        let context = Arc::new(RwLock::new(SystemContext::new()));
+
+        let system = System::Clustered {
+            cluster,
+            context,
             receptionist,
         };
 
-        // Start the systems actors within the system:
-        supervisor.start_within(system.clone());
+        receptionist_supervisor.start_within(system.clone());
+        cluster_supervisor.start_within(system.clone());
 
-        system
-    }
-
-    pub fn id(&self) -> SystemId {
-        self.context.read().id()
+        Ok(system)
     }
 
     pub fn receptionist(&self) -> &Receptionist {
-        &self.receptionist
+        match self {
+            Self::Local { receptionist, .. } => receptionist,
+            Self::Clustered { receptionist, .. } => receptionist,
+        }
+    }
+
+    pub fn id(&self) -> SystemId {
+        match self {
+            Self::Local { context, .. } => context.read().id(),
+            Self::Clustered { context, .. } => context.read().id(),
+        }
     }
 
     pub fn spawn<A: Actor + Default>(&self) -> Result<Endpoint<A>, SystemError> {
@@ -215,8 +222,18 @@ impl System {
     }
 
     pub fn shutdown(&mut self) {
-        let mut context = self.context.write();
+        let mut context = match self {
+            Self::Local { context, .. } => context.write(),
+            Self::Clustered { context, .. } => context.write(),
+        };
         context.shutdown();
+    }
+
+    fn context(&self) -> &Arc<RwLock<SystemContext>> {
+        match self {
+            Self::Local { context, .. } => context,
+            Self::Clustered { context, .. } => context,
+        }
     }
 }
 
@@ -240,7 +257,6 @@ where
     A: Actor,
 {
     actor: A,
-    ctx: Context,
     mailbox: PrioritizedMailbox<SupervisorCommand<A>>,
 }
 
@@ -248,28 +264,29 @@ impl<A> SupervisorRuntime<A>
 where
     A: Actor,
 {
-    fn handle_command(&mut self, cmd: SupervisorCommand<A>) -> bool {
+    async fn handle_command(&mut self, ctx: &mut Context<A>, cmd: SupervisorCommand<A>) -> bool {
         match cmd {
             SupervisorCommand::Envelope(envelope) => {
                 let mut handler = envelope.0;
-                handler.handle(&mut self.ctx, &mut self.actor);
+                handler.handle(ctx, &mut self.actor);
                 true
             }
             SupervisorCommand::Shutdown => {
-                self.actor.stopping(&mut self.ctx);
+                self.actor.stopping(ctx);
                 false
             }
         }
     }
 
     async fn run(mut self, _id: Arc<Id>) {
-        self.actor.started(&mut self.ctx);
+        let mut ctx = Context::new();
+        self.actor.started(&mut ctx);
         while let Some(cmd) = self.mailbox.recv().await {
-            if !self.handle_command(cmd) {
+            if !self.handle_command(&mut ctx, cmd).await {
                 break;
             }
         }
-        self.actor.stopped(&mut self.ctx);
+        self.actor.stopped(&mut ctx);
     }
 }
 
@@ -334,7 +351,6 @@ where
         let id = Id::new();
         let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
         let runtime = SupervisorRuntime {
-            ctx: Context {},
             actor,
             mailbox: PrioritizedMailbox::new(rx),
         };
@@ -355,7 +371,7 @@ where
         let runtime = self.state.runtime;
 
         system
-            .context
+            .context()
             .write()
             .register(id.clone(), supervisor.clone());
         tokio::spawn(async move {
@@ -412,7 +428,7 @@ impl<A: Actor> Endpoint<A> {
     pub fn direct(
         path: Arc<ActorPath>,
         actor: Arc<parking_lot::Mutex<A>>,
-        ctx: Arc<parking_lot::Mutex<Context>>,
+        ctx: Arc<parking_lot::Mutex<Context<A>>>,
     ) -> Self {
         let sender = EndpointSender::new_direct(ctx, actor);
         Self { sender, path }
@@ -420,6 +436,14 @@ impl<A: Actor> Endpoint<A> {
 
     pub fn path(&self) -> &ActorPath {
         &self.path
+    }
+
+    pub async fn background_send<M>(&self, message: M) -> Result<(), ActorError>
+    where
+        M: Message + 'static,
+        A: Handler<M>,
+    {
+        self.sender.background_send(message)
     }
 
     pub async fn send<M>(&self, message: M) -> Result<M::Result, ActorError>
@@ -546,7 +570,7 @@ impl<A: Actor> EndpointSender<A> {
     /// and cannot be used in production code.
     #[cfg(test)]
     fn new_direct(
-        ctx: Arc<parking_lot::Mutex<Context>>,
+        ctx: Arc<parking_lot::Mutex<Context<A>>>,
         actor: Arc<parking_lot::Mutex<A>>,
     ) -> Self {
         let send_fn = Box::new(move |mut envelope: Envelope<A>| {
@@ -560,6 +584,19 @@ impl<A: Actor> EndpointSender<A> {
         Self {
             send_fn: Arc::new(send_fn),
         }
+    }
+
+    /// Sends a message to the actor without waiting for a response
+    pub fn background_send<M>(&self, msg: M) -> Result<(), ActorError>
+    where
+        M: Message + 'static,
+        A: Handler<M>,
+    {
+        let (tx, _) = oneshot::channel();
+        let envelope = Envelope::new(msg, tx);
+        let fut = (self.send_fn)(envelope);
+        tokio::spawn(fut);
+        Ok(())
     }
 
     pub async fn send<M>(&self, msg: M) -> Result<M::Result, ActorError>

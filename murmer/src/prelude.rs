@@ -4,11 +4,17 @@
 //! Import this module to get started with the basic actor functionality.
 
 pub use super::actor::{
-    Actor,      // Core actor trait
-    ActorError, // Error types for actor operations
-    Context,    // Execution context for actors
-    Handler,    // Message handling trait
+    async_trait, // Async trait macro
+    Actor,       // Core actor trait
+    ActorError,  // Error types for actor operations
+    Handler,     // Message handling trait
 };
+pub use super::cluster::{
+    ClusterActor,            // Cluster management
+    Config as ClusterConfig, // Cluster configuration
+    Name,                    // Node identifier
+};
+pub use super::context::Context; // Actor context for message handling
 pub use super::id::Id; // An identifier type used for actors and other unique entities.
 pub use super::message::Message; // Message trait for actor communication
 pub use super::path::*;

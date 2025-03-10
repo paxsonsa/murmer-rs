@@ -11,13 +11,16 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use crate::actor::{Actor, ActorError, Context, Handler};
 use crate::message::Message;
 use crate::system::{AnyEndpoint, Endpoint};
+use crate::{
+    actor::{Actor, ActorError, Handler},
+    context::Context,
+};
 
 #[cfg(test)]
-#[path = "receptionist_test.rs"]
-mod receptionist_test;
+#[path = "receptionist.test.rs"]
+mod tests;
 
 /// A type-safe key used for registering and looking up actors
 ///
@@ -268,7 +271,7 @@ impl<T: Actor> Message for Register<T> {
 }
 
 impl<T: Actor> Handler<Register<T>> for ReceptionistActor {
-    fn handle(&mut self, _ctx: &mut Context, msg: Register<T>) -> bool {
+    fn handle(&mut self, _ctx: &mut Context<Self>, msg: Register<T>) -> bool {
         let type_id = TypeId::of::<T>();
         let key = msg.key.id;
         let registration = Registration {
@@ -307,7 +310,7 @@ impl<T: Actor> Message for Deregister<T> {
 }
 
 impl<T: Actor> Handler<Deregister<T>> for ReceptionistActor {
-    fn handle(&mut self, _ctx: &mut Context, msg: Deregister<T>) -> bool {
+    fn handle(&mut self, _ctx: &mut Context<Self>, msg: Deregister<T>) -> bool {
         let type_id = TypeId::of::<T>();
         let key = msg.key.id;
 
@@ -340,7 +343,7 @@ impl<T: Actor> Handler<Deregister<T>> for ReceptionistActor {
     }
 }
 impl<T: Actor> Handler<Lookup<T>> for ReceptionistActor {
-    fn handle(&mut self, _: &mut Context, msg: Lookup<T>) -> Option<Listing<T>> {
+    fn handle(&mut self, _: &mut Context<Self>, msg: Lookup<T>) -> Option<Listing<T>> {
         let type_id = TypeId::of::<T>();
         let key = msg.key;
 
@@ -376,7 +379,11 @@ impl<T: Actor> Handler<Lookup<T>> for ReceptionistActor {
 }
 
 impl<T: Actor> Handler<Subscribe<T>> for ReceptionistActor {
-    fn handle(&mut self, _: &mut Context, msg: Subscribe<T>) -> Option<ListingSubscription<T>> {
+    fn handle(
+        &mut self,
+        _: &mut Context<Self>,
+        msg: Subscribe<T>,
+    ) -> Option<ListingSubscription<T>> {
         let type_id = TypeId::of::<T>();
         let key = msg.key.clone();
 

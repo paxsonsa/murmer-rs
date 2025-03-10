@@ -1,16 +1,26 @@
 mod actor;
+mod cluster;
+mod context;
+mod id;
 mod mailbox;
+mod membership;
 mod message;
 mod path;
 pub mod prelude;
 mod receptionist;
 mod system;
-mod id;
+mod tls;
+
+// TODO: Add clustering functionality for both local and remote actors
+// TODO: Implement receptionist auto register traits for actors
+// TODO: Add shutdown/restart functionality to actors.
+// TODO: Create macro system for defining actors and messages.
 
 #[cfg(test)]
 mod tests {
     use crate::receptionist::Key;
     use crate::system::SystemId;
+    use crate::tls::TlsConfig;
 
     use super::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,7 +45,7 @@ mod tests {
     }
 
     struct MyActor {
-        on_handle: Box<dyn FnMut(&mut Context, MyMessage) -> () + Send>,
+        on_handle: Box<dyn FnMut(&mut Context<Self>, MyMessage) -> () + Send>,
     }
 
     impl Actor for MyActor {}
@@ -51,7 +61,7 @@ mod tests {
     impl MyActor {
         fn new<F>(on_handle: F) -> Self
         where
-            F: FnMut(&mut Context, MyMessage) -> () + Send + 'static,
+            F: FnMut(&mut Context<Self>, MyMessage) -> () + Send + 'static,
         {
             Self {
                 on_handle: Box::new(on_handle),
@@ -60,7 +70,7 @@ mod tests {
     }
 
     impl Handler<MyMessage> for MyActor {
-        fn handle(&mut self, ctx: &mut Context, message: MyMessage) -> SystemId {
+        fn handle(&mut self, ctx: &mut Context<Self>, message: MyMessage) -> SystemId {
             (self.on_handle)(ctx, message);
             System::current().id()
         }
@@ -123,8 +133,9 @@ mod tests {
         notify: Arc<tokio::sync::Notify>,
     }
 
+    #[async_trait]
     impl Actor for CounterActor {
-        fn started(&mut self, _ctx: &mut Context) {
+        async fn started(&mut self, _ctx: &mut Context<Self>) {
             self.notify.notify_one();
         }
     }
@@ -138,7 +149,7 @@ mod tests {
     }
 
     impl Handler<CounterMessage> for CounterActor {
-        fn handle(&mut self, _ctx: &mut Context, message: CounterMessage) -> usize {
+        fn handle(&mut self, _ctx: &mut Context<Self>, message: CounterMessage) -> usize {
             match message {
                 CounterMessage::Increment => {
                     self.counter += 1;
@@ -154,12 +165,20 @@ mod tests {
         // TODO: Implement receptionistkl
         // TODO: ReceptionistKey, ReceptionistStorage, ReceptionistActor
         init_tracing();
-        let system_a = System::clustered("A", vec!["127.0.0.1:7000".parse().unwrap()], vec![]);
-        let system_b = System::clustered(
-            "B",
-            vec!["127.0.0.1:7001".parse().unwrap()],
-            vec!["127.0.0.1:7000".parse().unwrap()],
-        );
+        let system_a = System::clustered(ClusterConfig {
+            name: "A".into(),
+            bind_addr: "127.0.0.1:7000".parse().unwrap(),
+            peers: vec![], // No peers
+            tls: TlsConfig::insecure(),
+        })
+        .expect("failed to create system");
+        let system_b = System::clustered(ClusterConfig {
+            name: "B".into(),
+            bind_addr: "127.0.0.1:7001".parse().unwrap(),
+            peers: vec!["127.0.0.1:7000".parse().unwrap()], // No peers
+            tls: TlsConfig::insecure(),
+        })
+        .expect("failed to create system");
 
         let notify = Arc::new(tokio::sync::Notify::new());
         let notification = notify.clone();
