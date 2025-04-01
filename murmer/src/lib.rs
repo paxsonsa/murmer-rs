@@ -5,6 +5,7 @@ mod id;
 mod mailbox;
 mod membership;
 mod message;
+mod net;
 mod path;
 pub mod prelude;
 mod receptionist;
@@ -23,9 +24,9 @@ mod tests {
     use crate::tls::TlsConfig;
 
     use super::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
     /// Initialize tracing for tests
     fn init_tracing() {

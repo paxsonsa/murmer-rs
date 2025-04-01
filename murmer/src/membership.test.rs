@@ -1,7 +1,52 @@
 use super::*;
 use assert_matches::assert_matches;
+use parking_lot::Mutex;
 
-struct MockConnectionDriver {}
+struct TestingDriver {
+    read_stream: Arc<Mutex<Vec<bytes::Bytes>>>,
+}
+
+impl TestingDriver {
+    fn new() -> Self {
+        TestingDriver {
+            read_stream: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+    fn push(&self, data: bytes::Bytes) {
+        let mut read_stream = self.read_stream.lock();
+        read_stream.push(data);
+    }
+
+    async fn expect_one_frame<T>(&self) -> net::Frame<T> {
+        todo!("implement the test driver to expect one frame")
+    }
+}
+
+struct MockConnectionDriverSpy {}
+
+impl MockConnectionDriverSpy {
+    fn new() -> Self {
+        MockConnectionDriverSpy {}
+    }
+}
+
+struct MockConnectionDriver {
+    spy: Option<Arc<Mutex<MockConnectionDriverSpy>>>,
+}
+
+impl MockConnectionDriver {
+    fn mocked() -> Self {
+        MockConnectionDriver { spy: None }
+    }
+
+    fn with_spy(test_driver: TestingDriver) -> (Arc<Mutex<MockConnectionDriverSpy>>, Self) {
+        let spy = Arc::new(Mutex::new(MockConnectionDriverSpy::new()));
+        let driver = MockConnectionDriver {
+            spy: Some(spy.clone()),
+        };
+        (spy, driver)
+    }
+}
 
 #[async_trait]
 impl ConnectionDriver for MockConnectionDriver {
@@ -12,7 +57,7 @@ impl ConnectionDriver for MockConnectionDriver {
 
 #[tokio::test]
 async fn test_member_actor_reachability_to_unreachable() {
-    let driver = MockConnectionDriver {};
+    let driver = MockConnectionDriver::mocked();
     let mut ctx = Context::new();
     let mut actor = MemberActor {
         node: Node {
@@ -108,7 +153,7 @@ async fn test_member_actor_reachability_to_unreachable() {
 
 #[tokio::test]
 async fn test_member_actor_reachability_reset() {
-    let driver = MockConnectionDriver {};
+    let driver = MockConnectionDriver::mocked();
     let mut ctx = Context::new();
     let mut actor = MemberActor {
         node: Node {
@@ -206,7 +251,7 @@ async fn test_member_actor_reachability_reset() {
 
 #[tokio::test]
 async fn test_member_actor_unreachable_to_reachable() {
-    let driver = MockConnectionDriver {};
+    let driver = MockConnectionDriver::mocked();
     let mut ctx = Context::new();
     let mut actor = MemberActor {
         node: Node {
@@ -287,7 +332,7 @@ async fn test_member_actor_unreachable_to_reachable() {
 
 #[tokio::test]
 async fn test_member_actor_unreachable_reset() {
-    let driver = MockConnectionDriver {};
+    let driver = MockConnectionDriver::mocked();
     let mut ctx = Context::new();
     let mut actor = MemberActor {
         node: Node {
@@ -346,4 +391,43 @@ async fn test_member_actor_unreachable_reset() {
             last_seen: future_timestamp
         }
     );
+}
+
+#[tokio::test]
+async fn test_membership_initiation() {
+    let test_driver = TestingDriver::new();
+    let (_, driver) = MockConnectionDriver::with_spy(test_driver);
+    let mut ctx = Context::new();
+    let mut actor = MemberActor {
+        node: Node {
+            name: "test".to_string(),
+            node_id: Id::new(),
+            addr: crate::cluster::NetworkAddrRef::from("127.0.0.1:8000"),
+        },
+        driver: Box::new(driver),
+        membership: Membership::Pending,
+        reachability: Reachability::Pending,
+    };
+
+    // 0) Connect to the Node.
+    // 1) Send Init Message and Wait for Response. Pending
+    // 2) Receive InitAccept Response and Send Join Message. Joining.
+    // 2) Receive InitReject Response and update Membership. Down.
+    // 3) Receive JoinAccept Response and update Membership. Up.
+    // 4) Receive JoinReject
+
+    actor.started(&mut ctx).await;
+    assert_matches!(actor.membership, Membership::Pending);
+    assert_matches!(actor.reachability, Reachability::Pending);
+
+    // 1) Send Init Message and Wait for Response. Pending
+    let frame: net::Frame<NodeMessage> = test_driver.expect_one_frame().await;
+    // TODO: Implies a FramePayload::* variant
+    assert_matches!(frame.payload, FramePayload::Ok(NodeMessage::Init { .. }));
+
+    // TODO: Test inner stream handler endpoint callers.
+    // Each open stream gets a dual loop for reading and writing.
+    // The reading side is given an endpoint to forward frame messages to.
+    // The writing side is stowed wrapped into a StreamHandle.
+    // We need to test the reading side of the stream handler in a deterministic way.
 }

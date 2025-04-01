@@ -1,14 +1,19 @@
+use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
 use uuid::Uuid;
 
 /// Unique identifier type within the system
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Id(uuid::Uuid);
 
 impl Id {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
+    }
+
+    pub fn from_u128(id: u128) -> Self {
+        Self(Uuid::from_u128(id))
     }
 }
 

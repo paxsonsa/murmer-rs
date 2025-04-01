@@ -106,6 +106,7 @@ impl ConnectionDriver for QuicConnectionDriver {
     }
 }
 
+#[derive(Debug)]
 pub enum Membership {
     Pending,
     Up,

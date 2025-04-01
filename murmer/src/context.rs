@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     actor::Actor,
+    message::Message,
     system::{Endpoint, System},
 };
 
@@ -54,7 +55,7 @@ where
     /// Establish an interval to execute a given closure at a fixed interval.
     pub fn interval<F>(&self, interval: std::time::Duration, f: F)
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut(&Context<A>) + Send + 'static,
     {
         todo!()
     }
@@ -73,5 +74,15 @@ where
                 _ = cancellation.cancelled() => {}
             };
         });
+    }
+
+    /// Send a message to the actor's endpoint.
+    pub fn send(&self, msg: impl Message) {
+        todo!()
+    }
+
+    /// Send a message to the actor's endpoint with a priority.
+    pub fn send_priority(&self, msg: impl Message) {
+        todo!()
     }
 }
