@@ -21,15 +21,15 @@ fn test_wire_frame_encode_decode() {
     assert_eq!(prefix.get_u64(), (encoded.len() - 8) as u64);
 
     // Decode the frame
-    let decoded = Frame::decode(body).unwrap();
+    let decoded = Frame::<MessageType>::decode(body).unwrap();
 
     // Verify the decoded frame
     match &decoded.payload {
-        Payload::Node(NodeMessage::Join {
+        Payload::Ok(MessageType::Node(NodeMessage::Join {
             node_id: decoded_id,
             name,
             capabilities,
-        }) => {
+        })) => {
             assert_eq!(*decoded_id, node_id);
             assert_eq!(name, "test-node");
             assert_eq!(capabilities.len(), 2);
@@ -68,7 +68,7 @@ fn test_frame_reader() {
     let encoded2 = frame2.encode().unwrap();
 
     // Create a reader
-    let mut reader = FrameReader::new();
+    let mut reader = FrameReader::<MessageType>::new();
 
     // Add partial data and verify no complete frame yet
     reader.extend(&encoded1[0..4]);
@@ -90,18 +90,18 @@ fn test_frame_reader() {
 
     // Verify the parsed frames
     match &parsed1.payload {
-        Payload::Node(NodeMessage::Heartbeat { timestamp }) => {
+        Payload::Ok(MessageType::Node(NodeMessage::Heartbeat { timestamp })) => {
             assert_eq!(*timestamp, 123456789);
         }
         _ => panic!("Parsed wrong message type for frame 1"),
     }
 
     match &parsed2.payload {
-        Payload::Node(NodeMessage::Join {
+        Payload::Ok(MessageType::Node(NodeMessage::Join {
             node_id: parsed_id,
             name,
             capabilities,
-        }) => {
+        })) => {
             assert_eq!(*parsed_id, node_id);
             assert_eq!(name, "test-node");
             assert_eq!(capabilities.len(), 1);

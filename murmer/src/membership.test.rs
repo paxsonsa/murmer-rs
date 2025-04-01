@@ -2,6 +2,7 @@ use super::*;
 use assert_matches::assert_matches;
 use parking_lot::Mutex;
 
+#[derive(Clone)]
 struct TestingDriver {
     read_stream: Arc<Mutex<Vec<bytes::Bytes>>>,
 }
@@ -396,7 +397,7 @@ async fn test_member_actor_unreachable_reset() {
 #[tokio::test]
 async fn test_membership_initiation() {
     let test_driver = TestingDriver::new();
-    let (_, driver) = MockConnectionDriver::with_spy(test_driver);
+    let (_, driver) = MockConnectionDriver::with_spy(test_driver.clone());
     let mut ctx = Context::new();
     let mut actor = MemberActor {
         node: Node {
@@ -421,9 +422,12 @@ async fn test_membership_initiation() {
     assert_matches!(actor.reachability, Reachability::Pending);
 
     // 1) Send Init Message and Wait for Response. Pending
-    let frame: net::Frame<NodeMessage> = test_driver.expect_one_frame().await;
+    let frame: net::Frame<net::NodeMessage> = test_driver.expect_one_frame().await;
     // TODO: Implies a FramePayload::* variant
-    assert_matches!(frame.payload, FramePayload::Ok(NodeMessage::Init { .. }));
+    assert_matches!(
+        frame.payload,
+        net::Payload::Ok(net::NodeMessage::Init { .. })
+    );
 
     // TODO: Test inner stream handler endpoint callers.
     // Each open stream gets a dual loop for reading and writing.

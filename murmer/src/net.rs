@@ -1,10 +1,8 @@
-use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::id::Id;
-use crate::path::ActorPath;
 
 #[cfg(test)]
 #[path = "./net.test.rs"]
@@ -145,9 +143,66 @@ pub enum ClusterMessage {
     LeaderElection { candidate_id: Id, term: u64 },
 }
 
+/// Enum for payload result with success or failure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Payload<T> {
+    /// Successfully decoded payload
+    Ok(T),
+    /// Failed to decode with reason
+    UnknownFailure(String),
+}
+
+impl<T> Payload<T> {
+    /// Returns true if the payload is Ok
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Payload::Ok(_))
+    }
+
+    /// Returns true if the payload is an UnknownFailure
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Payload::UnknownFailure(_))
+    }
+
+    /// Returns the inner value if Ok, or None if failure
+    pub fn ok(self) -> Option<T> {
+        match self {
+            Payload::Ok(value) => Some(value),
+            Payload::UnknownFailure(_) => None,
+        }
+    }
+
+    /// Returns a reference to the inner value if Ok, or None if failure
+    pub fn as_ok(&self) -> Option<&T> {
+        match self {
+            Payload::Ok(value) => Some(value),
+            Payload::UnknownFailure(_) => None,
+        }
+    }
+
+    /// Returns the failure reason if UnknownFailure, or None if Ok
+    pub fn failure_reason(&self) -> Option<&String> {
+        match self {
+            Payload::Ok(_) => None,
+            Payload::UnknownFailure(reason) => Some(reason),
+        }
+    }
+
+    /// Maps the inner value using the provided function if Ok
+    pub fn map<U, F>(self, f: F) -> Payload<U>
+    where
+        U: Serialize + for<'de> Deserialize<'de>,
+        F: FnOnce(T) -> U,
+    {
+        match self {
+            Payload::Ok(value) => Payload::Ok(f(value)),
+            Payload::UnknownFailure(reason) => Payload::UnknownFailure(reason),
+        }
+    }
+}
+
 /// Enum for different message categories
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Payload {
+pub enum MessageType {
     /// System-level messages (membership, heartbeats)
     Node(NodeMessage),
     /// Actor-to-actor communication
@@ -156,22 +211,48 @@ pub enum Payload {
     Cluster(ClusterMessage),
 }
 
+impl MessageType {
+    /// Helper method to extract NodeMessage if present
+    pub fn as_node(&self) -> Option<&NodeMessage> {
+        match self {
+            MessageType::Node(msg) => Some(msg),
+            _ => None,
+        }
+    }
+
+    /// Helper method to extract ActorMessage if present
+    pub fn as_actor(&self) -> Option<&ActorMessage> {
+        match self {
+            MessageType::Actor(msg) => Some(msg),
+            _ => None,
+        }
+    }
+
+    /// Helper method to extract ClusterMessage if present
+    pub fn as_cluster(&self) -> Option<&ClusterMessage> {
+        match self {
+            MessageType::Cluster(msg) => Some(msg),
+            _ => None,
+        }
+    }
+}
+
 /// Top-level frame that gets encoded/decoded from the wire
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Frame {
+pub struct Frame<T> {
     // TODO: add protocol versioning to decoding of the frame.
     /// Header with metadata
     pub header: Header,
     /// Typed payload
-    pub payload: Payload,
+    pub payload: Payload<T>,
 }
 
-impl Frame {
+impl Frame<MessageType> {
     /// Create a new wire frame with system message
     pub fn node(sender_id: Id, target_id: Option<Id>, message: NodeMessage) -> Self {
         Frame {
             header: Header::new(sender_id, target_id),
-            payload: Payload::Node(message),
+            payload: Payload::Ok(MessageType::Node(message)),
         }
     }
 
@@ -179,7 +260,7 @@ impl Frame {
     pub fn actor(sender_id: Id, target_id: Option<Id>, message: ActorMessage) -> Self {
         Frame {
             header: Header::new(sender_id, target_id),
-            payload: Payload::Actor(message),
+            payload: Payload::Ok(MessageType::Actor(message)),
         }
     }
 
@@ -187,7 +268,50 @@ impl Frame {
     pub fn cluster(sender_id: Id, target_id: Option<Id>, message: ClusterMessage) -> Self {
         Frame {
             header: Header::new(sender_id, target_id),
-            payload: Payload::Cluster(message),
+            payload: Payload::Ok(MessageType::Cluster(message)),
+        }
+    }
+}
+
+impl<T> Frame<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    /// Create a new frame with a failure payload
+    pub fn failure(sender_id: Id, target_id: Option<Id>, reason: String) -> Self {
+        Frame {
+            header: Header::new(sender_id, target_id),
+            payload: Payload::UnknownFailure(reason),
+        }
+    }
+
+    /// Create a new frame with a successful payload
+    pub fn ok(sender_id: Id, target_id: Option<Id>, value: T) -> Self {
+        Frame {
+            header: Header::new(sender_id, target_id),
+            payload: Payload::Ok(value),
+        }
+    }
+
+    /// Returns true if the payload is Ok
+    pub fn is_ok(&self) -> bool {
+        self.payload.is_ok()
+    }
+
+    /// Returns true if the payload is an UnknownFailure
+    pub fn is_failure(&self) -> bool {
+        self.payload.is_failure()
+    }
+
+    /// Maps the payload using the provided function
+    pub fn map_payload<U, F>(self, f: F) -> Frame<U>
+    where
+        U: Serialize + for<'de> Deserialize<'de>,
+        F: FnOnce(T) -> U,
+    {
+        Frame {
+            header: self.header,
+            payload: self.payload.map(f),
         }
     }
 
@@ -216,7 +340,7 @@ impl Frame {
         let config = bincode::config::standard();
 
         // Deserialize the frame
-        let frame: Frame = match bincode::serde::decode_from_slice(bytes, config) {
+        let frame: Frame<T> = match bincode::serde::decode_from_slice(bytes, config) {
             Ok((frame, _)) => frame,
             Err(err) => return Err(NetError::DeserializationError(err)),
         };
@@ -234,9 +358,13 @@ impl Frame {
 }
 
 /// Frame reader for processing incoming data
-pub struct FrameReader {
+pub struct FrameReader<T>
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+{
     state: ReaderState,
     buffer: BytesMut,
+    _phantom: std::marker::PhantomData<T>,
 }
 
 enum ReaderState {
@@ -244,12 +372,16 @@ enum ReaderState {
     ReadingData(usize),
 }
 
-impl FrameReader {
+impl<T> FrameReader<T>
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+{
     /// Create a new frame reader
     pub fn new() -> Self {
         FrameReader {
             state: ReaderState::ReadingLength,
             buffer: BytesMut::new(),
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -259,7 +391,7 @@ impl FrameReader {
     }
 
     /// Try to parse a complete frame from the buffer
-    pub fn parse(&mut self) -> Result<Option<Frame>, NetError> {
+    pub fn parse(&mut self) -> Result<Option<Frame<T>>, NetError> {
         loop {
             match &self.state {
                 ReaderState::ReadingLength => {
@@ -300,7 +432,7 @@ impl FrameReader {
     }
 
     /// Try to parse multiple frames from the buffer
-    pub fn parse_all(&mut self) -> Result<Vec<Frame>, NetError> {
+    pub fn parse_all(&mut self) -> Result<Vec<Frame<T>>, NetError> {
         let mut frames = Vec::new();
 
         while let Some(frame) = self.parse()? {
