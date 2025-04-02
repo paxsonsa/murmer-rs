@@ -321,26 +321,31 @@ where
         let mut buffer = BytesMut::new().writer();
 
         // Serialize the frame to bytes
-        let _ = bincode::serde::encode_into_std_write(self, &mut buffer, config);
+        let _ = bincode::serde::encode_into_std_write(self, &mut buffer, config)?;
 
         // Calculate the length of the serialized data
         let buffer = buffer.into_inner();
         let length = buffer.len() as u64;
 
-        let mut final_buffer = BytesMut::with_capacity(8);
-        final_buffer.put_u64(length);
-        final_buffer.put(buffer);
+        // Create a buffer with capacity for length (8 bytes) + data
+        let mut final_buffer = BytesMut::with_capacity(8 + buffer.len());
 
-        Ok(final_buffer.freeze())
+        // Write length in network byte order (big-endian)
+        final_buffer.put_u64(length);
+        final_buffer.extend_from_slice(&buffer);
+
+        let final_buffer = final_buffer.freeze();
+
+        Ok(final_buffer)
     }
 
     /// Decode a frame from bytes
-    pub fn decode(bytes: &[u8]) -> Result<Self, NetError> {
+    pub fn decode(bytes: Bytes) -> Result<Self, NetError> {
         // Use a consistent bincode configuration
         let config = bincode::config::standard();
 
         // Deserialize the frame
-        let frame: Frame<T> = match bincode::serde::decode_from_slice(bytes, config) {
+        let frame: Frame<T> = match bincode::serde::decode_from_slice(&bytes, config) {
             Ok((frame, _)) => frame,
             Err(err) => return Err(NetError::DeserializationError(err)),
         };
@@ -358,7 +363,7 @@ where
 }
 
 /// Frame reader for processing incoming data
-pub struct FrameReader<T>
+pub struct FrameParser<T>
 where
     T: Serialize + for<'de> Deserialize<'de>,
 {
@@ -372,13 +377,13 @@ enum ReaderState {
     ReadingData(usize),
 }
 
-impl<T> FrameReader<T>
+impl<T> FrameParser<T>
 where
     T: Serialize + for<'de> Deserialize<'de>,
 {
     /// Create a new frame reader
     pub fn new() -> Self {
-        FrameReader {
+        FrameParser {
             state: ReaderState::ReadingLength,
             buffer: BytesMut::new(),
             _phantom: std::marker::PhantomData,
@@ -417,13 +422,13 @@ where
                     }
 
                     // Extract the frame data
-                    let frame_data = self.buffer.split_to(*length);
+                    let frame_data = self.buffer.split_to(*length).freeze();
 
                     // Reset state to read the next frame length
                     self.state = ReaderState::ReadingLength;
 
                     // Decode the frame
-                    let frame = Frame::decode(&frame_data)?;
+                    let frame = Frame::decode(frame_data)?;
 
                     return Ok(Some(frame));
                 }

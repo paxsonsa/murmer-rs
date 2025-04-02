@@ -17,6 +17,7 @@ directories-next = "2.0.0"
 futures = "0.3.31"
 hostname = "0.4.0"
 parking_lot = "0.12.3"
+pin-project = "1.1.5"
 quinn = { version = "0.11.6", features = ["rustls"] }
 quinn-proto = { version = "0.11.9", features = ["rustls"] }
 rcgen = "0.13.2"

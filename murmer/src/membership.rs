@@ -5,18 +5,136 @@ use crate::cluster::Node;
 use crate::net;
 use crate::prelude::*;
 use crate::tls::TlsConfig;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use quinn::crypto::rustls::QuicClientConfig;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::io;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(test)]
 #[path = "membership.test.rs"]
 mod tests;
 
+/// A stream for reading frames of type T
+pub struct FrameReader<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    inner: Box<dyn AsyncRead + Send + Unpin>,
+    reader: net::FrameParser<T>,
+}
+
+impl<T> FrameReader<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    pub fn new(stream: Box<dyn AsyncRead + Send + Unpin>) -> Self {
+        FrameReader {
+            inner: stream,
+            reader: net::FrameParser::new(),
+        }
+    }
+
+    /// Read the next frame from the stream
+    pub async fn read_frame(&mut self) -> Result<Option<net::Frame<T>>, net::NetError> {
+        // Try to parse a frame from the existing buffer
+        if let Some(frame) = self.reader.parse()? {
+            return Ok(Some(frame));
+        }
+
+        // Read more data from the stream
+        let mut buffer = [0u8; 1024];
+        loop {
+            match self.inner.read(&mut buffer).await {
+                Ok(0) => return Ok(None), // End of stream
+                Ok(n) => {
+                    // Add the data to the reader
+                    self.reader.extend(&buffer[..n]);
+
+                    // Try to parse a frame
+                    if let Some(frame) = self.reader.parse()? {
+                        return Ok(Some(frame));
+                    }
+                }
+                Err(e) => {
+                    return Err(net::NetError::InvalidFrame(format!("Read error: {}", e)));
+                }
+            }
+        }
+    }
+}
+
+/// A stream for writing frames of type T
+pub struct FrameWriter<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    inner: Box<dyn AsyncWrite + Send + Unpin>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> FrameWriter<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    pub fn new(stream: Box<dyn AsyncWrite + Send + Unpin>) -> Self {
+        FrameWriter {
+            inner: stream,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Write a frame to the stream
+    pub async fn write_frame(&mut self, frame: &net::Frame<T>) -> Result<(), net::NetError> {
+        let encoded = frame.encode()?;
+        self.inner
+            .write_all(&encoded)
+            .await
+            .map_err(|e| net::NetError::InvalidFrame(format!("Write error: {}", e)))?;
+        self.inner
+            .flush()
+            .await
+            .map_err(|e| net::NetError::InvalidFrame(format!("Flush error: {}", e)))?;
+        Ok(())
+    }
+}
+
+/// A type-erased stream that can be used to read and write raw bytes
+pub struct RawStream {
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
+}
+
+impl RawStream {
+    pub fn new(
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        writer: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> Self {
+        RawStream { reader, writer }
+    }
+
+    /// Convert this raw stream into a typed frame stream
+    pub fn into_frame_stream<T>(self) -> (FrameWriter<T>, FrameReader<T>)
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let writer = FrameWriter::new(self.writer);
+        let reader = FrameReader::new(self.reader);
+        (writer, reader)
+    }
+}
+
 #[async_trait]
 pub trait ConnectionDriver: Send {
     async fn connect(&mut self) -> Result<(), ConnectionError>;
+
+    /// Open a new bidirectional stream for communication
+    /// Returns a type-erased stream that can be converted to a typed stream
+    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError>;
 }
 
 pub struct QuicConnectionDriver {
@@ -102,6 +220,24 @@ impl ConnectionDriver for QuicConnectionDriver {
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError> {
+        match &self.state {
+            ConnectionState::Connected { connection } => {
+                // Open a bidirectional stream
+                let (send, recv) = connection.open_bi().await.map_err(|e| {
+                    ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
+                })?;
+
+                // Create the raw stream
+                Ok(RawStream::new(Box::new(recv), Box::new(send)))
+            }
+            ConnectionState::NotReady => Err(ConnectionError::NotConnected),
+            ConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+                format!("Connection is disconnected: {}", reason),
+            )),
         }
     }
 }
@@ -249,105 +385,93 @@ impl Actor for MemberActor {
             return;
         }
 
-        // Open new pair for for initial cluster communication.
-        // let (mut stream_tx, mut stream_rx) = match self.driver.open_stream().await {
-        //     Ok((stream_tx, stream_rx)) => (stream_tx, stream_rx),
-        //     Err(e) => {
-        //         tracing::error!(error=%e, "Failed to establish member connection stream");
-        //         self.membership = Membership::Failed;
-        //         self.reachability = Reachability::Unreachable;
-        //         return;
-        //     }
-        // };
+        // Open new raw stream for initial cluster communication
+        let raw_stream = match self.driver.open_raw_stream().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::error!(error=%e, "Failed to establish member connection stream");
+                self.membership = Membership::Failed;
+                self.reachability = Reachability::Unreachable {
+                    pings: 0,
+                    last_seen: Utc::now(),
+                };
+                return;
+            }
+        };
+
+        // Convert the raw stream to a typed stream
+        let (mut stream_tx, mut stream_rx) = raw_stream.into_frame_stream::<net::NodeMessage>();
 
         // Send initial message
         let init = net::NodeMessage::Init {
             protocol_version: 1, // FIXME: Use a real protocol version
         };
-        //     let frame = net::Frame::node(self.connection.node.node_id.clone(), None, init);
-        //     let encoded = match frame.encode() {
-        //         Ok(encoded) => encoded,
-        //         Err(e) => {
-        //             tracing::error!(error=%e, "Failed to encode frame");
-        //             self.membership = Membership::Failed;
-        //             self.connection.state = ConnectionState::Disconnected {
-        //                 reason: ConnectionError::ConnectionFailed("Failed to encode frame".to_string()),
-        //             };
-        //             return;
-        //         }
-        //     };
-        //     match stream_tx.write_all(&encoded).await {
-        //         Ok(_) => {
-        //             tracing::debug!("Initial message sent");
-        //         }
-        //         Err(e) => {
-        //             // FIXME: Decode write error for more detailed error handling
-        //             tracing::error!(error=%e, "Failed to send initial message");
-        //             self.membership = Membership::Failed;
-        //             self.connection.state = ConnectionState::Disconnected {
-        //                 reason: ConnectionError::ConnectionFailed(
-        //                     "Failed to send initial message".to_string(),
-        //                 ),
-        //             };
-        //             return;
-        //         }
-        //     };
-        //
-        //     // Start accept loop for new streams
-        //     self.connection.state = ConnectionState::Connected {
-        //         connection: connection.clone(),
-        //         stream: stream_tx,
-        //     };
-        //     self.membership = Membership::Pending;
-        //     self.reachability = Reachability::Pending;
-        //
-        //     // Setup a heartbeat deadman switch.
-        //     // We need a timer that will periodically check the reachability of the node
-        //     // and update the reachability state accordingly.
-        //     ctx.interval(Duration::from_secs(1), |ctx: &Context<Self>| {
-        //         ctx.send(MemberActorHeartbeatCheck);
+        let frame = net::Frame::ok(self.node.node_id.clone(), None, init);
+        if let Err(e) = stream_tx.write_frame(&frame).await {
+            tracing::error!(error=%e, "Failed to send initial message");
+            self.membership = Membership::Failed;
+            self.reachability = Reachability::Unreachable {
+                pings: 0,
+                last_seen: Utc::now(),
+            };
+            return;
+        }
+
+        // Setup a heartbeat deadman switch.
+        // We need a timer that will periodically check the reachability of the node
+        // and update the reachability state accordingly.
+        // ctx.interval(Duration::from_secs(1), |actor, ctx| {
+        //     ctx.send(MemberActorHeartbeatCheck {
+        //         timestamp: Utc::now(),
         //     });
-        //
-        //     // Start Receive Loop for Cluster Stream
-        //     ctx.spawn(async move {
-        //         // Use our new net format reader
-        //         let mut reader = crate::net::FrameReader::new();
-        //
-        //         loop {
-        //             let chunk = match stream_rx.read_chunk(1024, true).await {
-        //                 Ok(Some(chunk)) => chunk,
-        //                 Ok(None) => {
-        //                     tracing::info!("Stream closed");
-        //                     break;
-        //                 }
-        //                 Err(e) => {
-        //                     tracing::error!(error=%e, "Failed to read from stream");
-        //                     break;
-        //                 }
-        //             };
-        //
-        //             // Add data to the reader
-        //             reader.extend(&chunk.bytes);
-        //
-        //             let frames = match reader.parse_all() {
-        //                 Ok(frames) => frames,
-        //                 Err(e) => {
-        //                     tracing::error!(error=%e, "Failed to parse frames");
-        //                     // TODO: How do handle this issue? Corrupted buffer?
-        //                     break;
-        //                 }
-        //             };
-        //
-        //             for frame in frames {
-        //                 match &frame.payload {
-        //                     net::Payload::Node(msg) => {}
-        //                     net::Payload::Actor(msg) => {}
-        //                     net::Payload::Cluster(msg) => {}
+        // });
+
+        // Start Receive Loop for Cluster Stream
+        // let endpoint = ctx.endpoint();
+        // ctx.spawn(async move {
+        //     loop {
+        //         match stream_rx.read_frame().await {
+        //             Ok(Some(frame)) => {
+        //                 // Process the frame
+        //                 match frame.payload {
+        //                     net::Payload::Ok(msg) => {
+        //                         // Handle the message
+        //                         match msg {
+        //                             net::NodeMessage::InitAck => {
+        //                                 // Send join message
+        //                                 // TODO: Implement join message handling
+        //                             }
+        //                             net::NodeMessage::JoinAck { accepted, reason } => {
+        //                                 // Handle join response
+        //                                 // TODO: Implement join response handling
+        //                             }
+        //                             net::NodeMessage::Heartbeat { timestamp } => {
+        //                                 // Update heartbeat
+        //                                 endpoint.send(MemberActorHeartbeatUpdate {
+        //                                     timestamp: Utc::now(),
+        //                                 });
+        //                             }
+        //                             _ => {
+        //                                 // Handle other message types
+        //                             }
+        //                         }
+        //                     }
+        //                     net::Payload::UnknownFailure(reason) => {
+        //                         tracing::error!(reason=%reason, "Received failure message");
+        //                     }
         //                 }
         //             }
+        //             Ok(None) => {
+        //                 tracing::info!("Stream closed");
+        //                 break;
+        //             }
+        //             Err(e) => {
+        //                 tracing::error!(error=%e, "Failed to read from stream");
+        //                 break;
+        //             }
         //         }
-        //     });
-        // }
+        //     }
+        // });
     }
 }
 

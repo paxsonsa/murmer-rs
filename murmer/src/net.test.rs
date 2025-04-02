@@ -17,11 +17,12 @@ fn test_wire_frame_encode_decode() {
     let encoded = frame.encode().unwrap();
 
     // Verify the length prefix
-    let (mut prefix, body) = encoded.split_at(8);
-    assert_eq!(prefix.get_u64(), (encoded.len() - 8) as u64);
+    let mut prefix_bytes = encoded.slice(0..8);
+    assert_eq!(prefix_bytes.get_u64(), (encoded.len() - 8) as u64);
 
     // Decode the frame
-    let decoded = Frame::<MessageType>::decode(body).unwrap();
+    let body_bytes = encoded.slice(8..encoded.len());
+    let decoded = Frame::<MessageType>::decode(body_bytes).unwrap();
 
     // Verify the decoded frame
     match &decoded.payload {
@@ -67,8 +68,11 @@ fn test_frame_reader() {
     let encoded1 = frame1.encode().unwrap();
     let encoded2 = frame2.encode().unwrap();
 
+    println!("Encoded frame 1: {:?}", encoded1);
+    println!("Encoded frame 2: {:?}", encoded2);
+
     // Create a reader
-    let mut reader = FrameReader::<MessageType>::new();
+    let mut reader = FrameParser::<MessageType>::new();
 
     // Add partial data and verify no complete frame yet
     reader.extend(&encoded1[0..4]);
