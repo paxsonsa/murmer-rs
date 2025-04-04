@@ -167,14 +167,14 @@ mod tests {
         // TODO: ReceptionistKey, ReceptionistStorage, ReceptionistActor
         init_tracing();
         let system_a = System::clustered(ClusterConfig {
-            name: "A".into(),
+            id: Arc::new("A".into()),
             bind_addr: "127.0.0.1:7000".parse().unwrap(),
             peers: vec![], // No peers
             tls: TlsConfig::insecure(),
         })
         .expect("failed to create system");
         let system_b = System::clustered(ClusterConfig {
-            name: "B".into(),
+            id: Arc::new("B".into()),
             bind_addr: "127.0.0.1:7001".parse().unwrap(),
             peers: vec!["127.0.0.1:7000".parse().unwrap()], // No peers
             tls: TlsConfig::insecure(),

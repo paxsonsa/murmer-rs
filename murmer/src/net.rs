@@ -41,8 +41,6 @@ pub struct Header {
     pub timestamp: u64,
     /// Protocol version for future compatibility
     pub protocol_version: u16,
-    /// Sequence number for ordering/deduplication
-    pub sequence: u64,
     /// Optional correlation ID for request/response patterns
     pub correlation_id: Option<u64>,
 }
@@ -57,18 +55,12 @@ impl Header {
                 .unwrap_or_default()
                 .as_millis() as u64,
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence: 0, // Should be incremented by the sender
             correlation_id: None,
         }
     }
 
     pub fn with_correlation_id(mut self, id: u64) -> Self {
         self.correlation_id = Some(id);
-        self
-    }
-
-    pub fn with_sequence(mut self, seq: u64) -> Self {
-        self.sequence = seq;
         self
     }
 }
@@ -78,8 +70,11 @@ impl Header {
 pub enum NodeMessage {
     Init {
         protocol_version: u16,
+        id: Id,
     },
-    InitAck,
+    InitAck {
+        node_id: Id,
+    },
     Join {
         node_id: Id,
         name: String,

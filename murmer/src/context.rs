@@ -15,14 +15,22 @@ use crate::{
 /// - Their own address for self-messaging
 /// - The actor system
 /// - Other runtime capabilities
-pub struct Context<A> {
+pub struct Context<A>
+where
+    A: Actor,
+{
+    endpoint: Endpoint<A>,
     _phantom: std::marker::PhantomData<A>,
 }
 
-impl<A> Context<A> {
+impl<A> Context<A>
+where
+    A: Actor,
+{
     /// Create a new context for the given actor.
-    pub fn new() -> Self {
+    pub fn new(endpoint: Endpoint<A>) -> Self {
         Context {
+            endpoint,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -34,7 +42,7 @@ where
 {
     /// Access the actor's endpoint for sending messages to itself.
     pub fn endpoint(&self) -> Endpoint<A> {
-        todo!()
+        self.endpoint.clone()
     }
 
     /// Access the actor system.

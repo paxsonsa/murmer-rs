@@ -264,6 +264,20 @@ impl<A> SupervisorRuntime<A>
 where
     A: Actor,
 {
+    pub fn construct(actor: A) -> (Self, MailboxSender<SupervisorCommand<A>>) {
+        let (tx, rx) = mpsc::channel(64);
+        let mailbox_sender = MailboxSender::new(tx);
+        let runtime = SupervisorRuntime {
+            actor,
+            mailbox: PrioritizedMailbox::new(rx),
+        };
+        (runtime, mailbox_sender)
+    }
+
+    fn actor_ref(&self) -> &A {
+        &self.actor
+    }
+
     async fn handle_command(&mut self, ctx: &mut Context<A>, cmd: SupervisorCommand<A>) -> bool {
         match cmd {
             SupervisorCommand::Envelope(envelope) => {
@@ -272,21 +286,101 @@ where
                 true
             }
             SupervisorCommand::Shutdown => {
-                self.actor.stopping(ctx);
+                self.actor.stopping(ctx).await;
                 false
             }
         }
     }
 
-    async fn run(mut self, _id: Arc<Id>) {
-        let mut ctx = Context::new();
-        self.actor.started(&mut ctx);
-        while let Some(cmd) = self.mailbox.recv().await {
-            if !self.handle_command(&mut ctx, cmd).await {
+    async fn run(mut self, _id: Arc<Id>, mut ctx: Context<A>) {
+        self.actor.started(&mut ctx).await;
+        loop {
+            if !self.tick(&mut ctx).await {
                 break;
             }
         }
-        self.actor.stopped(&mut ctx);
+        self.actor.stopped(&mut ctx).await;
+    }
+
+    async fn tick(&mut self, ctx: &mut Context<A>) -> bool {
+        match self.mailbox.recv().await {
+            Some(cmd) => !self.handle_command(ctx, cmd).await,
+            None => false,
+        }
+    }
+}
+
+/// Testing Supervisor for Unit Testing
+#[cfg(test)]
+pub(crate) struct TestSupervisor<A>
+where
+    A: Actor,
+{
+    path: Arc<ActorPath>,
+    ctx: Context<A>,
+    runtime: SupervisorRuntime<A>,
+    sender: MailboxSender<SupervisorCommand<A>>,
+}
+
+#[cfg(test)]
+impl<A> TestSupervisor<A>
+where
+    A: Actor,
+{
+    pub fn new(actor: A) -> Self {
+        let id = Id::new();
+        let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
+        let (runtime, sender) = SupervisorRuntime::construct(actor);
+
+        let endpoint = Endpoint::new(EndpointSender::new(sender.clone()), path.clone());
+        let ctx = Context::new(endpoint);
+
+        Self {
+            path,
+            ctx,
+            runtime,
+            sender,
+        }
+    }
+
+    pub fn actor_ref(&self) -> &A {
+        self.runtime.actor_ref()
+    }
+
+    pub async fn started(&mut self) {
+        self.runtime.actor.started(&mut self.ctx).await;
+    }
+
+    pub async fn send<M>(&mut self, system: &System, msg: M) -> Result<M::Result, ActorError>
+    where
+        M: Message + 'static,
+        A: Handler<M>,
+    {
+        let sender = EndpointSender::new(self.sender.clone());
+        let endpoint_path = self.path.clone();
+        ACTIVE_SYSTEM
+            .scope(system.clone(), async move {
+                let sender = sender.clone();
+                let endpoint = Endpoint::new(sender, endpoint_path);
+                let task = tokio::spawn(async move { endpoint.send(msg).await });
+                self.runtime.tick(&mut self.ctx).await;
+                task.await.unwrap()
+            })
+            .await
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self
+            .sender
+            .send_blocking(QoSLevel::Supervisor, SupervisorCommand::Shutdown);
+    }
+
+    async fn tick(&mut self, system: System) {
+        ACTIVE_SYSTEM
+            .scope(system, async move {
+                self.runtime.tick(&mut self.ctx).await;
+            })
+            .await
     }
 }
 
@@ -346,14 +440,10 @@ where
     A: Actor,
 {
     fn construct(actor: A) -> Supervisor<A, Uninitialized<A>> {
-        let (tx, rx) = mpsc::channel(64);
-        let mailbox_sender = MailboxSender::new(tx);
         let id = Id::new();
         let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
-        let runtime = SupervisorRuntime {
-            actor,
-            mailbox: PrioritizedMailbox::new(rx),
-        };
+
+        let (runtime, mailbox_sender) = SupervisorRuntime::construct(actor);
         Supervisor {
             path,
             sender: mailbox_sender,
@@ -374,10 +464,14 @@ where
             .context()
             .write()
             .register(id.clone(), supervisor.clone());
+        let local_endpoint = supervisor.endpoint();
+
+        let ctx = Context::new(local_endpoint);
+
         tokio::spawn(async move {
             ACTIVE_SYSTEM
                 .scope(system, async move {
-                    runtime.run(id).await;
+                    runtime.run(id, ctx).await;
                 })
                 .await;
         });
@@ -438,7 +532,7 @@ impl<A: Actor> Endpoint<A> {
         &self.path
     }
 
-    pub async fn background_send<M>(&self, message: M) -> Result<(), ActorError>
+    pub async fn send_in_background<M>(&self, message: M) -> Result<(), ActorError>
     where
         M: Message + 'static,
         A: Handler<M>,

@@ -1,3 +1,5 @@
+use crate::system::TestSupervisor;
+
 use super::*;
 use assert_matches::assert_matches;
 use parking_lot::Mutex;
@@ -212,8 +214,8 @@ impl AsyncWrite for MockStreamWriter {
 async fn test_member_actor_reachability_to_unreachable() {
     let test_driver = TestingDriver::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let mut ctx = Context::new();
-    let mut actor = MemberActor {
+    let actor = MemberActor {
+        id: Id::new(),
         node: Node {
             name: "test".to_string(),
             node_id: Id::new(),
@@ -222,23 +224,27 @@ async fn test_member_actor_reachability_to_unreachable() {
         driver: Box::new(driver),
         membership: Membership::Pending,
         reachability: Reachability::Pending,
+        send_stream: None,
     };
+    let system = System::local("test_system");
+    let mut S = TestSupervisor::new(actor);
 
     let _timestamp = chrono::Utc::now();
     let msg = MemberActorHeartbeatCheck {
         timestamp: _timestamp.clone(),
     };
 
-    actor.handle(&mut ctx, msg);
-    assert_matches!(actor.reachability, Reachability::Pending);
+    let _ = S.send(&system, msg).await;
+    /*   */
+    assert_matches!(S.actor_ref().reachability, Reachability::Pending);
 
     // Simulate a successful heartbeat
     let msg = MemberActorHeartbeatUpdate {
         timestamp: _timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 0,
             last_seen: _timestamp
@@ -251,9 +257,9 @@ async fn test_member_actor_reachability_to_unreachable() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: _check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 1,
             last_seen: _timestamp
@@ -266,9 +272,9 @@ async fn test_member_actor_reachability_to_unreachable() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 2,
             last_seen: _timestamp
@@ -281,9 +287,9 @@ async fn test_member_actor_reachability_to_unreachable() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 3,
             last_seen: _timestamp
@@ -296,10 +302,10 @@ async fn test_member_actor_reachability_to_unreachable() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     // SHOULD BE UNREACHABLE NOW.
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Unreachable {
             pings: 0,
             last_seen: _timestamp
@@ -311,8 +317,8 @@ async fn test_member_actor_reachability_to_unreachable() {
 async fn test_member_actor_reachability_reset() {
     let test_driver = TestingDriver::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let mut ctx = Context::new();
     let mut actor = MemberActor {
+        id: Id::new(),
         node: Node {
             name: "test".to_string(),
             node_id: Id::new(),
@@ -321,21 +327,24 @@ async fn test_member_actor_reachability_reset() {
         driver: Box::new(driver),
         membership: Membership::Pending,
         reachability: Reachability::Pending,
+        send_stream: None,
     };
+    let system = System::local("test_system");
+    let mut S = TestSupervisor::new(actor);
 
     let timestamp = chrono::Utc::now();
     let msg = MemberActorHeartbeatCheck { timestamp };
 
-    actor.handle(&mut ctx, msg);
-    assert_matches!(actor.reachability, Reachability::Pending);
+    let _ = S.send(&system, msg).await;
+    assert_matches!(S.actor_ref().reachability, Reachability::Pending);
 
     // Simulate a successful heartbeat
     let msg = MemberActorHeartbeatUpdate {
         timestamp: timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 0,
             last_seen: _timestamp
@@ -348,9 +357,9 @@ async fn test_member_actor_reachability_reset() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 1,
             last_seen: _timestamp
@@ -363,9 +372,9 @@ async fn test_member_actor_reachability_reset() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 2,
             last_seen: _timestamp
@@ -376,14 +385,14 @@ async fn test_member_actor_reachability_reset() {
     let msg = MemberActorHeartbeatUpdate {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     // Re-check to reset the misses.
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 0,
             last_seen: _check_timestamp,
@@ -396,9 +405,9 @@ async fn test_member_actor_reachability_reset() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 1,
             last_seen: _timestamp
@@ -410,8 +419,8 @@ async fn test_member_actor_reachability_reset() {
 async fn test_member_actor_unreachable_to_reachable() {
     let test_driver = TestingDriver::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let mut ctx = Context::new();
     let mut actor = MemberActor {
+        id: Id::new(),
         node: Node {
             name: "test".to_string(),
             node_id: Id::new(),
@@ -423,7 +432,10 @@ async fn test_member_actor_unreachable_to_reachable() {
             pings: 0,
             last_seen: chrono::Utc::now(),
         },
+        send_stream: None,
     };
+    let system = System::local("test_system");
+    let mut S = TestSupervisor::new(actor);
 
     let _timestamp = chrono::Utc::now();
 
@@ -431,9 +443,9 @@ async fn test_member_actor_unreachable_to_reachable() {
     let msg = MemberActorHeartbeatUpdate {
         timestamp: _timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Unreachable {
             pings: 1,
             last_seen: _timestamp
@@ -446,14 +458,14 @@ async fn test_member_actor_unreachable_to_reachable() {
     let msg = MemberActorHeartbeatUpdate {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
 
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Unreachable {
             pings: 2,
             last_seen: _timestamp
@@ -464,9 +476,9 @@ async fn test_member_actor_unreachable_to_reachable() {
     let msg = MemberActorHeartbeatUpdate {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Unreachable {
             pings: 3,
             last_seen: _check_timestamp
@@ -477,10 +489,10 @@ async fn test_member_actor_unreachable_to_reachable() {
     let msg = MemberActorHeartbeatCheck {
         timestamp: check_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     // SHOULD BE REACHABLE NOW.
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Reachable {
             misses: 0,
             last_seen: _timestamp
@@ -492,8 +504,8 @@ async fn test_member_actor_unreachable_to_reachable() {
 async fn test_member_actor_unreachable_reset() {
     let test_driver = TestingDriver::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let mut ctx = Context::new();
     let mut actor = MemberActor {
+        id: Id::new(),
         node: Node {
             name: "test".to_string(),
             node_id: Id::new(),
@@ -505,7 +517,10 @@ async fn test_member_actor_unreachable_reset() {
             pings: 0,
             last_seen: chrono::Utc::now(),
         },
+        send_stream: None,
     };
+    let system = System::local("test_system");
+    let mut S = TestSupervisor::new(actor);
 
     let _timestamp = chrono::Utc::now();
 
@@ -513,9 +528,9 @@ async fn test_member_actor_unreachable_reset() {
     let msg = MemberActorHeartbeatUpdate {
         timestamp: _timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Unreachable {
             pings: 1,
             last_seen: _timestamp
@@ -528,9 +543,9 @@ async fn test_member_actor_unreachable_reset() {
     let msg = MemberActorHeartbeatUpdate {
         timestamp: _future_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Unreachable {
             pings: 2,
             last_seen: _future_timestamp,
@@ -542,9 +557,9 @@ async fn test_member_actor_unreachable_reset() {
     let msg = MemberActorHeartbeatUpdate {
         timestamp: _future_timestamp.clone(),
     };
-    actor.handle(&mut ctx, msg);
+    let _ = S.send(&system, msg).await;
     assert_matches!(
-        actor.reachability,
+        S.actor_ref().reachability,
         Reachability::Unreachable {
             pings: 0,
             last_seen: _future_timestamp
@@ -556,7 +571,6 @@ async fn test_member_actor_unreachable_reset() {
 async fn test_membership_initiation() {
     let test_driver = TestingDriver::new();
     let driver = MockConnectionDriver::new(test_driver.clone());
-    let mut ctx = Context::new();
     let node = Node {
         name: "test".to_string(),
         node_id: Id::new(),
@@ -564,12 +578,16 @@ async fn test_membership_initiation() {
     };
 
     let mut actor = MemberActor {
+        id: Id::new(),
         node: node.clone(),
         driver: Box::new(driver),
         membership: Membership::Pending,
         reachability: Reachability::Pending,
+        send_stream: None,
     };
 
+    let system = System::local("test_system");
+    let mut S = TestSupervisor::new(actor);
     // 0) Connect to the Node.
     // 1) Send Init Message and Wait for Response. Pending
     // 2) Receive InitAccept Response and Send Join Message. Joining.
@@ -577,13 +595,18 @@ async fn test_membership_initiation() {
     // 3) Receive JoinAccept Response and update Membership. Up.
     // 4) Receive JoinReject
 
-    actor.started(&mut ctx).await;
-    assert_matches!(actor.membership, Membership::Pending);
-    assert_matches!(actor.reachability, Reachability::Pending);
+    S.started().await;
+
+    assert_matches!(S.actor_ref().membership, Membership::Pending);
+    assert_matches!(S.actor_ref().reachability, Reachability::Pending);
 
     // 1) Verify Init Message was sent
     let frame: net::Frame<net::NodeMessage> = test_driver.expect_one_frame().await;
-    if let net::Payload::Ok(net::NodeMessage::Init { protocol_version }) = frame.payload {
+    if let net::Payload::Ok(net::NodeMessage::Init {
+        id,
+        protocol_version,
+    }) = frame.payload
+    {
         assert_eq!(protocol_version, 1);
     } else {
         panic!("Expected Init message, got: {:?}", frame.payload);
@@ -592,7 +615,7 @@ async fn test_membership_initiation() {
     // 2) Simulate receiving InitAck response
     let init_accept = net::Frame {
         header: net::Header::new(Id::new(), Some(node.node_id.clone())),
-        payload: net::Payload::Ok(net::NodeMessage::InitAck),
+        payload: net::Payload::Ok(net::NodeMessage::InitAck { node_id: Id::new() }),
     };
     test_driver.push_frame(init_accept);
 
@@ -600,6 +623,6 @@ async fn test_membership_initiation() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // Verify that the membership state changed to Joining
-    assert_matches!(actor.membership, Membership::Joining);
+    assert_matches!(S.actor_ref().membership, Membership::Joining);
     // TODO: We need to simulate the context for the actor to be able to send and receive messages.
 }

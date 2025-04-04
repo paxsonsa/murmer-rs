@@ -1,3 +1,4 @@
+use crate::cluster::ClusterId;
 use crate::cluster::Connection;
 use crate::cluster::ConnectionError;
 use crate::cluster::ConnectionState;
@@ -286,6 +287,7 @@ pub struct Member {
 impl Member {
     pub fn spawn(
         system: System,
+        cluster_id: Arc<ClusterId>,
         node: Node,
         socket: quinn::Endpoint,
         tls: TlsConfig,
@@ -295,9 +297,11 @@ impl Member {
         let driver = Box::new(QuicConnectionDriver::new(node.clone(), socket, tls));
         let endpoint = system.spawn_with(MemberActor {
             node,
+            id: cluster_id.id.clone(),
             driver,
             membership: Membership::Pending,
             reachability: Reachability::Pending,
+            send_stream: None,
         });
         endpoint
             .map(|e| Member {
@@ -326,6 +330,9 @@ impl std::hash::Hash for Member {
 pub enum MemberError {
     #[error("Member not connected")]
     NotConnected,
+
+    #[error("Node network error: {0}")]
+    NodeNetworkError(#[from] net::NetError),
 }
 
 pub struct MemberActorHeartbeat;
@@ -356,14 +363,35 @@ impl Message for MemberActorHeartbeatUpdate {
     type Result = ();
 }
 
+pub struct MemberActorRecvFrame(pub Result<net::Frame<net::NodeMessage>, net::NetError>);
+
+impl Message for MemberActorRecvFrame {
+    type Result = ();
+}
+
 pub struct MemberActor {
+    pub id: Id,
     pub node: Node,
     pub driver: Box<dyn ConnectionDriver>,
     pub membership: Membership,
     pub reachability: Reachability,
+    pub send_stream: Option<FrameWriter<net::NodeMessage>>,
 }
 
-impl MemberActor {}
+impl MemberActor {
+    async fn send_message(&mut self, message: net::NodeMessage) -> Result<(), MemberError> {
+        if let Some(ref mut stream) = self.send_stream {
+            let frame = net::Frame::ok(self.node.node_id.clone(), None, message);
+            if let Err(e) = stream.write_frame(&frame).await {
+                tracing::error!(error=%e, "Failed to send message");
+                return Err(MemberError::NodeNetworkError(e));
+            }
+            Ok(())
+        } else {
+            Err(MemberError::NotConnected)
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl Actor for MemberActor {
@@ -400,22 +428,43 @@ impl Actor for MemberActor {
         };
 
         // Convert the raw stream to a typed stream
-        let (mut stream_tx, mut stream_rx) = raw_stream.into_frame_stream::<net::NodeMessage>();
+        let (stream_tx, mut stream_rx) = raw_stream.into_frame_stream::<net::NodeMessage>();
+        self.send_stream = Some(stream_tx);
 
         // Send initial message
         let init = net::NodeMessage::Init {
             protocol_version: 1, // FIXME: Use a real protocol version
+            id: self.id.clone(),
         };
-        let frame = net::Frame::ok(self.node.node_id.clone(), None, init);
-        if let Err(e) = stream_tx.write_frame(&frame).await {
-            tracing::error!(error=%e, "Failed to send initial message");
+        if let Err(err) = self.send_message(init).await {
+            tracing::error!(error=%err, "Failed to send initial message");
             self.membership = Membership::Failed;
-            self.reachability = Reachability::Unreachable {
-                pings: 0,
-                last_seen: Utc::now(),
-            };
             return;
         }
+
+        // Start the receive loop for the main node stream
+        let endpoint = ctx.endpoint();
+        ctx.spawn(async move {
+            let mut running = true;
+            while running {
+                let frame = match stream_rx.read_frame().await {
+                    Ok(Some(frame)) => Ok(frame),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!(error=%e, "Failed to read stream acknowledgment");
+                        running = false;
+                        Err(e)
+                    }
+                };
+                if let Err(err) = endpoint
+                    .send_in_background(MemberActorRecvFrame(frame))
+                    .await
+                {
+                    tracing::error!(error=%err, "Failed to send frame message to member actor. exiting read loop.");
+                    running = false;
+                };
+            }
+        });
 
         // Setup a heartbeat deadman switch.
         // We need a timer that will periodically check the reachability of the node
@@ -472,6 +521,15 @@ impl Actor for MemberActor {
         //         }
         //     }
         // });
+    }
+}
+
+impl Handler<MemberActorRecvFrame> for MemberActor {
+    fn handle(&mut self, _ctx: &mut Context<Self>, msg: MemberActorRecvFrame) {
+        match msg.0 {
+            Ok(frame) => {}
+            Err(e) => {}
+        }
     }
 }
 

@@ -1,20 +1,13 @@
 use std::collections::HashSet;
-use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
-use std::time::Duration;
 use std::{
     net::{SocketAddr, ToSocketAddrs},
     sync::Arc,
 };
 
-use async_trait::async_trait;
 use hostname;
-use parking_lot::Mutex;
-use quinn::crypto::rustls::QuicClientConfig;
-use tokio_util::sync::CancellationToken;
 
 use super::membership::*;
-use super::net;
 use super::prelude::*;
 use super::tls::TlsConfig;
 use super::tls::TlsConfigError;
@@ -188,8 +181,22 @@ pub enum State {
     Stopped,
 }
 
-pub struct Config {
+pub struct ClusterId {
+    pub id: Id,
     pub name: Name,
+}
+
+impl From<&str> for ClusterId {
+    fn from(s: &str) -> Self {
+        ClusterId {
+            id: Id::new(),
+            name: Name::from(s),
+        }
+    }
+}
+
+pub struct Config {
+    pub id: Arc<ClusterId>,
     pub bind_addr: SocketAddr,
     pub peers: Vec<NetworkAddrRef>,
     pub tls: TlsConfig,
@@ -235,7 +242,7 @@ impl ClusterActor {
     fn spawn_server(&self, endpoint: Endpoint<ClusterActor>) -> Result<(), ClusterError> {
         let socket = self.socket.clone();
         let cancellation = self.cancellation.clone();
-        tracing::info!(addr=%self.config.bind_addr, node_id=%self.config.name, "Starting cluster server");
+        tracing::info!(addr=%self.config.bind_addr, node_id=%self.config.id.name, "Starting cluster server");
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -258,7 +265,7 @@ impl ClusterActor {
 #[async_trait::async_trait]
 impl Actor for ClusterActor {
     async fn started(&mut self, ctx: &mut Context<Self>) {
-        tracing::info!(node_id=%self.config.name, "Cluster started");
+        tracing::info!(node_id=%self.config.id.name, "Cluster started");
         self.state = State::Starting;
         if let Err(err) = self.spawn_server(ctx.endpoint()) {
             tracing::error!(error=%err, "Failed to start cluster server");
@@ -283,6 +290,7 @@ impl Actor for ClusterActor {
 
             let Some(member) = Member::spawn(
                 ctx.subsystem(),
+                self.config.id.clone(),
                 Node::new(peer.clone()),
                 self.socket.clone(),
                 self.config.tls.clone(),
