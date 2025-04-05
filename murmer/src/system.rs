@@ -69,6 +69,8 @@ trait SystemSupervisor: Send + Sync {
 struct SystemContext {
     /// Unique identifier for this system instance
     id: SystemId,
+    /// Cancellation token for the system
+    cancellation: tokio_util::sync::CancellationToken,
     /// Registry of all active actor supervisors
     supervisors: HashMap<Arc<Id>, Box<dyn SystemSupervisor>>,
 }
@@ -79,6 +81,7 @@ impl SystemContext {
         let id = NEXT_SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self {
             id,
+            cancellation: tokio_util::sync::CancellationToken::new(),
             supervisors: HashMap::new(),
         }
     }
@@ -97,10 +100,8 @@ impl SystemContext {
     /// ensure that the all queued messages for the actors is processed or perform
     /// a wait.
     ///
-    fn shutdown(&mut self) {
-        for (_, mut supervisor) in self.supervisors.drain() {
-            supervisor.shutdown();
-        }
+    async fn shutdown(&mut self) {
+        self.cancellation.cancel();
     }
 }
 
@@ -137,11 +138,13 @@ enum Mode {
 pub enum System {
     Local {
         name: String,
+        root_cancellation: tokio_util::sync::CancellationToken,
         context: Arc<RwLock<SystemContext>>,
         receptionist: Receptionist,
     },
     Clustered {
         cluster: cluster::Cluster,
+        root_cancellation: tokio_util::sync::CancellationToken,
         context: Arc<RwLock<SystemContext>>,
         receptionist: Receptionist,
     },
@@ -166,6 +169,7 @@ impl System {
 
         Self::Local {
             name: name.into(),
+            root_cancellation: tokio_util::sync::CancellationToken::new(),
             context,
             receptionist,
         }
@@ -186,6 +190,7 @@ impl System {
 
         let system = System::Clustered {
             cluster,
+            root_cancellation: tokio_util::sync::CancellationToken::new(),
             context,
             receptionist,
         };
@@ -210,6 +215,24 @@ impl System {
         }
     }
 
+    fn context(&self) -> &Arc<RwLock<SystemContext>> {
+        match self {
+            Self::Local { context, .. } => context,
+            Self::Clustered { context, .. } => context,
+        }
+    }
+
+    fn cancellation(&self) -> tokio_util::sync::CancellationToken {
+        match self {
+            Self::Local {
+                root_cancellation, ..
+            } => root_cancellation.child_token(),
+            Self::Clustered {
+                root_cancellation, ..
+            } => root_cancellation.child_token(),
+        }
+    }
+
     pub fn spawn<A: Actor + Default>(&self) -> Result<Endpoint<A>, SystemError> {
         let actor: A = Default::default();
         self.spawn_with(actor)
@@ -221,18 +244,14 @@ impl System {
         Ok(supervisor.into())
     }
 
-    pub fn shutdown(&mut self) {
-        let mut context = match self {
-            Self::Local { context, .. } => context.write(),
-            Self::Clustered { context, .. } => context.write(),
-        };
-        context.shutdown();
-    }
-
-    fn context(&self) -> &Arc<RwLock<SystemContext>> {
+    pub async fn shutdown(&mut self) {
         match self {
-            Self::Local { context, .. } => context,
-            Self::Clustered { context, .. } => context,
+            Self::Local {
+                root_cancellation, ..
+            } => root_cancellation.cancel(),
+            Self::Clustered {
+                root_cancellation, ..
+            } => root_cancellation.cancel(),
         }
     }
 }
@@ -285,18 +304,26 @@ where
                 handler.handle(ctx, &mut self.actor);
                 true
             }
-            SupervisorCommand::Shutdown => {
-                self.actor.stopping(ctx).await;
-                false
-            }
+            SupervisorCommand::Shutdown => false,
         }
     }
 
+    async fn start(&mut self, ctx: &mut Context<A>) {
+        self.actor.started(ctx).await;
+    }
+
     async fn run(mut self, _id: Arc<Id>, mut ctx: Context<A>) {
+        let cancellation = ctx.inner_cancellation();
         self.actor.started(&mut ctx).await;
         loop {
-            if !self.tick(&mut ctx).await {
-                break;
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    self.actor.stopping(&mut ctx).await;
+                    break;
+                }
+                _ = self.tick(&mut ctx) => {
+                    // Continue processing messages
+                }
             }
         }
         self.actor.stopped(&mut ctx).await;
@@ -320,6 +347,7 @@ where
     ctx: Context<A>,
     runtime: SupervisorRuntime<A>,
     sender: MailboxSender<SupervisorCommand<A>>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 #[cfg(test)]
@@ -331,15 +359,17 @@ where
         let id = Id::new();
         let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
         let (runtime, sender) = SupervisorRuntime::construct(actor);
+        let cancellation = tokio_util::sync::CancellationToken::new();
 
         let endpoint = Endpoint::new(EndpointSender::new(sender.clone()), path.clone());
-        let ctx = Context::new(endpoint);
+        let ctx = Context::new(endpoint, cancellation.clone());
 
         Self {
             path,
             ctx,
             runtime,
             sender,
+            cancellation,
         }
     }
 
@@ -375,10 +405,13 @@ where
             .send_blocking(QoSLevel::Supervisor, SupervisorCommand::Shutdown);
     }
 
-    async fn tick(&mut self, system: System) {
+    pub async fn tick(&mut self, system: System, timeout: Option<std::time::Duration>) {
+        let timeout_duration = timeout.unwrap_or(std::time::Duration::from_millis(500));
         ACTIVE_SYSTEM
             .scope(system, async move {
-                self.runtime.tick(&mut self.ctx).await;
+                tokio::time::timeout(timeout_duration, self.runtime.tick(&mut self.ctx))
+                    .await
+                    .unwrap_or(false);
             })
             .await
     }
@@ -393,7 +426,9 @@ struct Uninitialized<A: Actor> {
 impl<A: Actor> State for Uninitialized<A> {}
 
 #[derive(Clone)]
-struct Initialized {}
+struct Initialized {
+    cancellation: tokio_util::sync::CancellationToken,
+}
 
 impl State for Initialized {}
 
@@ -452,11 +487,14 @@ where
     }
 
     fn start_within(self, system: System) -> Supervisor<A, Initialized> {
+        let cancellation = system.cancellation();
         let id = self.path.instance_id.clone();
         let supervisor = Supervisor {
             path: self.path,
             sender: self.sender,
-            state: Initialized {},
+            state: Initialized {
+                cancellation: cancellation.clone(),
+            },
         };
         let runtime = self.state.runtime;
 
@@ -464,9 +502,9 @@ where
             .context()
             .write()
             .register(id.clone(), supervisor.clone());
-        let local_endpoint = supervisor.endpoint();
 
-        let ctx = Context::new(local_endpoint);
+        let local_endpoint = supervisor.endpoint();
+        let ctx = Context::new(local_endpoint, cancellation.clone());
 
         tokio::spawn(async move {
             ACTIVE_SYSTEM
@@ -488,9 +526,7 @@ where
     }
 
     fn shutdown(&mut self) {
-        let _ = self
-            .sender
-            .send_blocking(QoSLevel::Supervisor, SupervisorCommand::Shutdown);
+        self.state.cancellation.cancel();
     }
 }
 

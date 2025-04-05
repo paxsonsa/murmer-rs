@@ -20,6 +20,7 @@ where
     A: Actor,
 {
     endpoint: Endpoint<A>,
+    cancellation: CancellationToken,
     _phantom: std::marker::PhantomData<A>,
 }
 
@@ -28,9 +29,10 @@ where
     A: Actor,
 {
     /// Create a new context for the given actor.
-    pub fn new(endpoint: Endpoint<A>) -> Self {
+    pub fn new(endpoint: Endpoint<A>, cancellation: CancellationToken) -> Self {
         Context {
             endpoint,
+            cancellation,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -55,9 +57,9 @@ where
         todo!()
     }
 
-    /// Return a cancellation that is a child to actor's cancellation token.
-    pub fn cancellation(&self) -> tokio_util::sync::CancellationToken {
-        todo!()
+    /// Return a cancellation token for this actor.
+    pub(crate) fn inner_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.cancellation.clone()
     }
 
     /// Establish an interval to execute a given closure at a fixed interval.
@@ -74,14 +76,16 @@ where
     /// As such, the future should be cancel safe as the future may be cancelled
     /// without notice. Once the future is cancelled, it will not be restarted.
     ///
-    pub fn spawn(&self, f: impl Future<Output = ()> + Send + 'static) {
-        let cancellation = self.cancellation();
+    pub fn spawn(&self, f: impl Future<Output = ()> + Send + 'static) -> CancellationToken {
+        let cancellation = self.cancellation.child_token();
+        let cancellation_ret = cancellation.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = f => {},
                 _ = cancellation.cancelled() => {}
             };
         });
+        cancellation_ret
     }
 
     /// Send a message to the actor's endpoint.
