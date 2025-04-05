@@ -133,7 +133,6 @@ pub struct Listing<T: Actor> {
 }
 
 /// Message to look up all actors registered under a specific key
-#[derive(Debug)]
 pub struct Lookup<T: Actor> {
     /// The key to look up
     pub key: Key<T>,
@@ -143,8 +142,16 @@ impl<T: Actor> Message for Lookup<T> {
     type Result = Option<Listing<T>>;
 }
 
+impl<T> std::fmt::Debug for Lookup<T>
+where
+    T: Actor,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lookup").field("key", &self.key).finish()
+    }
+}
+
 /// Message to subscribe to registration updates for a specific key
-#[derive(Debug)]
 pub struct Subscribe<T: Actor> {
     /// The key to subscribe to
     pub key: Key<T>,
@@ -152,6 +159,15 @@ pub struct Subscribe<T: Actor> {
 
 impl<T: Actor> Message for Subscribe<T> {
     type Result = Option<ListingSubscription<T>>;
+}
+
+impl<T> std::fmt::Debug for Subscribe<T>
+where
+    T: Actor,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscribe").field("key", &self.key).finish()
+    }
 }
 
 /// Internal type representing a subscription to registration updates
@@ -270,6 +286,18 @@ impl<T: Actor> Message for Register<T> {
     type Result = bool;
 }
 
+impl<T> std::fmt::Debug for Register<T>
+where
+    T: Actor,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Register")
+            .field("key", &self.key)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
 impl<T: Actor> Handler<Register<T>> for ReceptionistActor {
     fn handle(&mut self, _ctx: &mut Context<Self>, msg: Register<T>) -> bool {
         let type_id = TypeId::of::<T>();
@@ -307,6 +335,18 @@ pub struct Deregister<T: Actor> {
 
 impl<T: Actor> Message for Deregister<T> {
     type Result = bool;
+}
+
+impl<T> std::fmt::Debug for Deregister<T>
+where
+    T: Actor,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deregister")
+            .field("key", &self.key)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 impl<T: Actor> Handler<Deregister<T>> for ReceptionistActor {

@@ -10,14 +10,14 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Clone)]
-struct TestingDriver {
+struct MockNetwork {
     read_stream: Arc<Mutex<Vec<bytes::Bytes>>>,
     write_stream: Arc<Mutex<Vec<bytes::Bytes>>>,
 }
 
-impl TestingDriver {
+impl MockNetwork {
     fn new() -> Self {
-        TestingDriver {
+        MockNetwork {
             read_stream: Arc::new(Mutex::new(Vec::new())),
             write_stream: Arc::new(Mutex::new(Vec::new())),
         }
@@ -60,11 +60,11 @@ impl TestingDriver {
 }
 
 struct MockConnectionDriver {
-    test_driver: TestingDriver,
+    test_driver: MockNetwork,
 }
 
 impl MockConnectionDriver {
-    fn new(test_driver: TestingDriver) -> Self {
+    fn new(test_driver: MockNetwork) -> Self {
         MockConnectionDriver { test_driver }
     }
 }
@@ -215,9 +215,9 @@ impl AsyncWrite for MockStreamWriter {
     }
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_member_actor_reachability_to_unreachable() {
-    let test_driver = TestingDriver::new();
+    let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = MemberActor {
         id: Id::new(),
@@ -318,9 +318,9 @@ async fn test_member_actor_reachability_to_unreachable() {
     );
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_member_actor_reachability_reset() {
-    let test_driver = TestingDriver::new();
+    let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = MemberActor {
         id: Id::new(),
@@ -420,9 +420,9 @@ async fn test_member_actor_reachability_reset() {
     );
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_member_actor_unreachable_to_reachable() {
-    let test_driver = TestingDriver::new();
+    let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = MemberActor {
         id: Id::new(),
@@ -505,9 +505,9 @@ async fn test_member_actor_unreachable_to_reachable() {
     );
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_member_actor_unreachable_reset() {
-    let test_driver = TestingDriver::new();
+    let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = MemberActor {
         id: Id::new(),
@@ -572,9 +572,9 @@ async fn test_member_actor_unreachable_reset() {
     );
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_membership_initiation() {
-    let test_driver = TestingDriver::new();
+    let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver.clone());
     let node = Node {
         name: "test".to_string(),

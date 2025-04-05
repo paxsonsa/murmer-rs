@@ -331,18 +331,21 @@ pub enum MemberError {
     NodeNetworkError(#[from] net::NetError),
 }
 
+#[derive(Debug)]
 pub struct MemberActorHeartbeat;
 
 impl Message for MemberActorHeartbeat {
     type Result = Result<(), MemberError>;
 }
 
+#[derive(Debug)]
 pub struct MemberActorSetConnectionState(pub ConnectionState);
 
 impl Message for MemberActorSetConnectionState {
     type Result = Result<(), MemberError>;
 }
 
+#[derive(Debug)]
 pub struct MemberActorHeartbeatCheck {
     pub timestamp: DateTime<Utc>,
 }
@@ -351,6 +354,7 @@ impl Message for MemberActorHeartbeatCheck {
     type Result = ();
 }
 
+#[derive(Debug)]
 pub struct MemberActorHeartbeatUpdate {
     pub timestamp: DateTime<Utc>,
 }
@@ -359,6 +363,7 @@ impl Message for MemberActorHeartbeatUpdate {
     type Result = ();
 }
 
+#[derive(Debug)]
 pub struct MemberActorRecvFrame(pub Result<net::Frame<net::NodeMessage>, net::NetError>);
 
 impl Message for MemberActorRecvFrame {
@@ -440,8 +445,11 @@ impl Actor for MemberActor {
 
         // Start the receive loop for the main node stream
         let endpoint = ctx.endpoint();
+        let node_id = self.node.node_id.clone();
+        let mut running = true;
         ctx.spawn(async move {
-            let mut running = true;
+            let span = tracing::trace_span!("member-rx", node_id=%node_id);
+            let _enter = span.enter();
             while running {
                 let frame = match stream_rx.read_frame().await {
                     Ok(Some(frame)) => Ok(frame),
@@ -452,6 +460,7 @@ impl Actor for MemberActor {
                         Err(e)
                     }
                 };
+                tracing::trace!("Received frame: {:?}", frame);
                 if let Err(err) = endpoint
                     .send_in_background(MemberActorRecvFrame(frame))
                     .await
@@ -522,6 +531,7 @@ impl Actor for MemberActor {
 
 impl Handler<MemberActorRecvFrame> for MemberActor {
     fn handle(&mut self, _ctx: &mut Context<Self>, msg: MemberActorRecvFrame) {
+        tracing::info!(node_id=%self.node.node_id, "Received frame");
         match msg.0 {
             Ok(frame) => {}
             Err(e) => {}

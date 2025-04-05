@@ -77,6 +77,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct MyMessage;
 
     impl Message for MyMessage {
@@ -121,6 +122,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
+    #[derive(Debug)]
     enum CounterMessage {
         Increment,
     }

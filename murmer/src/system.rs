@@ -266,9 +266,18 @@ where
     A: Actor,
 {
     /// A message envelope containing the actual message and response channel
-    Envelope(Envelope<A>),
-    /// Command to initiate actor shutdown
-    Shutdown,
+    Message(Envelope<A>),
+}
+
+impl<A> std::fmt::Debug for SupervisorCommand<A>
+where
+    A: Actor,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SupervisorCommand::Message(_) => write!(f, "SupervisorCommand::Message"),
+        }
+    }
 }
 
 struct SupervisorRuntime<A>
@@ -276,6 +285,7 @@ where
     A: Actor,
 {
     actor: A,
+    path: Arc<ActorPath>,
     mailbox: PrioritizedMailbox<SupervisorCommand<A>>,
 }
 
@@ -283,11 +293,15 @@ impl<A> SupervisorRuntime<A>
 where
     A: Actor,
 {
-    pub fn construct(actor: A) -> (Self, MailboxSender<SupervisorCommand<A>>) {
+    pub fn construct(
+        path: Arc<ActorPath>,
+        actor: A,
+    ) -> (Self, MailboxSender<SupervisorCommand<A>>) {
         let (tx, rx) = mpsc::channel(64);
         let mailbox_sender = MailboxSender::new(tx);
         let runtime = SupervisorRuntime {
             actor,
+            path,
             mailbox: PrioritizedMailbox::new(rx),
         };
         (runtime, mailbox_sender)
@@ -297,14 +311,15 @@ where
         &self.actor
     }
 
+    #[tracing::instrument(skip(ctx))]
     async fn handle_command(&mut self, ctx: &mut Context<A>, cmd: SupervisorCommand<A>) -> bool {
         match cmd {
-            SupervisorCommand::Envelope(envelope) => {
+            SupervisorCommand::Message(envelope) => {
+                tracing::trace!("handling message");
                 let mut handler = envelope.0;
                 handler.handle(ctx, &mut self.actor);
                 true
             }
-            SupervisorCommand::Shutdown => false,
         }
     }
 
@@ -312,12 +327,16 @@ where
         self.actor.started(ctx).await;
     }
 
-    async fn run(mut self, _id: Arc<Id>, mut ctx: Context<A>) {
+    #[tracing::instrument(skip(ctx))]
+    async fn run(mut self, mut ctx: Context<A>) {
+        tracing::info!("starting supervisor loop");
         let cancellation = ctx.inner_cancellation();
+        tracing::debug!("starting supervisor");
         self.actor.started(&mut ctx).await;
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
+                    tracing::debug!("stopping supervisor loop");
                     self.actor.stopping(&mut ctx).await;
                     break;
                 }
@@ -329,11 +348,26 @@ where
         self.actor.stopped(&mut ctx).await;
     }
 
-    async fn tick(&mut self, ctx: &mut Context<A>) -> bool {
+    #[tracing::instrument(skip(ctx))]
+    async fn tick(&mut self, ctx: &mut Context<A>) {
         match self.mailbox.recv().await {
-            Some(cmd) => !self.handle_command(ctx, cmd).await,
-            None => false,
-        }
+            Some(cmd) => {
+                tracing::trace!(?cmd, "command received");
+                self.handle_command(ctx, cmd).await;
+            }
+            None => {}
+        };
+    }
+}
+
+impl<A> std::fmt::Debug for SupervisorRuntime<A>
+where
+    A: Actor,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupervisorRuntime")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -358,7 +392,7 @@ where
     pub fn new(actor: A) -> Self {
         let id = Id::new();
         let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
-        let (runtime, sender) = SupervisorRuntime::construct(actor);
+        let (runtime, sender) = SupervisorRuntime::construct(path.clone(), actor);
         let cancellation = tokio_util::sync::CancellationToken::new();
 
         let endpoint = Endpoint::new(EndpointSender::new(sender.clone()), path.clone());
@@ -399,19 +433,13 @@ where
             .await
     }
 
-    fn shutdown(&mut self) {
-        let _ = self
-            .sender
-            .send_blocking(QoSLevel::Supervisor, SupervisorCommand::Shutdown);
-    }
-
     pub async fn tick(&mut self, system: System, timeout: Option<std::time::Duration>) {
         let timeout_duration = timeout.unwrap_or(std::time::Duration::from_millis(500));
         ACTIVE_SYSTEM
             .scope(system, async move {
                 tokio::time::timeout(timeout_duration, self.runtime.tick(&mut self.ctx))
                     .await
-                    .unwrap_or(false);
+                    .unwrap();
             })
             .await
     }
@@ -478,7 +506,7 @@ where
         let id = Id::new();
         let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
 
-        let (runtime, mailbox_sender) = SupervisorRuntime::construct(actor);
+        let (runtime, mailbox_sender) = SupervisorRuntime::construct(path.clone(), actor);
         Supervisor {
             path,
             sender: mailbox_sender,
@@ -509,7 +537,7 @@ where
         tokio::spawn(async move {
             ACTIVE_SYSTEM
                 .scope(system, async move {
-                    runtime.run(id, ctx).await;
+                    runtime.run(ctx).await;
                 })
                 .await;
         });
@@ -603,7 +631,7 @@ impl<A: Actor> Clone for Endpoint<A> {
 impl<A: Actor> Debug for Endpoint<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Endpoint")
-            .field("type", &std::any::type_name::<A>())
+            .field("path", &self.path)
             .finish()
     }
 }
@@ -682,7 +710,7 @@ impl<A: Actor> EndpointSender<A> {
         let send_fn = Box::new(move |envelope| {
             let sender = sender.clone();
             Box::pin(async move {
-                let cmd = SupervisorCommand::Envelope(envelope);
+                let cmd = SupervisorCommand::Message(envelope);
                 sender
                     .send(QoSLevel::Normal, cmd)
                     .await
@@ -722,8 +750,7 @@ impl<A: Actor> EndpointSender<A> {
         M: Message + 'static,
         A: Handler<M>,
     {
-        let (tx, _) = oneshot::channel();
-        let envelope = Envelope::new(msg, tx);
+        let envelope = Envelope::no_response(msg);
         let fut = (self.send_fn)(envelope);
         tokio::spawn(fut);
         Ok(())

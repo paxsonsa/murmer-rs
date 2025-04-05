@@ -458,6 +458,7 @@ pub struct Connection {
     pub state: ConnectionState,
 }
 
+#[derive(Debug)]
 pub enum ConnectionState {
     NotReady,
     Connected { connection: quinn::Connection },
