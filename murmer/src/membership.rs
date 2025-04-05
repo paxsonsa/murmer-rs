@@ -1,19 +1,15 @@
 use crate::cluster::ClusterId;
-use crate::cluster::Connection;
 use crate::cluster::ConnectionError;
 use crate::cluster::ConnectionState;
 use crate::cluster::Node;
 use crate::net;
 use crate::prelude::*;
 use crate::tls::TlsConfig;
-use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use quinn::crypto::rustls::QuicClientConfig;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io;
+use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(test)]
