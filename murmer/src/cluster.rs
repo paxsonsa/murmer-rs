@@ -1,9 +1,6 @@
+use crate::net::{NetworkAddrError, NetworkAddrRef};
 use std::collections::HashSet;
-use std::str::FromStr;
-use std::{
-    net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use hostname;
 
@@ -39,129 +36,6 @@ impl std::fmt::Display for Name {
 impl From<&str> for Name {
     fn from(s: &str) -> Self {
         Name(s.to_string())
-    }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum NetworkAddrError {
-    #[error("Failed to parse network address: {0}")]
-    ParseError(String),
-    #[error("Invalid URL: {0}")]
-    InvalidUrl(String),
-    #[error("Invalid Socket Address: {0}")]
-    InvalidSocketAddr(String),
-    #[error("Addr parsing error: {0}")]
-    AddrParseError(#[from] std::net::AddrParseError),
-    #[error("failed to parse url into socket addr: {0}")]
-    ToSocketAddrError(String),
-}
-
-pub enum NetworkAddr {
-    Socket(SocketAddr),
-    HostPort(String, u16),
-}
-
-impl NetworkAddr {
-    pub fn host(&self) -> String {
-        match self {
-            NetworkAddr::Socket(addr) => addr.ip().to_string().as_str().to_string(),
-            NetworkAddr::HostPort(host, _) => host.clone(),
-        }
-    }
-
-    pub fn to_sock_addrs(&self) -> Result<SocketAddr, NetworkAddrError> {
-        match self {
-            NetworkAddr::Socket(addr) => Ok(*addr),
-            NetworkAddr::HostPort(host, port) => (host.as_str(), *port)
-                .to_socket_addrs()
-                .map_err(|_| {
-                    NetworkAddrError::ToSocketAddrError(
-                        "failed to parse host/port into socket addr".to_string(),
-                    )
-                })?
-                .next()
-                .ok_or(NetworkAddrError::ToSocketAddrError(
-                    "failed to resolve host".to_string(),
-                )),
-        }
-    }
-}
-
-impl FromStr for NetworkAddr {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Try parsing as SocketAddr
-        if let Ok(addr) = s.parse::<SocketAddr>() {
-            return Ok(NetworkAddr::Socket(addr));
-        }
-
-        // Try parsing as hostname:port
-        if let Some((host, port_str)) = s.rsplit_once(':') {
-            if let Ok(port) = port_str.parse::<u16>() {
-                if !host.is_empty() {
-                    return Ok(NetworkAddr::HostPort(host.to_string(), port));
-                }
-            }
-        }
-        Err(format!(
-            "Failed to parse '{}' as SocketAddr, URL, or hostname:port",
-            s
-        ))
-    }
-}
-
-impl std::fmt::Display for NetworkAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            NetworkAddr::Socket(addr) => write!(f, "{}", addr),
-            NetworkAddr::HostPort(host, port) => write!(f, "{}:{}", host, port),
-        }
-    }
-}
-
-// Newtype wrapper for Arc<NetworkAddr>
-#[derive(Clone)]
-pub struct NetworkAddrRef(pub Arc<NetworkAddr>);
-
-impl FromStr for NetworkAddrRef {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Parse the string into NetworkAddr first
-        let addr = NetworkAddr::from_str(s)?;
-        // Then wrap it in an Arc and our newtype
-        Ok(NetworkAddrRef(Arc::new(addr)))
-    }
-}
-
-// Allow easy dereferencing to access the inner NetworkAddr
-impl std::ops::Deref for NetworkAddrRef {
-    type Target = NetworkAddr;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// Allow conversion from NetworkAddrRef to Arc<NetworkAddr>
-impl From<NetworkAddrRef> for Arc<NetworkAddr> {
-    fn from(addr_ref: NetworkAddrRef) -> Self {
-        addr_ref.0
-    }
-}
-
-// Allow conversion from &str to NetworkAddrRef
-impl From<&str> for NetworkAddrRef {
-    fn from(s: &str) -> Self {
-        s.parse()
-            .unwrap_or_else(|e| panic!("Failed to parse address: {}", e))
-    }
-}
-
-impl std::fmt::Display for NetworkAddrRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
@@ -207,7 +81,7 @@ pub struct ClusterActor {
     socket: quinn::Endpoint,
     cancellation: tokio_util::sync::CancellationToken,
     state: State,
-    members: HashSet<Member>,
+    members: HashSet<Node>,
 }
 
 impl ClusterActor {
@@ -288,10 +162,10 @@ impl Actor for ClusterActor {
             // };
             //
 
-            let Some(member) = Member::spawn(
+            let Some(member) = Node::spawn(
                 ctx.subsystem(),
                 self.config.id.clone(),
-                Node::new(peer.clone()),
+                NodeInfo::from(peer.clone()),
                 self.socket.clone(),
                 self.config.tls.clone(),
             ) else {
@@ -348,46 +222,6 @@ enum StreamState {
     Handshake,
     Ready,
     Closed,
-}
-
-pub struct NodeAddr {
-    pub name: String,
-    pub addr: NetworkAddr,
-}
-
-#[derive(Clone)]
-pub struct Node {
-    pub name: String,
-    pub addr: NetworkAddrRef,
-    pub node_id: Id,
-}
-
-impl Node {
-    fn new(addr: NetworkAddrRef) -> Self {
-        Node {
-            name: "".to_string(),
-            addr,
-            node_id: Id::new(),
-        }
-    }
-
-    fn new_with_name(name: impl Into<String>, addr: NetworkAddrRef) -> Self {
-        Node {
-            name: name.into(),
-            addr,
-            node_id: Id::new(),
-        }
-    }
-}
-
-impl std::fmt::Display for Node {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "node(name={}, addr={}, node_id={})",
-            self.name, self.addr, self.node_id
-        )
-    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -449,18 +283,4 @@ impl From<quinn::ConnectionError> for ConnectionError {
             }
         }
     }
-}
-
-pub struct Connection {
-    pub node: Node,
-    pub socket: quinn::Endpoint,
-    pub tls: TlsConfig,
-    pub state: ConnectionState,
-}
-
-#[derive(Debug)]
-pub enum ConnectionState {
-    NotReady,
-    Connected { connection: quinn::Connection },
-    Disconnected { reason: ConnectionError },
 }

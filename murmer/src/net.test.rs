@@ -1,17 +1,20 @@
 use super::*;
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TestMessage {
+    value: String,
+}
+
 #[test]
 fn test_wire_frame_encode_decode() {
     // Create a system message
     let node_id = Id::new();
-    let system_msg = NodeMessage::Join {
-        node_id: node_id.clone(),
-        name: "test-node".to_string(),
-        capabilities: vec!["actor".to_string(), "cluster".to_string()],
+    let msg = TestMessage {
+        value: "test".to_string(),
     };
 
     // Create a wire frame
-    let frame = Frame::node(node_id.clone(), None, system_msg);
+    let frame = Frame::ok(node_id.clone(), None, msg);
 
     // Encode the frame
     let encoded = frame.encode().unwrap();
@@ -22,21 +25,11 @@ fn test_wire_frame_encode_decode() {
 
     // Decode the frame
     let body_bytes = encoded.slice(8..encoded.len());
-    let decoded = Frame::<MessageType>::decode(body_bytes).unwrap();
+    let decoded = Frame::<TestMessage>::decode(body_bytes).unwrap();
 
     // Verify the decoded frame
     match &decoded.payload {
-        Payload::Ok(MessageType::Node(NodeMessage::Join {
-            node_id: decoded_id,
-            name,
-            capabilities,
-        })) => {
-            assert_eq!(*decoded_id, node_id);
-            assert_eq!(name, "test-node");
-            assert_eq!(capabilities.len(), 2);
-            assert_eq!(capabilities[0], "actor");
-            assert_eq!(capabilities[1], "cluster");
-        }
+        Payload::Ok(msg) => assert_eq!(msg.value, "test"),
         _ => panic!("Decoded wrong message type"),
     }
 }
@@ -46,21 +39,19 @@ fn test_frame_reader() {
     // Create a few frames
     let node_id = Id::new();
 
-    let frame1 = Frame::node(
+    let frame1 = Frame::ok(
         node_id.clone(),
         None,
-        NodeMessage::Heartbeat {
-            timestamp: 123456789,
+        TestMessage {
+            value: "test1".to_string(),
         },
     );
 
-    let frame2 = Frame::node(
+    let frame2 = Frame::ok(
         node_id.clone(),
         None,
-        NodeMessage::Join {
-            node_id: node_id.clone(),
-            name: "test-node".to_string(),
-            capabilities: vec!["actor".to_string()],
+        TestMessage {
+            value: "test2".to_string(),
         },
     );
 
@@ -72,7 +63,7 @@ fn test_frame_reader() {
     println!("Encoded frame 2: {:?}", encoded2);
 
     // Create a reader
-    let mut reader = FrameParser::<MessageType>::new();
+    let mut reader = FrameParser::<TestMessage>::new();
 
     // Add partial data and verify no complete frame yet
     reader.extend(&encoded1[0..4]);
@@ -94,22 +85,15 @@ fn test_frame_reader() {
 
     // Verify the parsed frames
     match &parsed1.payload {
-        Payload::Ok(MessageType::Node(NodeMessage::Heartbeat { timestamp })) => {
-            assert_eq!(*timestamp, 123456789);
+        Payload::Ok(msg) => {
+            assert_eq!(msg.value, "test1");
         }
         _ => panic!("Parsed wrong message type for frame 1"),
     }
 
     match &parsed2.payload {
-        Payload::Ok(MessageType::Node(NodeMessage::Join {
-            node_id: parsed_id,
-            name,
-            capabilities,
-        })) => {
-            assert_eq!(*parsed_id, node_id);
-            assert_eq!(name, "test-node");
-            assert_eq!(capabilities.len(), 1);
-            assert_eq!(capabilities[0], "actor");
+        Payload::Ok(msg) => {
+            assert_eq!(msg.value, "test2");
         }
         _ => panic!("Parsed wrong message type for frame 2"),
     }

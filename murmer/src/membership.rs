@@ -1,243 +1,14 @@
 use crate::cluster::ClusterId;
 use crate::cluster::ConnectionError;
-use crate::cluster::ConnectionState;
-use crate::cluster::Node;
-use crate::net;
+use crate::net::{self, FrameWriter, NetworkAddrRef, NetworkDriver, QuicConnectionDriver};
 use crate::prelude::*;
 use crate::tls::TlsConfig;
 use chrono::{DateTime, Utc};
-use quinn::crypto::rustls::QuicClientConfig;
-use serde::{Serialize, de::DeserializeOwned};
-use std::marker::PhantomData;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(test)]
 #[path = "membership.test.rs"]
 mod tests;
-
-/// A stream for reading frames of type T
-pub struct FrameReader<T>
-where
-    T: Serialize + DeserializeOwned,
-{
-    inner: Box<dyn AsyncRead + Send + Unpin>,
-    reader: net::FrameParser<T>,
-}
-
-impl<T> FrameReader<T>
-where
-    T: Serialize + DeserializeOwned,
-{
-    pub fn new(stream: Box<dyn AsyncRead + Send + Unpin>) -> Self {
-        FrameReader {
-            inner: stream,
-            reader: net::FrameParser::new(),
-        }
-    }
-
-    /// Read the next frame from the stream
-    pub async fn read_frame(&mut self) -> Result<Option<net::Frame<T>>, net::NetError> {
-        // Try to parse a frame from the existing buffer
-        if let Some(frame) = self.reader.parse()? {
-            return Ok(Some(frame));
-        }
-
-        // Read more data from the stream
-        let mut buffer = [0u8; 1024];
-        loop {
-            match self.inner.read(&mut buffer).await {
-                Ok(0) => return Ok(None), // End of stream
-                Ok(n) => {
-                    // Add the data to the reader
-                    self.reader.extend(&buffer[..n]);
-
-                    // Try to parse a frame
-                    if let Some(frame) = self.reader.parse()? {
-                        return Ok(Some(frame));
-                    }
-                }
-                Err(e) => {
-                    return Err(net::NetError::InvalidFrame(format!("Read error: {}", e)));
-                }
-            }
-        }
-    }
-}
-
-/// A stream for writing frames of type T
-pub struct FrameWriter<T>
-where
-    T: Serialize + DeserializeOwned,
-{
-    inner: Box<dyn AsyncWrite + Send + Unpin>,
-    _phantom: PhantomData<T>,
-}
-
-impl<T> FrameWriter<T>
-where
-    T: Serialize + DeserializeOwned,
-{
-    pub fn new(stream: Box<dyn AsyncWrite + Send + Unpin>) -> Self {
-        FrameWriter {
-            inner: stream,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Write a frame to the stream
-    pub async fn write_frame(&mut self, frame: &net::Frame<T>) -> Result<(), net::NetError> {
-        let encoded = frame.encode()?;
-        self.inner
-            .write_all(&encoded)
-            .await
-            .map_err(|e| net::NetError::InvalidFrame(format!("Write error: {}", e)))?;
-        self.inner
-            .flush()
-            .await
-            .map_err(|e| net::NetError::InvalidFrame(format!("Flush error: {}", e)))?;
-        Ok(())
-    }
-}
-
-/// A type-erased stream that can be used to read and write raw bytes
-pub struct RawStream {
-    reader: Box<dyn AsyncRead + Send + Unpin>,
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
-}
-
-impl RawStream {
-    pub fn new(
-        reader: Box<dyn AsyncRead + Send + Unpin>,
-        writer: Box<dyn AsyncWrite + Send + Unpin>,
-    ) -> Self {
-        RawStream { reader, writer }
-    }
-
-    /// Convert this raw stream into a typed frame stream
-    pub fn into_frame_stream<T>(self) -> (FrameWriter<T>, FrameReader<T>)
-    where
-        T: Serialize + DeserializeOwned,
-    {
-        let writer = FrameWriter::new(self.writer);
-        let reader = FrameReader::new(self.reader);
-        (writer, reader)
-    }
-}
-
-#[async_trait]
-pub trait ConnectionDriver: Send {
-    async fn connect(&mut self) -> Result<(), ConnectionError>;
-
-    /// Open a new bidirectional stream for communication
-    /// Returns a type-erased stream that can be converted to a typed stream
-    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError>;
-}
-
-pub struct QuicConnectionDriver {
-    node: Node,
-    socket: quinn::Endpoint,
-    tls: TlsConfig,
-    state: ConnectionState,
-}
-
-impl QuicConnectionDriver {
-    pub fn new(node: Node, socket: quinn::Endpoint, tls: TlsConfig) -> Self {
-        QuicConnectionDriver {
-            node,
-            socket,
-            tls,
-            state: ConnectionState::NotReady,
-        }
-    }
-}
-
-#[async_trait]
-impl ConnectionDriver for QuicConnectionDriver {
-    async fn connect(&mut self) -> Result<(), ConnectionError> {
-        match &self.state {
-            ConnectionState::NotReady | ConnectionState::Disconnected { .. } => {
-                let tls = self.tls.clone();
-                let addr = self.node.addr.clone();
-                let socket = self.socket.clone();
-
-                let crypto = tls.into_client_config()?;
-                let sock_addr = addr.to_sock_addrs()?;
-
-                let Ok(client_config) = QuicClientConfig::try_from(crypto) else {
-                    return Err(ConnectionError::FailedToConnect(
-                        "Failed to create TLS QUIC client config".to_string(),
-                    ));
-                };
-                let client_config = quinn::ClientConfig::new(Arc::new(client_config));
-                let connection = match socket
-                    .connect_with(client_config, sock_addr, &addr.host())
-                    .map_err(|err| match err {
-                        quinn::ConnectError::EndpointStopping => ConnectionError::ConnectionClosed(
-                            "internal endpoint is stopping, cannot create new connections"
-                                .to_string(),
-                        ),
-                        quinn::ConnectError::CidsExhausted => ConnectionError::FailedToConnect(
-                            "CID space are exhausted, cannot create new connections".to_string(),
-                        ),
-                        quinn::ConnectError::InvalidServerName(name) => {
-                            ConnectionError::FailedToConnect(format!(
-                                "Invalid server name: {}",
-                                name
-                            ))
-                        }
-                        quinn::ConnectError::InvalidRemoteAddress(socket_addr) => {
-                            ConnectionError::FailedToConnect(format!(
-                                "Invalid remote address: {}",
-                                socket_addr
-                            ))
-                        }
-                        quinn::ConnectError::NoDefaultClientConfig => {
-                            ConnectionError::InvalidConfiguration
-                        }
-                        quinn::ConnectError::UnsupportedVersion => {
-                            ConnectionError::FailedToConnect(
-                                "Peer does not support the required QUIC version".to_string(),
-                            )
-                        }
-                    }) {
-                    Ok(connection) => connection,
-                    Err(e) => {
-                        self.state = ConnectionState::Disconnected {
-                            reason: ConnectionError::ConnectionFailed(
-                                "Failed to open initial connection to node.".to_string(),
-                            ),
-                        };
-                        return Err(e);
-                    }
-                }
-                .await?;
-
-                self.state = ConnectionState::Connected { connection };
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError> {
-        match &self.state {
-            ConnectionState::Connected { connection } => {
-                // Open a bidirectional stream
-                let (send, recv) = connection.open_bi().await.map_err(|e| {
-                    ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
-                })?;
-
-                // Create the raw stream
-                Ok(RawStream::new(Box::new(recv), Box::new(send)))
-            }
-            ConnectionState::NotReady => Err(ConnectionError::NotConnected),
-            ConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
-                format!("Connection is disconnected: {}", reason),
-            )),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum Membership {
@@ -275,50 +46,88 @@ impl Reachability {
 }
 
 #[derive(Clone)]
-pub struct Member {
-    node_id: Id,
-    endpoint: Endpoint<MemberActor>,
+pub struct NodeInfo {
+    pub name: String,
+    pub addr: NetworkAddrRef,
+    pub node_id: Id,
 }
 
-impl Member {
+impl NodeInfo {
+    fn new(addr: NetworkAddrRef) -> Self {
+        NodeInfo {
+            name: hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "default".to_string()),
+            addr,
+            node_id: Id::new(),
+        }
+    }
+
+    fn new_with_name(name: impl Into<String>, addr: NetworkAddrRef) -> Self {
+        NodeInfo {
+            name: name.into(),
+            addr,
+            node_id: Id::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for NodeInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "node(name={}, addr={}, node_id={})",
+            self.name, self.addr, self.node_id
+        )
+    }
+}
+
+impl From<NetworkAddrRef> for NodeInfo {
+    fn from(addr: NetworkAddrRef) -> Self {
+        NodeInfo::new(addr)
+    }
+}
+
+#[derive(Clone)]
+pub struct Node {
+    id: Id,
+    endpoint: Endpoint<NodeActor>,
+}
+
+impl Node {
     pub fn spawn(
         system: System,
         cluster_id: Arc<ClusterId>,
-        node: Node,
+        node_info: NodeInfo,
         socket: quinn::Endpoint,
         tls: TlsConfig,
-    ) -> Option<Member> {
-        let node_id = node.node_id.clone();
+    ) -> Option<Node> {
+        let id = node_info.node_id.clone();
 
-        let driver = Box::new(QuicConnectionDriver::new(node.clone(), socket, tls));
-        let endpoint = system.spawn_with(MemberActor {
-            node,
+        let driver = Box::new(QuicConnectionDriver::new(node_info.clone(), socket, tls));
+        let endpoint = system.spawn_with(NodeActor {
+            node_info,
             id: cluster_id.id.clone(),
             driver,
             membership: Membership::Pending,
             reachability: Reachability::Pending,
             send_stream: None,
         });
-        endpoint
-            .map(|e| Member {
-                node_id,
-                endpoint: e,
-            })
-            .ok()
+        endpoint.map(|e| Node { id, endpoint: e }).ok()
     }
 }
 
-impl Eq for Member {}
+impl Eq for Node {}
 
-impl PartialEq for Member {
+impl PartialEq for Node {
     fn eq(&self, other: &Self) -> bool {
-        self.node_id == other.node_id
+        self.id == other.id
     }
 }
 
-impl std::hash::Hash for Member {
+impl std::hash::Hash for Node {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.node_id.hash(state);
+        self.id.hash(state);
     }
 }
 
@@ -332,57 +141,50 @@ pub enum MemberError {
 }
 
 #[derive(Debug)]
-pub struct MemberActorHeartbeat;
+pub struct NodeActorHeartbeatMessage;
 
-impl Message for MemberActorHeartbeat {
+impl Message for NodeActorHeartbeatMessage {
     type Result = Result<(), MemberError>;
 }
 
 #[derive(Debug)]
-pub struct MemberActorSetConnectionState(pub ConnectionState);
-
-impl Message for MemberActorSetConnectionState {
-    type Result = Result<(), MemberError>;
-}
-
-#[derive(Debug)]
-pub struct MemberActorHeartbeatCheck {
+pub struct NodeActorHeartbeatCheckMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-impl Message for MemberActorHeartbeatCheck {
+impl Message for NodeActorHeartbeatCheckMessage {
     type Result = ();
 }
 
 #[derive(Debug)]
-pub struct MemberActorHeartbeatUpdate {
+pub struct NodeActorHeartbeatUpdateMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-impl Message for MemberActorHeartbeatUpdate {
+impl Message for NodeActorHeartbeatUpdateMessage {
     type Result = ();
 }
 
 #[derive(Debug)]
-pub struct MemberActorRecvFrame(pub Result<net::Frame<net::NodeMessage>, net::NetError>);
+pub struct NodeActorRecvFrameMessage(pub Result<net::Frame<net::NodeMessage>, net::NetError>);
 
-impl Message for MemberActorRecvFrame {
+impl Message for NodeActorRecvFrameMessage {
     type Result = ();
 }
 
-pub struct MemberActor {
+pub struct NodeActor {
     pub id: Id,
-    pub node: Node,
-    pub driver: Box<dyn ConnectionDriver>,
+    pub node_info: NodeInfo,
+    pub driver: Box<dyn NetworkDriver>,
     pub membership: Membership,
     pub reachability: Reachability,
     pub send_stream: Option<FrameWriter<net::NodeMessage>>,
 }
 
-impl MemberActor {
+impl NodeActor {
     async fn send_message(&mut self, message: net::NodeMessage) -> Result<(), MemberError> {
         if let Some(ref mut stream) = self.send_stream {
-            let frame = net::Frame::ok(self.node.node_id.clone(), None, message);
+            let frame = net::Frame::ok(self.node_info.node_id.clone(), None, message);
             if let Err(e) = stream.write_frame(&frame).await {
                 tracing::error!(error=%e, "Failed to send message");
                 return Err(MemberError::NodeNetworkError(e));
@@ -395,9 +197,9 @@ impl MemberActor {
 }
 
 #[async_trait::async_trait]
-impl Actor for MemberActor {
+impl Actor for NodeActor {
     async fn started(&mut self, ctx: &mut Context<Self>) {
-        tracing::info!(node_id=%self.node.node_id, "Member started");
+        tracing::info!(node_id=%self.node_info.node_id, "Member started");
 
         // Update membership state
         self.membership = Membership::Pending;
@@ -445,7 +247,7 @@ impl Actor for MemberActor {
 
         // Start the receive loop for the main node stream
         let endpoint = ctx.endpoint();
-        let node_id = self.node.node_id.clone();
+        let node_id = self.node_info.node_id.clone();
         let mut running = true;
         ctx.spawn(async move {
             let span = tracing::trace_span!("member-rx", node_id=%node_id);
@@ -462,7 +264,7 @@ impl Actor for MemberActor {
                 };
                 tracing::trace!("Received frame: {:?}", frame);
                 if let Err(err) = endpoint
-                    .send_in_background(MemberActorRecvFrame(frame))
+                    .send_in_background(NodeActorRecvFrameMessage(frame))
                     .await
                 {
                     tracing::error!(error=%err, "Failed to send frame message to member actor. exiting read loop.");
@@ -529,9 +331,9 @@ impl Actor for MemberActor {
     }
 }
 
-impl Handler<MemberActorRecvFrame> for MemberActor {
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: MemberActorRecvFrame) {
-        tracing::info!(node_id=%self.node.node_id, "Received frame");
+impl Handler<NodeActorRecvFrameMessage> for NodeActor {
+    fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorRecvFrameMessage) {
+        tracing::info!(node_id=%self.node_info.node_id, "Received frame");
         match msg.0 {
             Ok(frame) => {}
             Err(e) => {}
@@ -539,8 +341,8 @@ impl Handler<MemberActorRecvFrame> for MemberActor {
     }
 }
 
-impl Handler<MemberActorHeartbeatUpdate> for MemberActor {
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: MemberActorHeartbeatUpdate) {
+impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
+    fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatUpdateMessage) {
         let ping_time = msg.timestamp;
         match self.reachability {
             Reachability::Unreachable { pings, last_seen } => {
@@ -571,9 +373,9 @@ impl Handler<MemberActorHeartbeatUpdate> for MemberActor {
     }
 }
 
-impl Handler<MemberActorHeartbeatCheck> for MemberActor {
+impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
     /// Check the reachability of the node and update the reachability state accordingly.
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: MemberActorHeartbeatCheck) {
+    fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatCheckMessage) {
         let timestamp = msg.timestamp;
         match &self.reachability {
             Reachability::Reachable { misses, last_seen } => {

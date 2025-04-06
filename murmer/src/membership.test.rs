@@ -1,3 +1,4 @@
+use crate::net::{NetworkDriver, RawStream};
 use crate::system::TestSupervisor;
 
 use super::*;
@@ -70,7 +71,7 @@ impl MockConnectionDriver {
 }
 
 #[async_trait]
-impl ConnectionDriver for MockConnectionDriver {
+impl NetworkDriver for MockConnectionDriver {
     async fn connect(&mut self) -> Result<(), ConnectionError> {
         Ok(())
     }
@@ -219,12 +220,12 @@ impl AsyncWrite for MockStreamWriter {
 async fn test_member_actor_reachability_to_unreachable() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let actor = MemberActor {
+    let actor = NodeActor {
         id: Id::new(),
-        node: Node {
+        node_info: NodeInfo {
             name: "test".to_string(),
             node_id: Id::new(),
-            addr: crate::cluster::NetworkAddrRef::from("127.0.0.1:8000"),
+            addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
         membership: Membership::Pending,
@@ -235,7 +236,7 @@ async fn test_member_actor_reachability_to_unreachable() {
     let mut s = TestSupervisor::new(actor);
 
     let _timestamp = chrono::Utc::now();
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: _timestamp.clone(),
     };
 
@@ -244,7 +245,7 @@ async fn test_member_actor_reachability_to_unreachable() {
     assert_matches!(s.actor_ref().reachability, Reachability::Pending);
 
     // Simulate a successful heartbeat
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: _timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -259,7 +260,7 @@ async fn test_member_actor_reachability_to_unreachable() {
     // 1) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let _check_timestamp = _timestamp + chrono::Duration::seconds(5);
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: _check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -274,7 +275,7 @@ async fn test_member_actor_reachability_to_unreachable() {
     // 2) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let check_timestamp = _check_timestamp + chrono::Duration::seconds(5);
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -289,7 +290,7 @@ async fn test_member_actor_reachability_to_unreachable() {
     // 3) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let check_timestamp = check_timestamp + chrono::Duration::seconds(5);
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -304,7 +305,7 @@ async fn test_member_actor_reachability_to_unreachable() {
     // 4) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let check_timestamp = check_timestamp + chrono::Duration::seconds(5);
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -322,12 +323,12 @@ async fn test_member_actor_reachability_to_unreachable() {
 async fn test_member_actor_reachability_reset() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let actor = MemberActor {
+    let actor = NodeActor {
         id: Id::new(),
-        node: Node {
+        node_info: NodeInfo {
             name: "test".to_string(),
             node_id: Id::new(),
-            addr: crate::cluster::NetworkAddrRef::from("127.0.0.1:8000"),
+            addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
         membership: Membership::Pending,
@@ -338,13 +339,13 @@ async fn test_member_actor_reachability_reset() {
     let mut s = TestSupervisor::new(actor);
 
     let timestamp = chrono::Utc::now();
-    let msg = MemberActorHeartbeatCheck { timestamp };
+    let msg = NodeActorHeartbeatCheckMessage { timestamp };
 
     let _ = s.send(&system, msg).await;
     assert_matches!(s.actor_ref().reachability, Reachability::Pending);
 
     // Simulate a successful heartbeat
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -359,7 +360,7 @@ async fn test_member_actor_reachability_reset() {
     // 1) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let check_timestamp = timestamp + chrono::Duration::seconds(5);
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -374,7 +375,7 @@ async fn test_member_actor_reachability_reset() {
     // 2) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let check_timestamp = check_timestamp + chrono::Duration::seconds(5);
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -387,12 +388,12 @@ async fn test_member_actor_reachability_reset() {
     );
 
     // Simulate a successful heartbeat
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
     // Re-check to reset the misses.
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -407,7 +408,7 @@ async fn test_member_actor_reachability_reset() {
     // 3) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let check_timestamp = check_timestamp + chrono::Duration::seconds(5);
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -424,12 +425,12 @@ async fn test_member_actor_reachability_reset() {
 async fn test_member_actor_unreachable_to_reachable() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let actor = MemberActor {
+    let actor = NodeActor {
         id: Id::new(),
-        node: Node {
+        node_info: NodeInfo {
             name: "test".to_string(),
             node_id: Id::new(),
-            addr: crate::cluster::NetworkAddrRef::from("127.0.0.1:8000"),
+            addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
         membership: Membership::Pending,
@@ -445,7 +446,7 @@ async fn test_member_actor_unreachable_to_reachable() {
     let _timestamp = chrono::Utc::now();
 
     // Simulate a successful heartbeat
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: _timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -460,12 +461,12 @@ async fn test_member_actor_unreachable_to_reachable() {
     // 1) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let check_timestamp = _timestamp + chrono::Duration::seconds(2);
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
 
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -478,7 +479,7 @@ async fn test_member_actor_unreachable_to_reachable() {
     );
 
     // 2) Simulate a heartbeat check
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -491,7 +492,7 @@ async fn test_member_actor_unreachable_to_reachable() {
     );
 
     // 4) Simulate a heartbeat check
-    let msg = MemberActorHeartbeatCheck {
+    let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -509,12 +510,12 @@ async fn test_member_actor_unreachable_to_reachable() {
 async fn test_member_actor_unreachable_reset() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let actor = MemberActor {
+    let actor = NodeActor {
         id: Id::new(),
-        node: Node {
+        node_info: NodeInfo {
             name: "test".to_string(),
             node_id: Id::new(),
-            addr: crate::cluster::NetworkAddrRef::from("127.0.0.1:8000"),
+            addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
         membership: Membership::Pending,
@@ -530,7 +531,7 @@ async fn test_member_actor_unreachable_reset() {
     let _timestamp = chrono::Utc::now();
 
     // Simulate a successful heartbeat
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: _timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -545,7 +546,7 @@ async fn test_member_actor_unreachable_reset() {
     // 1) Simulate a heartbeat check failure
     // Move the check time forward by 5 seconds.
     let _future_timestamp = _timestamp + chrono::Duration::seconds(2);
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: _future_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -559,7 +560,7 @@ async fn test_member_actor_unreachable_reset() {
 
     // 2) Simulate a heartbeat update in the far future
     let _future_timestamp = _timestamp + chrono::Duration::seconds(20);
-    let msg = MemberActorHeartbeatUpdate {
+    let msg = NodeActorHeartbeatUpdateMessage {
         timestamp: _future_timestamp.clone(),
     };
     let _ = s.send(&system, msg).await;
@@ -576,15 +577,15 @@ async fn test_member_actor_unreachable_reset() {
 async fn test_membership_initiation() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver.clone());
-    let node = Node {
+    let info = NodeInfo {
         name: "test".to_string(),
         node_id: Id::new(),
-        addr: crate::cluster::NetworkAddrRef::from("127.0.0.1:8000"),
+        addr: NetworkAddrRef::from("127.0.0.1:8000"),
     };
 
-    let actor = MemberActor {
+    let actor = NodeActor {
         id: Id::new(),
-        node: node.clone(),
+        node_info: info.clone(),
         driver: Box::new(driver),
         membership: Membership::Pending,
         reachability: Reachability::Pending,
@@ -626,7 +627,7 @@ async fn test_membership_initiation() {
 
     // 2) Simulate receiving InitAck response
     let init_accept = net::Frame {
-        header: net::Header::new(Id::new(), Some(node.node_id.clone())),
+        header: net::Header::new(Id::new(), Some(info.node_id.clone())),
         payload: net::Payload::Ok(net::NodeMessage::InitAck { node_id: Id::new() }),
     };
     test_driver.push_frame(init_accept);

@@ -1,8 +1,18 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
+use std::{
+    marker::PhantomData,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::cluster::{ConnectionError, ConnectionState};
 use crate::id::Id;
+use crate::membership::NodeInfo;
+use crate::tls::TlsConfig;
 
 #[cfg(test)]
 #[path = "./net.test.rs"]
@@ -11,6 +21,128 @@ mod tests;
 /// Protocol version for wire format
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
 
+#[derive(thiserror::Error, Debug)]
+pub enum NetworkAddrError {
+    #[error("Failed to parse network address: {0}")]
+    ParseError(String),
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(String),
+    #[error("Invalid Socket Address: {0}")]
+    InvalidSocketAddr(String),
+    #[error("Addr parsing error: {0}")]
+    AddrParseError(#[from] std::net::AddrParseError),
+    #[error("failed to parse url into socket addr: {0}")]
+    ToSocketAddrError(String),
+}
+
+pub enum NetworkAddr {
+    Socket(SocketAddr),
+    HostPort(String, u16),
+}
+
+impl NetworkAddr {
+    pub fn host(&self) -> String {
+        match self {
+            NetworkAddr::Socket(addr) => addr.ip().to_string().as_str().to_string(),
+            NetworkAddr::HostPort(host, _) => host.clone(),
+        }
+    }
+
+    pub fn to_sock_addrs(&self) -> Result<SocketAddr, NetworkAddrError> {
+        match self {
+            NetworkAddr::Socket(addr) => Ok(*addr),
+            NetworkAddr::HostPort(host, port) => (host.as_str(), *port)
+                .to_socket_addrs()
+                .map_err(|_| {
+                    NetworkAddrError::ToSocketAddrError(
+                        "failed to parse host/port into socket addr".to_string(),
+                    )
+                })?
+                .next()
+                .ok_or(NetworkAddrError::ToSocketAddrError(
+                    "failed to resolve host".to_string(),
+                )),
+        }
+    }
+}
+
+impl FromStr for NetworkAddr {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Try parsing as SocketAddr
+        if let Ok(addr) = s.parse::<SocketAddr>() {
+            return Ok(NetworkAddr::Socket(addr));
+        }
+
+        // Try parsing as hostname:port
+        if let Some((host, port_str)) = s.rsplit_once(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                if !host.is_empty() {
+                    return Ok(NetworkAddr::HostPort(host.to_string(), port));
+                }
+            }
+        }
+        Err(format!(
+            "Failed to parse '{}' as SocketAddr, URL, or hostname:port",
+            s
+        ))
+    }
+}
+
+impl std::fmt::Display for NetworkAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            NetworkAddr::Socket(addr) => write!(f, "{}", addr),
+            NetworkAddr::HostPort(host, port) => write!(f, "{}:{}", host, port),
+        }
+    }
+}
+
+// Newtype wrapper for Arc<NetworkAddr>
+#[derive(Clone)]
+pub struct NetworkAddrRef(pub Arc<NetworkAddr>);
+
+impl FromStr for NetworkAddrRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Parse the string into NetworkAddr first
+        let addr = NetworkAddr::from_str(s)?;
+        // Then wrap it in an Arc and our newtype
+        Ok(NetworkAddrRef(Arc::new(addr)))
+    }
+}
+
+// Allow easy dereferencing to access the inner NetworkAddr
+impl std::ops::Deref for NetworkAddrRef {
+    type Target = NetworkAddr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Allow conversion from NetworkAddrRef to Arc<NetworkAddr>
+impl From<NetworkAddrRef> for Arc<NetworkAddr> {
+    fn from(addr_ref: NetworkAddrRef) -> Self {
+        addr_ref.0
+    }
+}
+
+// Allow conversion from &str to NetworkAddrRef
+impl From<&str> for NetworkAddrRef {
+    fn from(s: &str) -> Self {
+        s.parse()
+            .unwrap_or_else(|e| panic!("Failed to parse address: {}", e))
+    }
+}
+
+impl std::fmt::Display for NetworkAddrRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 /// Error types for wire format operations
 #[derive(thiserror::Error, Debug)]
 pub enum NetError {
@@ -195,77 +327,12 @@ impl<T> Payload<T> {
     }
 }
 
-/// Enum for different message categories
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MessageType {
-    /// System-level messages (membership, heartbeats)
-    Node(NodeMessage),
-    /// Actor-to-actor communication
-    Actor(ActorMessage),
-    /// Cluster state and management
-    Cluster(ClusterMessage),
-}
-
-impl MessageType {
-    /// Helper method to extract NodeMessage if present
-    pub fn as_node(&self) -> Option<&NodeMessage> {
-        match self {
-            MessageType::Node(msg) => Some(msg),
-            _ => None,
-        }
-    }
-
-    /// Helper method to extract ActorMessage if present
-    pub fn as_actor(&self) -> Option<&ActorMessage> {
-        match self {
-            MessageType::Actor(msg) => Some(msg),
-            _ => None,
-        }
-    }
-
-    /// Helper method to extract ClusterMessage if present
-    pub fn as_cluster(&self) -> Option<&ClusterMessage> {
-        match self {
-            MessageType::Cluster(msg) => Some(msg),
-            _ => None,
-        }
-    }
-}
-
 /// Top-level frame that gets encoded/decoded from the wire
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame<T> {
-    // TODO: add protocol versioning to decoding of the frame.
-    /// Header with metadata
     pub header: Header,
     /// Typed payload
     pub payload: Payload<T>,
-}
-
-impl Frame<MessageType> {
-    /// Create a new wire frame with system message
-    pub fn node(sender_id: Id, target_id: Option<Id>, message: NodeMessage) -> Self {
-        Frame {
-            header: Header::new(sender_id, target_id),
-            payload: Payload::Ok(MessageType::Node(message)),
-        }
-    }
-
-    /// Create a new wire frame with actor message
-    pub fn actor(sender_id: Id, target_id: Option<Id>, message: ActorMessage) -> Self {
-        Frame {
-            header: Header::new(sender_id, target_id),
-            payload: Payload::Ok(MessageType::Actor(message)),
-        }
-    }
-
-    /// Create a new wire frame with cluster message
-    pub fn cluster(sender_id: Id, target_id: Option<Id>, message: ClusterMessage) -> Self {
-        Frame {
-            header: Header::new(sender_id, target_id),
-            payload: Payload::Ok(MessageType::Cluster(message)),
-        }
-    }
 }
 
 impl<T> Frame<T>
@@ -442,3 +509,235 @@ where
         Ok(frames)
     }
 }
+
+/// A stream for reading frames of type T
+pub struct FrameReader<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    inner: Box<dyn AsyncRead + Send + Unpin>,
+    reader: FrameParser<T>,
+}
+
+impl<T> FrameReader<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    pub fn new(stream: Box<dyn AsyncRead + Send + Unpin>) -> Self {
+        FrameReader {
+            inner: stream,
+            reader: FrameParser::new(),
+        }
+    }
+
+    /// Read the next frame from the stream
+    pub async fn read_frame(&mut self) -> Result<Option<Frame<T>>, NetError> {
+        // Try to parse a frame from the existing buffer
+        if let Some(frame) = self.reader.parse()? {
+            return Ok(Some(frame));
+        }
+
+        // Read more data from the stream
+        let mut buffer = [0u8; 1024];
+        loop {
+            match self.inner.read(&mut buffer).await {
+                Ok(0) => return Ok(None), // End of stream
+                Ok(n) => {
+                    // Add the data to the reader
+                    self.reader.extend(&buffer[..n]);
+
+                    // Try to parse a frame
+                    if let Some(frame) = self.reader.parse()? {
+                        return Ok(Some(frame));
+                    }
+                }
+                Err(e) => {
+                    return Err(NetError::InvalidFrame(format!("Read error: {}", e)));
+                }
+            }
+        }
+    }
+}
+
+/// A stream for writing frames of type T
+pub struct FrameWriter<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    inner: Box<dyn AsyncWrite + Send + Unpin>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> FrameWriter<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    pub fn new(stream: Box<dyn AsyncWrite + Send + Unpin>) -> Self {
+        FrameWriter {
+            inner: stream,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Write a frame to the stream
+    pub async fn write_frame(&mut self, frame: &Frame<T>) -> Result<(), NetError> {
+        let encoded = frame.encode()?;
+        self.inner
+            .write_all(&encoded)
+            .await
+            .map_err(|e| NetError::InvalidFrame(format!("Write error: {}", e)))?;
+        self.inner
+            .flush()
+            .await
+            .map_err(|e| NetError::InvalidFrame(format!("Flush error: {}", e)))?;
+        Ok(())
+    }
+}
+
+/// A type-erased stream that can be used to read and write raw bytes
+pub struct RawStream {
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
+}
+
+impl RawStream {
+    pub fn new(
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        writer: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> Self {
+        RawStream { reader, writer }
+    }
+
+    /// Convert this raw stream into a typed frame stream
+    pub fn into_frame_stream<T>(self) -> (FrameWriter<T>, FrameReader<T>)
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let writer = FrameWriter::new(self.writer);
+        let reader = FrameReader::new(self.reader);
+        (writer, reader)
+    }
+}
+
+//
+// Network Driver Implementations
+//
+
+/// Network driver trait for establishing connections and opening streams
+#[async_trait::async_trait]
+pub trait NetworkDriver: Send {
+    /// Connect to a remote node
+    async fn connect(&mut self) -> Result<(), ConnectionError>;
+
+    /// Open a new bidirectional stream for communication
+    /// Returns a type-erased stream that can be converted to a typed stream
+    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError>;
+}
+
+/// QUIC-based implementation of the NetworkDriver trait
+pub struct QuicConnectionDriver {
+    node_info: NodeInfo,
+    socket: quinn::Endpoint,
+    tls: TlsConfig,
+    state: ConnectionState,
+}
+
+impl QuicConnectionDriver {
+    pub fn new(node_info: NodeInfo, socket: quinn::Endpoint, tls: TlsConfig) -> Self {
+        QuicConnectionDriver {
+            node_info,
+            socket,
+            tls,
+            state: ConnectionState::NotReady,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl NetworkDriver for QuicConnectionDriver {
+    async fn connect(&mut self) -> Result<(), ConnectionError> {
+        match &self.state {
+            ConnectionState::NotReady | ConnectionState::Disconnected { .. } => {
+                let tls = self.tls.clone();
+                let addr = self.node_info.addr.clone();
+                let socket = self.socket.clone();
+
+                let crypto = tls.into_client_config()?;
+                let sock_addr = addr.to_sock_addrs()?;
+
+                let Ok(client_config) = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+                else {
+                    return Err(ConnectionError::FailedToConnect(
+                        "Failed to create TLS QUIC client config".to_string(),
+                    ));
+                };
+                let client_config = quinn::ClientConfig::new(Arc::new(client_config));
+                let connection = match socket
+                    .connect_with(client_config, sock_addr, &addr.host())
+                    .map_err(|err| match err {
+                        quinn::ConnectError::EndpointStopping => ConnectionError::ConnectionClosed(
+                            "internal endpoint is stopping, cannot create new connections"
+                                .to_string(),
+                        ),
+                        quinn::ConnectError::CidsExhausted => ConnectionError::FailedToConnect(
+                            "CID space are exhausted, cannot create new connections".to_string(),
+                        ),
+                        quinn::ConnectError::InvalidServerName(name) => {
+                            ConnectionError::FailedToConnect(format!(
+                                "Invalid server name: {}",
+                                name
+                            ))
+                        }
+                        quinn::ConnectError::InvalidRemoteAddress(socket_addr) => {
+                            ConnectionError::FailedToConnect(format!(
+                                "Invalid remote address: {}",
+                                socket_addr
+                            ))
+                        }
+                        quinn::ConnectError::NoDefaultClientConfig => {
+                            ConnectionError::InvalidConfiguration
+                        }
+                        quinn::ConnectError::UnsupportedVersion => {
+                            ConnectionError::FailedToConnect(
+                                "Peer does not support the required QUIC version".to_string(),
+                            )
+                        }
+                    }) {
+                    Ok(connection) => connection,
+                    Err(e) => {
+                        self.state = ConnectionState::Disconnected {
+                            reason: ConnectionError::ConnectionFailed(
+                                "Failed to open initial connection to node.".to_string(),
+                            ),
+                        };
+                        return Err(e);
+                    }
+                }
+                .await?;
+
+                self.state = ConnectionState::Connected { connection };
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError> {
+        match &self.state {
+            ConnectionState::Connected { connection } => {
+                // Open a bidirectional stream
+                let (send, recv) = connection.open_bi().await.map_err(|e| {
+                    ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
+                })?;
+
+                // Create the raw stream
+                Ok(RawStream::new(Box::new(recv), Box::new(send)))
+            }
+            ConnectionState::NotReady => Err(ConnectionError::NotConnected),
+            ConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+                format!("Connection is disconnected: {}", reason),
+            )),
+        }
+    }
+}
+
