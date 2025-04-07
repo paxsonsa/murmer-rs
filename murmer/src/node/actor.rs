@@ -1,197 +1,28 @@
-use crate::cluster::ClusterId;
-use crate::cluster::ConnectionError;
-use crate::net::{self, FrameWriter, NetworkAddrRef, NetworkDriver, QuicConnectionDriver};
-use crate::prelude::*;
-use crate::tls::TlsConfig;
+use crate::net::{self, FrameWriter, NetworkDriver};
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
 
-#[cfg(test)]
-#[path = "membership.test.rs"]
-mod tests;
-
-#[derive(Debug)]
-pub enum Membership {
-    Pending,
-    Up,
-    Down,
-    Joining,
-    Leaving,
-    Removed,
-    Failed,
-}
-
-#[derive(Debug)]
-pub enum Reachability {
-    Pending,
-    Reachable {
-        // The number of consecutive heartbeat misses.
-        misses: u32,
-        // The last time the node's heartbeat/message was received.
-        last_seen: DateTime<Utc>,
-    },
-    Unreachable {
-        pings: u32,
-        last_seen: DateTime<Utc>,
-    },
-}
-
-impl Reachability {
-    pub fn reachable_now() -> Self {
-        Reachability::Reachable {
-            misses: 0,
-            last_seen: Utc::now(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct NodeInfo {
-    pub name: String,
-    pub addr: NetworkAddrRef,
-    pub node_id: Id,
-}
-
-impl NodeInfo {
-    fn new(addr: NetworkAddrRef) -> Self {
-        NodeInfo {
-            name: hostname::get()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "default".to_string()),
-            addr,
-            node_id: Id::new(),
-        }
-    }
-
-    fn new_with_name(name: impl Into<String>, addr: NetworkAddrRef) -> Self {
-        NodeInfo {
-            name: name.into(),
-            addr,
-            node_id: Id::new(),
-        }
-    }
-}
-
-impl std::fmt::Display for NodeInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "node(name={}, addr={}, node_id={})",
-            self.name, self.addr, self.node_id
-        )
-    }
-}
-
-impl From<NetworkAddrRef> for NodeInfo {
-    fn from(addr: NetworkAddrRef) -> Self {
-        NodeInfo::new(addr)
-    }
-}
-
-#[derive(Clone)]
-pub struct Node {
-    id: Id,
-    endpoint: Endpoint<NodeActor>,
-}
-
-impl Node {
-    pub fn spawn(
-        system: System,
-        cluster_id: Arc<ClusterId>,
-        node_info: NodeInfo,
-        socket: quinn::Endpoint,
-        tls: TlsConfig,
-    ) -> Option<Node> {
-        let id = node_info.node_id.clone();
-
-        let driver = Box::new(QuicConnectionDriver::new(node_info.clone(), socket, tls));
-        let endpoint = system.spawn_with(NodeActor {
-            node_info,
-            id: cluster_id.id.clone(),
-            driver,
-            membership: Membership::Pending,
-            reachability: Reachability::Pending,
-            send_stream: None,
-        });
-        endpoint.map(|e| Node { id, endpoint: e }).ok()
-    }
-}
-
-impl Eq for Node {}
-
-impl PartialEq for Node {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl std::hash::Hash for Node {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum MemberError {
-    #[error("Member not connected")]
-    NotConnected,
-
-    #[error("Node network error: {0}")]
-    NodeNetworkError(#[from] net::NetError),
-}
-
-#[derive(Debug)]
-pub struct NodeActorHeartbeatMessage;
-
-impl Message for NodeActorHeartbeatMessage {
-    type Result = Result<(), MemberError>;
-}
-
-#[derive(Debug)]
-pub struct NodeActorHeartbeatCheckMessage {
-    pub timestamp: DateTime<Utc>,
-}
-
-impl Message for NodeActorHeartbeatCheckMessage {
-    type Result = ();
-}
-
-#[derive(Debug)]
-pub struct NodeActorHeartbeatUpdateMessage {
-    pub timestamp: DateTime<Utc>,
-}
-
-impl Message for NodeActorHeartbeatUpdateMessage {
-    type Result = ();
-}
-
-#[derive(Debug)]
-pub struct NodeActorRecvFrameMessage(pub Result<net::Frame<net::NodeMessage>, net::NetError>);
-
-impl Message for NodeActorRecvFrameMessage {
-    type Result = ();
-}
+use super::*;
 
 pub struct NodeActor {
     pub id: Id,
     pub node_info: NodeInfo,
     pub driver: Box<dyn NetworkDriver>,
-    pub membership: Membership,
+    pub membership: Status,
     pub reachability: Reachability,
     pub send_stream: Option<FrameWriter<net::NodeMessage>>,
 }
 
 impl NodeActor {
-    async fn send_message(&mut self, message: net::NodeMessage) -> Result<(), MemberError> {
+    async fn send_message(&mut self, message: net::NodeMessage) -> Result<(), NodeError> {
         if let Some(ref mut stream) = self.send_stream {
             let frame = net::Frame::ok(self.node_info.node_id.clone(), None, message);
             if let Err(e) = stream.write_frame(&frame).await {
                 tracing::error!(error=%e, "Failed to send message");
-                return Err(MemberError::NodeNetworkError(e));
+                return Err(NodeError::NodeNetworkError(e));
             }
             Ok(())
         } else {
-            Err(MemberError::NotConnected)
+            Err(NodeError::NotConnected)
         }
     }
 }
@@ -202,13 +33,13 @@ impl Actor for NodeActor {
         tracing::info!(node_id=%self.node_info.node_id, "Member started");
 
         // Update membership state
-        self.membership = Membership::Pending;
+        self.membership = Status::Pending;
         self.reachability = Reachability::Pending;
 
         // Establish the connection regardless of the current state
         if let Err(err) = self.driver.connect().await {
             tracing::error!(error=%err, "Failed to establish connection");
-            self.membership = Membership::Failed;
+            self.membership = Status::Failed;
             self.reachability = Reachability::Unreachable {
                 pings: 0,
                 last_seen: Utc::now(),
@@ -221,7 +52,7 @@ impl Actor for NodeActor {
             Ok(stream) => stream,
             Err(e) => {
                 tracing::error!(error=%e, "Failed to establish member connection stream");
-                self.membership = Membership::Failed;
+                self.membership = Status::Failed;
                 self.reachability = Reachability::Unreachable {
                     pings: 0,
                     last_seen: Utc::now(),
@@ -241,7 +72,7 @@ impl Actor for NodeActor {
         };
         if let Err(err) = self.send_message(init).await {
             tracing::error!(error=%err, "Failed to send initial message");
-            self.membership = Membership::Failed;
+            self.membership = Status::Failed;
             return;
         }
 
@@ -331,6 +162,13 @@ impl Actor for NodeActor {
     }
 }
 
+#[derive(Debug)]
+pub struct NodeActorRecvFrameMessage(pub Result<net::Frame<net::NodeMessage>, net::NetError>);
+
+impl Message for NodeActorRecvFrameMessage {
+    type Result = ();
+}
+
 impl Handler<NodeActorRecvFrameMessage> for NodeActor {
     fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorRecvFrameMessage) {
         tracing::info!(node_id=%self.node_info.node_id, "Received frame");
@@ -341,6 +179,14 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
     }
 }
 
+#[derive(Debug)]
+pub struct NodeActorHeartbeatUpdateMessage {
+    pub timestamp: DateTime<Utc>,
+}
+
+impl Message for NodeActorHeartbeatUpdateMessage {
+    type Result = ();
+}
 impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
     fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatUpdateMessage) {
         let ping_time = msg.timestamp;
@@ -371,6 +217,15 @@ impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
             }
         }
     }
+}
+
+#[derive(Debug)]
+pub struct NodeActorHeartbeatCheckMessage {
+    pub timestamp: DateTime<Utc>,
+}
+
+impl Message for NodeActorHeartbeatCheckMessage {
+    type Result = ();
 }
 
 impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {

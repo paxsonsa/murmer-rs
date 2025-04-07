@@ -4,7 +4,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use hostname;
 
-use super::membership::*;
+use super::node::*;
 use super::prelude::*;
 use super::tls::TlsConfig;
 use super::tls::TlsConfigError;
@@ -222,65 +222,4 @@ enum StreamState {
     Handshake,
     Ready,
     Closed,
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum ConnectionError {
-    #[error("TLS Configuration error: {0}")]
-    TlsError(#[from] TlsConfigError),
-
-    #[error("Invalid configuration")]
-    InvalidConfiguration,
-
-    #[error("Network Address error: {0}")]
-    NetworkAddrError(#[from] NetworkAddrError),
-
-    #[error("Failed to connect: {0}")]
-    FailedToConnect(String),
-
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
-
-    #[error("Connection closed: {0}")]
-    ConnectionClosed(String),
-
-    #[error("Application closed: {0}")]
-    ApplicationClosed(String),
-
-    #[error("Connection reset")]
-    Reset,
-
-    #[error("Connection timed out")]
-    TimedOut,
-
-    #[error("Connection locally closed")]
-    LocallyClosed,
-
-    #[error("Not connected")]
-    NotConnected,
-}
-
-impl From<quinn::ConnectionError> for ConnectionError {
-    fn from(err: quinn::ConnectionError) -> Self {
-        match err {
-            quinn::ConnectionError::VersionMismatch => ConnectionError::FailedToConnect(
-                "Peer does not support the required QUIC version".to_string(),
-            ),
-            quinn::ConnectionError::TransportError(e) => {
-                ConnectionError::ConnectionFailed(format!("Transport error: {}", e))
-            }
-            quinn::ConnectionError::CidsExhausted => ConnectionError::FailedToConnect(
-                "CID space are exhausted, cannot create new connections".to_string(),
-            ),
-            quinn::ConnectionError::LocallyClosed => ConnectionError::LocallyClosed,
-            quinn::ConnectionError::Reset => ConnectionError::Reset,
-            quinn::ConnectionError::TimedOut => ConnectionError::TimedOut,
-            quinn::ConnectionError::ApplicationClosed(code) => {
-                ConnectionError::ApplicationClosed(format!("code: {}", code))
-            }
-            quinn::ConnectionError::ConnectionClosed(code) => {
-                ConnectionError::ConnectionClosed(format!("code: {}", code))
-            }
-        }
-    }
 }

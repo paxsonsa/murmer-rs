@@ -1,4 +1,4 @@
-use crate::net::{NetworkDriver, RawStream};
+use crate::net::{ConnectionError, NetworkDriver, RawStream};
 use crate::system::TestSupervisor;
 
 use super::*;
@@ -217,7 +217,7 @@ impl AsyncWrite for MockStreamWriter {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_member_actor_reachability_to_unreachable() {
+async fn node_actor_reachability_to_unreachable() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = NodeActor {
@@ -228,7 +228,7 @@ async fn test_member_actor_reachability_to_unreachable() {
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
-        membership: Membership::Pending,
+        membership: Status::Pending,
         reachability: Reachability::Pending,
         send_stream: None,
     };
@@ -320,7 +320,7 @@ async fn test_member_actor_reachability_to_unreachable() {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_member_actor_reachability_reset() {
+async fn node_actor_reachability_reset() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = NodeActor {
@@ -331,7 +331,7 @@ async fn test_member_actor_reachability_reset() {
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
-        membership: Membership::Pending,
+        membership: Status::Pending,
         reachability: Reachability::Pending,
         send_stream: None,
     };
@@ -422,7 +422,7 @@ async fn test_member_actor_reachability_reset() {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_member_actor_unreachable_to_reachable() {
+async fn node_actor_unreachable_to_reachable() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = NodeActor {
@@ -433,7 +433,7 @@ async fn test_member_actor_unreachable_to_reachable() {
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
-        membership: Membership::Pending,
+        membership: Status::Pending,
         reachability: Reachability::Unreachable {
             pings: 0,
             last_seen: chrono::Utc::now(),
@@ -507,7 +507,7 @@ async fn test_member_actor_unreachable_to_reachable() {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_member_actor_unreachable_reset() {
+async fn node_actor_unreachable_reset() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
     let actor = NodeActor {
@@ -518,7 +518,7 @@ async fn test_member_actor_unreachable_reset() {
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         driver: Box::new(driver),
-        membership: Membership::Pending,
+        membership: Status::Pending,
         reachability: Reachability::Unreachable {
             pings: 0,
             last_seen: chrono::Utc::now(),
@@ -587,7 +587,7 @@ async fn test_membership_initiation() {
         id: Id::new(),
         node_info: info.clone(),
         driver: Box::new(driver),
-        membership: Membership::Pending,
+        membership: Status::Pending,
         reachability: Reachability::Pending,
         send_stream: None,
     };
@@ -603,7 +603,7 @@ async fn test_membership_initiation() {
 
     s.started().await;
 
-    assert_matches!(s.actor_ref().membership, Membership::Pending);
+    assert_matches!(s.actor_ref().membership, Status::Pending);
     assert_matches!(s.actor_ref().reachability, Reachability::Pending);
 
     // 1) Verify Init Message was sent
@@ -636,7 +636,7 @@ async fn test_membership_initiation() {
 
     // Set a timeout for the tick operation to prevent indefinite hanging
     s.tick(system, None).await;
-    assert_matches!(s.actor_ref().membership, Membership::Joining);
+    assert_matches!(s.actor_ref().membership, Status::Joining);
 
     // // TODO: We need to simulate the context for the actor to be able to send and receive messages.
 }

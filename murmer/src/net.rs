@@ -9,10 +9,10 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::cluster::{ConnectionError, ConnectionState};
 use crate::id::Id;
-use crate::membership::NodeInfo;
+use crate::node::NodeInfo;
 use crate::tls::TlsConfig;
+use crate::tls::TlsConfigError;
 
 #[cfg(test)]
 #[path = "./net.test.rs"]
@@ -634,12 +634,19 @@ pub trait NetworkDriver: Send {
     async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError>;
 }
 
+#[derive(Debug)]
+pub enum QuicConnectionState {
+    NotReady,
+    Connected { connection: quinn::Connection },
+    Disconnected { reason: ConnectionError },
+}
+
 /// QUIC-based implementation of the NetworkDriver trait
 pub struct QuicConnectionDriver {
     node_info: NodeInfo,
     socket: quinn::Endpoint,
     tls: TlsConfig,
-    state: ConnectionState,
+    state: QuicConnectionState,
 }
 
 impl QuicConnectionDriver {
@@ -648,7 +655,7 @@ impl QuicConnectionDriver {
             node_info,
             socket,
             tls,
-            state: ConnectionState::NotReady,
+            state: QuicConnectionState::NotReady,
         }
     }
 }
@@ -657,7 +664,7 @@ impl QuicConnectionDriver {
 impl NetworkDriver for QuicConnectionDriver {
     async fn connect(&mut self) -> Result<(), ConnectionError> {
         match &self.state {
-            ConnectionState::NotReady | ConnectionState::Disconnected { .. } => {
+            QuicConnectionState::NotReady | QuicConnectionState::Disconnected { .. } => {
                 let tls = self.tls.clone();
                 let addr = self.node_info.addr.clone();
                 let socket = self.socket.clone();
@@ -705,7 +712,7 @@ impl NetworkDriver for QuicConnectionDriver {
                     }) {
                     Ok(connection) => connection,
                     Err(e) => {
-                        self.state = ConnectionState::Disconnected {
+                        self.state = QuicConnectionState::Disconnected {
                             reason: ConnectionError::ConnectionFailed(
                                 "Failed to open initial connection to node.".to_string(),
                             ),
@@ -715,7 +722,7 @@ impl NetworkDriver for QuicConnectionDriver {
                 }
                 .await?;
 
-                self.state = ConnectionState::Connected { connection };
+                self.state = QuicConnectionState::Connected { connection };
                 Ok(())
             }
             _ => Ok(()),
@@ -724,7 +731,7 @@ impl NetworkDriver for QuicConnectionDriver {
 
     async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError> {
         match &self.state {
-            ConnectionState::Connected { connection } => {
+            QuicConnectionState::Connected { connection } => {
                 // Open a bidirectional stream
                 let (send, recv) = connection.open_bi().await.map_err(|e| {
                     ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
@@ -733,11 +740,71 @@ impl NetworkDriver for QuicConnectionDriver {
                 // Create the raw stream
                 Ok(RawStream::new(Box::new(recv), Box::new(send)))
             }
-            ConnectionState::NotReady => Err(ConnectionError::NotConnected),
-            ConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+            QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
+            QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
                 format!("Connection is disconnected: {}", reason),
             )),
         }
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ConnectionError {
+    #[error("TLS Configuration error: {0}")]
+    TlsError(#[from] TlsConfigError),
+
+    #[error("Invalid configuration")]
+    InvalidConfiguration,
+
+    #[error("Network Address error: {0}")]
+    NetworkAddrError(#[from] NetworkAddrError),
+
+    #[error("Failed to connect: {0}")]
+    FailedToConnect(String),
+
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+
+    #[error("Connection closed: {0}")]
+    ConnectionClosed(String),
+
+    #[error("Application closed: {0}")]
+    ApplicationClosed(String),
+
+    #[error("Connection reset")]
+    Reset,
+
+    #[error("Connection timed out")]
+    TimedOut,
+
+    #[error("Connection locally closed")]
+    LocallyClosed,
+
+    #[error("Not connected")]
+    NotConnected,
+}
+
+impl From<quinn::ConnectionError> for ConnectionError {
+    fn from(err: quinn::ConnectionError) -> Self {
+        match err {
+            quinn::ConnectionError::VersionMismatch => ConnectionError::FailedToConnect(
+                "Peer does not support the required QUIC version".to_string(),
+            ),
+            quinn::ConnectionError::TransportError(e) => {
+                ConnectionError::ConnectionFailed(format!("Transport error: {}", e))
+            }
+            quinn::ConnectionError::CidsExhausted => ConnectionError::FailedToConnect(
+                "CID space are exhausted, cannot create new connections".to_string(),
+            ),
+            quinn::ConnectionError::LocallyClosed => ConnectionError::LocallyClosed,
+            quinn::ConnectionError::Reset => ConnectionError::Reset,
+            quinn::ConnectionError::TimedOut => ConnectionError::TimedOut,
+            quinn::ConnectionError::ApplicationClosed(code) => {
+                ConnectionError::ApplicationClosed(format!("code: {}", code))
+            }
+            quinn::ConnectionError::ConnectionClosed(code) => {
+                ConnectionError::ConnectionClosed(format!("code: {}", code))
+            }
+        }
+    }
+}
