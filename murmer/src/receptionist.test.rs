@@ -5,175 +5,167 @@ use parking_lot::Mutex;
 
 use super::*;
 use crate::prelude::*;
+use crate::system::EndpointSender;
 
 struct FakeActor;
 
 impl Actor for FakeActor {}
 
-#[tokio::test]
-async fn test_receptionist_lifecycle() {
-    let mut receptionist = ReceptionistActor::default();
-    let actor = FakeActor;
-    let context = Context::new();
+/// Helper function to create a simple endpoint for a FakeActor
+fn create_endpoint(name: &str) -> Endpoint<FakeActor> {
+    let path = Arc::new(ActorPath::local(name.to_string(), Id::new()));
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+    let sender = EndpointSender::<FakeActor>::from_channel(tx);
+    Endpoint::new(sender, path)
+}
 
-    let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
-    let actor = Arc::new(Mutex::new(actor));
+/// Helper function to create a direct endpoint for a FakeActor
+fn create_direct_endpoint(name: &str) -> Endpoint<FakeActor> {
+    let path = Arc::new(ActorPath::local(name.to_string(), Id::new()));
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+    let sender = EndpointSender::<FakeActor>::from_channel(tx);
+    let endpoint = Endpoint::new(sender, path.clone());
+    let context = Context::new(endpoint, tokio_util::sync::CancellationToken::new());
+    let actor = Arc::new(Mutex::new(FakeActor));
     let context = Arc::new(Mutex::new(context));
+    Endpoint::direct(path, actor, context)
+}
 
-    let endpoint = Endpoint::direct(path, actor, context);
+/// Helper function to create a receptionist context
+fn create_receptionist_context() -> Context<ReceptionistActor> {
+    let path = Arc::new(ActorPath::local("receptionist".to_string(), Id::new()));
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+    let sender = EndpointSender::from_channel(tx);
+    let endpoint = Endpoint::new(sender, path);
+    Context::new(endpoint, tokio_util::sync::CancellationToken::new())
+}
 
-    let key = Key::new("actor");
+/// Helper function to register an endpoint with a receptionist
+fn register_endpoint<T: Actor>(
+    receptionist: &mut ReceptionistActor,
+    ctx: &mut Context<ReceptionistActor>,
+    key: &Key<T>,
+    endpoint: &Endpoint<T>,
+) {
     let message = Register {
         key: key.clone(),
         endpoint: endpoint.clone(),
     };
+    assert!(receptionist.handle(ctx, message));
+}
 
-    let mut ctx = Context::new();
-    let _ = receptionist.handle(&mut ctx, message);
+/// Helper function to deregister an endpoint from a receptionist
+fn deregister_endpoint<T: Actor>(
+    receptionist: &mut ReceptionistActor,
+    ctx: &mut Context<ReceptionistActor>,
+    key: &Key<T>,
+    endpoint: &Endpoint<T>,
+) {
+    let message = Deregister {
+        key: key.clone(),
+        endpoint: endpoint.clone(),
+    };
+    receptionist.handle(ctx, message);
+}
 
+/// Helper function to lookup endpoints for a key
+fn lookup_endpoints<T: Actor>(
+    receptionist: &mut ReceptionistActor,
+    ctx: &mut Context<ReceptionistActor>,
+    key: &Key<T>,
+) -> Listing<T> {
     let message = Lookup { key: key.clone() };
-    let result = receptionist
-        .handle(&mut ctx, message)
-        .expect("lookup failed");
+    receptionist.handle(ctx, message).expect("lookup failed")
+}
 
+/// Helper function to subscribe to a key
+fn subscribe_to_key<T: Actor>(
+    receptionist: &mut ReceptionistActor,
+    ctx: &mut Context<ReceptionistActor>,
+    key: &Key<T>,
+) -> ListingSubscription<T> {
+    let message = Subscribe { key: key.clone() };
+    receptionist.handle(ctx, message).expect("subscribe failed")
+}
+
+/// Helper function to assert a registered update
+fn assert_registered_update<T: Actor>(
+    listing: &mut ListingSubscription<T>,
+    expected_endpoint: &Endpoint<T>,
+) {
+    let update = listing.some_next().expect("update was not received");
+    let ListingUpdate::Registered(recv_endpoint) = update else {
+        panic!("unexpected update type");
+    };
+    assert_eq!(recv_endpoint, *expected_endpoint);
+}
+
+#[tokio::test]
+async fn test_receptionist_lifecycle() {
+    let mut receptionist = ReceptionistActor::default();
+    let mut ctx = create_receptionist_context();
+    let endpoint = create_endpoint("testA");
+    let key = Key::<FakeActor>::new("actor");
+
+    // Register the endpoint
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint);
+
+    // Lookup should return the registered endpoint
+    let result = lookup_endpoints(&mut receptionist, &mut ctx, &key);
     assert_eq!(result.endpoints.len(), 1);
     assert_eq!(result.endpoints[0], endpoint);
 
-    let message = Deregister {
-        key: key.clone(),
-        endpoint,
-    };
-    let _ = receptionist.handle(&mut ctx, message);
+    // Deregister the endpoint
+    deregister_endpoint(&mut receptionist, &mut ctx, &key, &endpoint);
 
-    let message = Lookup { key };
-    let result = receptionist
-        .handle(&mut ctx, message)
-        .expect("lookup failed");
-
+    // Lookup should return empty list
+    let result = lookup_endpoints(&mut receptionist, &mut ctx, &key);
     assert_eq!(result.endpoints.len(), 0);
 }
 
 #[tokio::test]
 async fn test_receptionist_subscription() {
     let mut receptionist = ReceptionistActor::default();
-    let actor = FakeActor;
-    let context = Context::new();
+    let mut ctx = create_receptionist_context();
+    let key = Key::<FakeActor>::new("actor");
 
-    let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
-    let actor = Arc::new(Mutex::new(actor));
-    let context = Arc::new(Mutex::new(context));
+    // Create and register first endpoint
+    let endpoint1 = create_direct_endpoint("test1");
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint1);
 
-    let endpoint = Endpoint::direct(path, actor, context);
+    // Subscribe to the key
+    let mut listing = subscribe_to_key(&mut receptionist, &mut ctx, &key);
 
-    // Register an existing actor to the receptionist
-    let key = Key::new("actor");
-    let message = Register {
-        key: key.clone(),
-        endpoint: endpoint.clone(),
-    };
+    // Assert we get a registered update for the previously registered actor
+    assert_registered_update(&mut listing, &endpoint1);
 
-    let mut ctx = Context::new();
-    let _ = receptionist.handle(&mut ctx, message);
+    // Create and register second endpoint
+    let endpoint2 = create_direct_endpoint("test2");
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint2);
 
-    // Create a subscription to the key
-    let message = Subscribe { key: key.clone() };
-
-    let mut ctx = Context::new();
-    let mut listing = receptionist
-        .handle(&mut ctx, message)
-        .expect("subscribe failed");
-
-    // Assert we get a registered for the previously registered actor
-    let update = listing.some_next().expect("update was not received");
-    let ListingUpdate::Registered(recv_endpoint) = update else {
-        panic!("unexpected update type");
-    };
-    assert_eq!(recv_endpoint, endpoint);
-
-    // Register another actor to the receptionist
-    let actor = FakeActor;
-    let context = Context::new();
-
-    let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
-    let actor = Arc::new(Mutex::new(actor));
-    let context = Arc::new(Mutex::new(context));
-
-    let endpoint = Endpoint::direct(path, actor, context);
-
-    // Register an existing actor to the receptionist
-    let key = Key::new("actor");
-    let message = Register {
-        key: key.clone(),
-        endpoint: endpoint.clone(),
-    };
-    let mut ctx = Context::new();
-    let _ = receptionist.handle(&mut ctx, message);
-
-    // Expect to receive the next registered update
-    let update = listing.some_next().expect("update was not received");
-    let ListingUpdate::Registered(recv_endpoint) = update else {
-        panic!("unexpected update type");
-    };
-    assert_eq!(recv_endpoint, endpoint);
+    // Assert we get a registered update for the newly registered actor
+    assert_registered_update(&mut listing, &endpoint2);
 }
 
 #[tokio::test]
 async fn test_receptionist_subscription_stream() {
     let mut receptionist = ReceptionistActor::default();
-    let actor = FakeActor;
-    let context = Context::new();
+    let mut ctx = create_receptionist_context();
+    let key = Key::<FakeActor>::new("actor");
 
-    let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
-    let actor = Arc::new(Mutex::new(actor));
-    let context = Arc::new(Mutex::new(context));
+    // Create and register first endpoint
+    let endpoint_a = create_endpoint("testA");
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_a);
 
-    let endpoint_a = Endpoint::direct(path, actor, context);
+    // Subscribe to the key
+    let mut listing = subscribe_to_key(&mut receptionist, &mut ctx, &key);
 
-    // Register an existing actor to the receptionist
-    let key = Key::new("actor");
-    let message = Register {
-        key: key.clone(),
-        endpoint: endpoint_a.clone(),
-    };
-    let mut ctx = Context::new();
-    let _ = receptionist.handle(&mut ctx, message);
+    // Create and register second endpoint
+    let endpoint_b = create_endpoint("testB");
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_b);
 
-    // Create a subscription to the key
-    let message = Subscribe { key: key.clone() };
-
-    let mut ctx = Context::new();
-    let mut listing = receptionist
-        .handle(&mut ctx, message)
-        .expect("subscribe failed");
-
-    // Register another actor to the receptionist
-    let actor = FakeActor;
-    let context = Context::new();
-
-    let path = Arc::new(ActorPath::local("test".to_string(), Id::new()));
-    let actor = Arc::new(Mutex::new(actor));
-    let context = Arc::new(Mutex::new(context));
-
-    let endpoint_b = Endpoint::direct(path, actor, context);
-
-    // Register an existing actor to the receptionist
-    let key = Key::new("actor");
-    let message = Register {
-        key: key.clone(),
-        endpoint: endpoint_b.clone(),
-    };
-    let mut ctx = Context::new();
-    let _ = receptionist.handle(&mut ctx, message);
-
-    let message = Deregister {
-        key: key.clone(),
-        endpoint: endpoint_b.clone(),
-    };
-    let mut ctx = Context::new();
-    receptionist
-        .handle(&mut ctx, message)
-        .then_some(())
-        .expect("deregister failed");
+    // Deregister the second endpoint
+    deregister_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_b);
 
     // Read the stream and expect to receive the registered and deregistered updates in order
     // First registered update

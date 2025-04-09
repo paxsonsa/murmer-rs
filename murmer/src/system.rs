@@ -327,9 +327,14 @@ where
         self.actor.started(ctx).await;
     }
 
-    #[tracing::instrument(skip(ctx))]
-    async fn run(mut self, mut ctx: Context<A>) {
+    #[tracing::instrument(skip(endpoint, cancellation))]
+    async fn run(
+        mut self,
+        endpoint: Endpoint<A>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) {
         tracing::info!("starting supervisor loop");
+        let mut ctx = Context::new(endpoint, cancellation.clone());
         let cancellation = ctx.inner_cancellation();
         tracing::debug!("starting supervisor");
         self.actor.started(&mut ctx).await;
@@ -395,7 +400,7 @@ where
         let (runtime, sender) = SupervisorRuntime::construct(path.clone(), actor);
         let cancellation = tokio_util::sync::CancellationToken::new();
 
-        let endpoint = Endpoint::new(EndpointSender::new(sender.clone()), path.clone());
+        let endpoint = Endpoint::new(EndpointSender::from_sender(sender.clone()), path.clone());
         let ctx = Context::new(endpoint, cancellation.clone());
 
         Self {
@@ -420,7 +425,7 @@ where
         M: Message + 'static,
         A: Handler<M>,
     {
-        let sender = EndpointSender::new(self.sender.clone());
+        let sender = EndpointSender::from_sender(self.sender.clone());
         let endpoint_path = self.path.clone();
         ACTIVE_SYSTEM
             .scope(system.clone(), async move {
@@ -482,7 +487,7 @@ impl<A: Actor, S: State + Clone> Clone for Supervisor<A, S> {
 
 impl<A: Actor> Into<Endpoint<A>> for Supervisor<A, Initialized> {
     fn into(self) -> Endpoint<A> {
-        let sender = EndpointSender::new(self.sender);
+        let sender = EndpointSender::from_sender(self.sender);
         Endpoint::new(sender, self.path)
     }
 }
@@ -493,7 +498,7 @@ where
     S: State,
 {
     fn endpoint(&self) -> Endpoint<A> {
-        let sender = EndpointSender::new(self.sender.clone());
+        let sender = EndpointSender::from_sender(self.sender.clone());
         Endpoint::new(sender, self.path.clone())
     }
 }
@@ -532,12 +537,11 @@ where
             .register(id.clone(), supervisor.clone());
 
         let local_endpoint = supervisor.endpoint();
-        let ctx = Context::new(local_endpoint, cancellation.clone());
 
         tokio::spawn(async move {
             ACTIVE_SYSTEM
                 .scope(system, async move {
-                    runtime.run(ctx).await;
+                    runtime.run(local_endpoint, cancellation).await;
                 })
                 .await;
         });
@@ -578,7 +582,7 @@ where
 }
 
 impl<A: Actor> Endpoint<A> {
-    fn new(sender: EndpointSender<A>, path: Arc<ActorPath>) -> Self {
+    pub(crate) fn new(sender: EndpointSender<A>, path: Arc<ActorPath>) -> Self {
         Self { sender, path }
     }
 
@@ -692,7 +696,7 @@ impl AnyEndpoint {
     }
 }
 
-struct EndpointSender<A: Actor> {
+pub(crate) struct EndpointSender<A: Actor> {
     send_fn: Arc<
         Box<
             dyn Fn(
@@ -706,13 +710,27 @@ struct EndpointSender<A: Actor> {
 }
 
 impl<A: Actor> EndpointSender<A> {
-    fn new(sender: MailboxSender<SupervisorCommand<A>>) -> Self {
+    pub(crate) fn from_sender(sender: MailboxSender<SupervisorCommand<A>>) -> Self {
         let send_fn = Box::new(move |envelope| {
             let sender = sender.clone();
             Box::pin(async move {
                 let cmd = SupervisorCommand::Message(envelope);
                 sender
                     .send(QoSLevel::Normal, cmd)
+                    .await
+                    .map_err(|_| ActorError::MailboxClosed)
+            }) as Pin<Box<dyn Future<Output = Result<(), ActorError>> + Send>>
+        });
+        Self {
+            send_fn: Arc::new(send_fn),
+        }
+    }
+
+    pub(crate) fn from_channel(tx: mpsc::Sender<Envelope<A>>) -> Self {
+        let send_fn = Box::new(move |envelope| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                tx.send(envelope)
                     .await
                     .map_err(|_| ActorError::MailboxClosed)
             }) as Pin<Box<dyn Future<Output = Result<(), ActorError>> + Send>>
