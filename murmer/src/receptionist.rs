@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::message::Message;
 use crate::system::{AnyEndpoint, Endpoint};
 use crate::{
-    actor::{Actor, ActorError, Handler},
+    actor::{Actor, ActorError, Handler, async_trait},
     context::Context,
 };
 
@@ -298,8 +298,9 @@ where
     }
 }
 
+#[async_trait::async_trait]
 impl<T: Actor> Handler<Register<T>> for ReceptionistActor {
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: Register<T>) -> bool {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: Register<T>) -> bool {
         let type_id = TypeId::of::<T>();
         let key = msg.key.id;
         let registration = Registration {
@@ -349,8 +350,9 @@ where
     }
 }
 
+#[async_trait::async_trait]
 impl<T: Actor> Handler<Deregister<T>> for ReceptionistActor {
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: Deregister<T>) -> bool {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: Deregister<T>) -> bool {
         let type_id = TypeId::of::<T>();
         let key = msg.key.id;
 
@@ -382,8 +384,9 @@ impl<T: Actor> Handler<Deregister<T>> for ReceptionistActor {
             .is_some()
     }
 }
+#[async_trait::async_trait]
 impl<T: Actor> Handler<Lookup<T>> for ReceptionistActor {
-    fn handle(&mut self, _: &mut Context<Self>, msg: Lookup<T>) -> Option<Listing<T>> {
+    async fn handle(&mut self, _: &mut Context<Self>, msg: Lookup<T>) -> Option<Listing<T>> {
         let type_id = TypeId::of::<T>();
         let key = msg.key;
 
@@ -418,8 +421,9 @@ impl<T: Actor> Handler<Lookup<T>> for ReceptionistActor {
     }
 }
 
+#[async_trait::async_trait]
 impl<T: Actor> Handler<Subscribe<T>> for ReceptionistActor {
-    fn handle(
+    async fn handle(
         &mut self,
         _: &mut Context<Self>,
         msg: Subscribe<T>,

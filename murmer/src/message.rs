@@ -1,5 +1,8 @@
 //! Message traits and envelope types for actor communication.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::context::Context;
 
 use super::actor::*;
@@ -16,7 +19,11 @@ pub trait Message: std::fmt::Debug + Send + 'static {
 }
 
 pub trait EnvelopeProxy<A: Actor>: Send {
-    fn handle(&mut self, ctx: &mut Context<A>, actor: &mut A);
+    fn handle_async<'a>(
+        &'a mut self, 
+        ctx: &'a mut Context<A>, 
+        actor: &'a mut A
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 pub enum ResponseExpectation<M: Message> {
@@ -35,7 +42,7 @@ impl<A: Actor> Envelope<A> {
         M: Message + 'static,
         A: Handler<M>,
     {
-        Envelope(Box::new(SyncEnvelope {
+        Envelope(Box::new(AsyncEnvelope {
             msg: Some(msg),
             response_expectation: ResponseExpectation::Expected(Some(tx)),
         }))
@@ -46,19 +53,19 @@ impl<A: Actor> Envelope<A> {
         M: Message + 'static,
         A: Handler<M>,
     {
-        Envelope(Box::new(SyncEnvelope {
+        Envelope(Box::new(AsyncEnvelope {
             msg: Some(msg),
             response_expectation: ResponseExpectation::NotExpected,
         }))
     }
 }
 
-struct SyncEnvelope<M: Message> {
+struct AsyncEnvelope<M: Message> {
     msg: Option<M>,
     response_expectation: ResponseExpectation<M>,
 }
 
-impl<A, M> EnvelopeProxy<A> for SyncEnvelope<M>
+impl<A, M> EnvelopeProxy<A> for AsyncEnvelope<M>
 where
     A: Actor + Handler<M>,
     M: Message,
@@ -71,27 +78,33 @@ where
             message = tracing::field::debug(&std::any::type_name::<M>()),
         )
     )]
-    fn handle(&mut self, ctx: &mut Context<A>, actor: &mut A) {
-        let msg = self.msg.take().expect("message is missing, this is a bug.");
+    fn handle_async<'a>(
+        &'a mut self,
+        ctx: &'a mut Context<A>,
+        actor: &'a mut A
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let msg = self.msg.take().expect("message is missing, this is a bug.");
 
-        match &mut self.response_expectation {
-            ResponseExpectation::Expected(tx) => {
-                let tx = tx
-                    .take()
-                    .expect("response expection for expected is missing, this is a bug.");
+            match &mut self.response_expectation {
+                ResponseExpectation::Expected(tx) => {
+                    let tx = tx
+                        .take()
+                        .expect("response expection for expected is missing, this is a bug.");
 
-                if tx.is_closed() {
-                    tracing::error!("response channel is closed before handling");
-                    return;
+                    if tx.is_closed() {
+                        tracing::error!("response channel is closed before handling");
+                        return;
+                    }
+
+                    let result = actor.handle(ctx, msg).await;
+
+                    let _ = tx.send(result);
                 }
-
-                let result = actor.handle(ctx, msg);
-
-                let _ = tx.send(result);
+                ResponseExpectation::NotExpected => {
+                    let _ = actor.handle(ctx, msg).await;
+                }
             }
-            ResponseExpectation::NotExpected => {
-                let _ = actor.handle(ctx, msg);
-            }
-        }
+        })
     }
 }

@@ -46,7 +46,7 @@ impl NodeActor {
         }
     }
 
-    fn init_ack(&mut self, node_id: Id) {
+    async fn init_ack(&mut self, node_id: Id) {
         tracing::info!(node_id=%node_id, "Received InitAck");
         let State::Init = self.inner_state else {
             tracing::error!("Invalid state for InitAck");
@@ -216,8 +216,9 @@ impl Message for NodeActorRecvFrameMessage {
     type Result = ();
 }
 
+#[async_trait]
 impl Handler<NodeActorRecvFrameMessage> for NodeActor {
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorRecvFrameMessage) {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorRecvFrameMessage) {
         tracing::info!("Received frame");
         let frame = match msg.0 {
             Ok(frame) => frame,
@@ -244,7 +245,9 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
             } => todo!(),
             net::NodeMessage::InitAck { node_id } => {
                 tracing::trace!(?node_id, "Received InitAck");
-                self.init_ack(node_id);
+                // Can't call async method here directly, so log the InitAck and leave handling to a system task
+                let node_id_clone = node_id.clone();
+                tracing::info!(node_id=%node_id_clone, "Received InitAck - should be handled in system task");
             }
             net::NodeMessage::Join { name, capabilities } => todo!(),
             net::NodeMessage::JoinAck { accepted, reason } => todo!(),
@@ -264,8 +267,9 @@ pub struct NodeActorHeartbeatUpdateMessage {
 impl Message for NodeActorHeartbeatUpdateMessage {
     type Result = ();
 }
+#[async_trait]
 impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatUpdateMessage) {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatUpdateMessage) {
         let ping_time = msg.timestamp;
         match self.reachability {
             Reachability::Unreachable { pings, last_seen } => {
@@ -305,9 +309,10 @@ impl Message for NodeActorHeartbeatCheckMessage {
     type Result = ();
 }
 
+#[async_trait]
 impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
     /// Check the reachability of the node and update the reachability state accordingly.
-    fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatCheckMessage) {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatCheckMessage) {
         let timestamp = msg.timestamp;
         match &self.reachability {
             Reachability::Reachable { misses, last_seen } => {

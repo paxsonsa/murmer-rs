@@ -41,11 +41,12 @@ pub trait Actor: Unpin + Sized + Send + 'static {
 ///
 /// Implement this trait for your actor for each message type it should handle.
 /// The associated Result type defines what will be returned to the sender.
+#[async_trait]
 pub trait Handler<M>
 where
     Self: Actor,
     M: Message,
 {
     /// Handle a message of type M and return a result of type M::Result
-    fn handle(&mut self, ctx: &mut Context<Self>, message: M) -> M::Result;
+    async fn handle(&mut self, ctx: &mut Context<Self>, message: M) -> M::Result;
 }

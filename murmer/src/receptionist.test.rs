@@ -41,7 +41,7 @@ fn create_receptionist_context() -> Context<ReceptionistActor> {
 }
 
 /// Helper function to register an endpoint with a receptionist
-fn register_endpoint<T: Actor>(
+async fn register_endpoint<T: Actor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
@@ -51,11 +51,11 @@ fn register_endpoint<T: Actor>(
         key: key.clone(),
         endpoint: endpoint.clone(),
     };
-    assert!(receptionist.handle(ctx, message));
+    assert!(receptionist.handle(ctx, message).await);
 }
 
 /// Helper function to deregister an endpoint from a receptionist
-fn deregister_endpoint<T: Actor>(
+async fn deregister_endpoint<T: Actor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
@@ -65,27 +65,27 @@ fn deregister_endpoint<T: Actor>(
         key: key.clone(),
         endpoint: endpoint.clone(),
     };
-    receptionist.handle(ctx, message);
+    let _ = receptionist.handle(ctx, message).await;
 }
 
 /// Helper function to lookup endpoints for a key
-fn lookup_endpoints<T: Actor>(
+async fn lookup_endpoints<T: Actor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
 ) -> Listing<T> {
     let message = Lookup { key: key.clone() };
-    receptionist.handle(ctx, message).expect("lookup failed")
+    receptionist.handle(ctx, message).await.expect("lookup failed")
 }
 
 /// Helper function to subscribe to a key
-fn subscribe_to_key<T: Actor>(
+async fn subscribe_to_key<T: Actor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
 ) -> ListingSubscription<T> {
     let message = Subscribe { key: key.clone() };
-    receptionist.handle(ctx, message).expect("subscribe failed")
+    receptionist.handle(ctx, message).await.expect("subscribe failed")
 }
 
 /// Helper function to assert a registered update
@@ -108,18 +108,18 @@ async fn test_receptionist_lifecycle() {
     let key = Key::<FakeActor>::new("actor");
 
     // Register the endpoint
-    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint);
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint).await;
 
     // Lookup should return the registered endpoint
-    let result = lookup_endpoints(&mut receptionist, &mut ctx, &key);
+    let result = lookup_endpoints(&mut receptionist, &mut ctx, &key).await;
     assert_eq!(result.endpoints.len(), 1);
     assert_eq!(result.endpoints[0], endpoint);
 
     // Deregister the endpoint
-    deregister_endpoint(&mut receptionist, &mut ctx, &key, &endpoint);
+    deregister_endpoint(&mut receptionist, &mut ctx, &key, &endpoint).await;
 
     // Lookup should return empty list
-    let result = lookup_endpoints(&mut receptionist, &mut ctx, &key);
+    let result = lookup_endpoints(&mut receptionist, &mut ctx, &key).await;
     assert_eq!(result.endpoints.len(), 0);
 }
 
@@ -131,17 +131,17 @@ async fn test_receptionist_subscription() {
 
     // Create and register first endpoint
     let endpoint1 = create_direct_endpoint("test1");
-    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint1);
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint1).await;
 
     // Subscribe to the key
-    let mut listing = subscribe_to_key(&mut receptionist, &mut ctx, &key);
+    let mut listing = subscribe_to_key(&mut receptionist, &mut ctx, &key).await;
 
     // Assert we get a registered update for the previously registered actor
     assert_registered_update(&mut listing, &endpoint1);
 
     // Create and register second endpoint
     let endpoint2 = create_direct_endpoint("test2");
-    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint2);
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint2).await;
 
     // Assert we get a registered update for the newly registered actor
     assert_registered_update(&mut listing, &endpoint2);
@@ -155,17 +155,17 @@ async fn test_receptionist_subscription_stream() {
 
     // Create and register first endpoint
     let endpoint_a = create_endpoint("testA");
-    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_a);
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_a).await;
 
     // Subscribe to the key
-    let mut listing = subscribe_to_key(&mut receptionist, &mut ctx, &key);
+    let mut listing = subscribe_to_key(&mut receptionist, &mut ctx, &key).await;
 
     // Create and register second endpoint
     let endpoint_b = create_endpoint("testB");
-    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_b);
+    register_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_b).await;
 
     // Deregister the second endpoint
-    deregister_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_b);
+    deregister_endpoint(&mut receptionist, &mut ctx, &key, &endpoint_b).await;
 
     // Read the stream and expect to receive the registered and deregistered updates in order
     // First registered update

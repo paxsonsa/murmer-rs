@@ -317,7 +317,7 @@ where
             SupervisorCommand::Message(envelope) => {
                 tracing::trace!("handling message");
                 let mut handler = envelope.0;
-                handler.handle(ctx, &mut self.actor);
+                handler.handle_async(ctx, &mut self.actor).await;
                 true
             }
         }
@@ -752,7 +752,10 @@ impl<A: Actor> EndpointSender<A> {
         let send_fn = Box::new(move |mut envelope: Envelope<A>| {
             let mut ctx = ctx.lock();
             let mut actor = actor.lock();
-            envelope.0.handle(&mut *ctx, &mut *actor);
+            let fut = envelope.0.handle_async(&mut *ctx, &mut *actor);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(fut)
+            });
 
             Box::pin(async { Ok(()) })
                 as Pin<Box<dyn Future<Output = Result<(), ActorError>> + Send>>
