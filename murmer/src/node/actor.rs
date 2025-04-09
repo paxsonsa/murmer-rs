@@ -3,16 +3,36 @@ use chrono::{DateTime, Utc};
 
 use super::*;
 
+enum State {
+    Init,
+    InitAck,
+}
+
 pub struct NodeActor {
-    pub id: Id,
+    pub cluster_node_id: Id,
     pub node_info: NodeInfo,
     pub driver: Box<dyn NetworkDriver>,
     pub membership: Status,
     pub reachability: Reachability,
     pub send_stream: Option<FrameWriter<net::NodeMessage>>,
+    inner_state: State,
+    node_id: Option<Id>,
 }
 
 impl NodeActor {
+    pub fn new(id: Id, node_info: NodeInfo, driver: Box<dyn NetworkDriver>) -> Self {
+        NodeActor {
+            cluster_node_id: id,
+            node_info,
+            driver,
+            membership: Status::Pending,
+            reachability: Reachability::Pending,
+            send_stream: None,
+            inner_state: State::Init,
+            node_id: None,
+        }
+    }
+
     async fn send_message(&mut self, message: net::NodeMessage) -> Result<(), NodeError> {
         if let Some(ref mut stream) = self.send_stream {
             let frame = net::Frame::ok(self.node_info.node_id.clone(), None, message);
@@ -23,6 +43,33 @@ impl NodeActor {
             Ok(())
         } else {
             Err(NodeError::NotConnected)
+        }
+    }
+
+    fn init_ack(&mut self, node_id: Id) {
+        tracing::info!(node_id=%node_id, "Received InitAck");
+        let State::Init = self.inner_state else {
+            tracing::error!("Invalid state for InitAck");
+            // TODO: Send Error
+            return;
+        };
+        self.node_id = Some(node_id.clone());
+        self.inner_state = State::InitAck;
+        self.membership = Status::Joining;
+        self.reachability = Reachability::reachable_now();
+
+        // Send Join Message
+        let join_message = net::NodeMessage::Join {
+            name: "default".to_string(),
+            capabilities: Vec::new(),
+        };
+
+        // TODO: Make this a background task that can return a result/error
+        if let Err(err) = self.send_message(join_message).await {
+            tracing::error!(error=%err, "Failed to send join message");
+            self.membership = Status::Failed;
+            self.inner_state = State::Init;
+            return;
         }
     }
 }
@@ -68,7 +115,7 @@ impl Actor for NodeActor {
         // Send initial message
         let init = net::NodeMessage::Init {
             protocol_version: 1, // FIXME: Use a real protocol version
-            id: self.id.clone(),
+            id: self.cluster_node_id.clone(),
         };
         if let Err(err) = self.send_message(init).await {
             tracing::error!(error=%err, "Failed to send initial message");
@@ -171,10 +218,40 @@ impl Message for NodeActorRecvFrameMessage {
 
 impl Handler<NodeActorRecvFrameMessage> for NodeActor {
     fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorRecvFrameMessage) {
-        tracing::info!(node_id=%self.node_info.node_id, "Received frame");
-        match msg.0 {
-            Ok(frame) => {}
-            Err(e) => {}
+        tracing::info!("Received frame");
+        let frame = match msg.0 {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::error!(error=%e, "Failed frame");
+                return;
+            }
+        };
+        let header = frame.header;
+        let payload = frame.payload;
+
+        let msg = match payload {
+            net::Payload::Ok(msg) => msg,
+            net::Payload::UnknownFailure(reason) => {
+                tracing::error!(reason=%reason, "Received failure message");
+                return;
+            }
+        };
+
+        match msg {
+            net::NodeMessage::Init {
+                protocol_version,
+                id,
+            } => todo!(),
+            net::NodeMessage::InitAck { node_id } => {
+                tracing::trace!(?node_id, "Received InitAck");
+                self.init_ack(node_id);
+            }
+            net::NodeMessage::Join { name, capabilities } => todo!(),
+            net::NodeMessage::JoinAck { accepted, reason } => todo!(),
+            net::NodeMessage::Handshake { capabilities } => todo!(),
+            net::NodeMessage::HandshakeAck { capabilities } => todo!(),
+            net::NodeMessage::Heartbeat { timestamp } => todo!(),
+            net::NodeMessage::Disconnect { reason } => todo!(),
         }
     }
 }

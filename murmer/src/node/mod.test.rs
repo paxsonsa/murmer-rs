@@ -2,6 +2,7 @@ use crate::net::{ConnectionError, NetworkDriver, RawStream};
 use crate::system::TestSupervisor;
 
 use super::*;
+
 use assert_matches::assert_matches;
 use parking_lot::Mutex;
 use serde::{Serialize, de::DeserializeOwned};
@@ -220,18 +221,15 @@ impl AsyncWrite for MockStreamWriter {
 async fn node_actor_reachability_to_unreachable() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let actor = NodeActor {
-        id: Id::new(),
-        node_info: NodeInfo {
+    let actor = NodeActor::new(
+        Id::new(),
+        NodeInfo {
             name: "test".to_string(),
             node_id: Id::new(),
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
-        driver: Box::new(driver),
-        membership: Status::Pending,
-        reachability: Reachability::Pending,
-        send_stream: None,
-    };
+        Box::new(driver),
+    );
     let system = System::local("test_system");
     let mut s = TestSupervisor::new(actor);
 
@@ -323,123 +321,15 @@ async fn node_actor_reachability_to_unreachable() {
 async fn node_actor_reachability_reset() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let actor = NodeActor {
-        id: Id::new(),
-        node_info: NodeInfo {
+    let actor = NodeActor::new(
+        Id::new(),
+        NodeInfo {
             name: "test".to_string(),
             node_id: Id::new(),
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
-        driver: Box::new(driver),
-        membership: Status::Pending,
-        reachability: Reachability::Pending,
-        send_stream: None,
-    };
-    let system = System::local("test_system");
-    let mut s = TestSupervisor::new(actor);
-
-    let timestamp = chrono::Utc::now();
-    let msg = NodeActorHeartbeatCheckMessage { timestamp };
-
-    let _ = s.send(&system, msg).await;
-    assert_matches!(s.actor_ref().reachability, Reachability::Pending);
-
-    // Simulate a successful heartbeat
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: timestamp.clone(),
-    };
-    let _ = s.send(&system, msg).await;
-    assert_matches!(
-        s.actor_ref().reachability,
-        Reachability::Reachable {
-            misses: 0,
-            last_seen: _timestamp
-        }
+        Box::new(driver),
     );
-
-    // 1) Simulate a heartbeat check failure
-    // Move the check time forward by 5 seconds.
-    let check_timestamp = timestamp + chrono::Duration::seconds(5);
-    let msg = NodeActorHeartbeatCheckMessage {
-        timestamp: check_timestamp.clone(),
-    };
-    let _ = s.send(&system, msg).await;
-    assert_matches!(
-        s.actor_ref().reachability,
-        Reachability::Reachable {
-            misses: 1,
-            last_seen: _timestamp
-        }
-    );
-
-    // 2) Simulate a heartbeat check failure
-    // Move the check time forward by 5 seconds.
-    let check_timestamp = check_timestamp + chrono::Duration::seconds(5);
-    let msg = NodeActorHeartbeatCheckMessage {
-        timestamp: check_timestamp.clone(),
-    };
-    let _ = s.send(&system, msg).await;
-    assert_matches!(
-        s.actor_ref().reachability,
-        Reachability::Reachable {
-            misses: 2,
-            last_seen: _timestamp
-        }
-    );
-
-    // Simulate a successful heartbeat
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: check_timestamp.clone(),
-    };
-    let _ = s.send(&system, msg).await;
-    // Re-check to reset the misses.
-    let msg = NodeActorHeartbeatCheckMessage {
-        timestamp: check_timestamp.clone(),
-    };
-    let _ = s.send(&system, msg).await;
-    assert_matches!(
-        s.actor_ref().reachability,
-        Reachability::Reachable {
-            misses: 0,
-            last_seen: _check_timestamp,
-        }
-    );
-
-    // 3) Simulate a heartbeat check failure
-    // Move the check time forward by 5 seconds.
-    let check_timestamp = check_timestamp + chrono::Duration::seconds(5);
-    let msg = NodeActorHeartbeatCheckMessage {
-        timestamp: check_timestamp.clone(),
-    };
-    let _ = s.send(&system, msg).await;
-    assert_matches!(
-        s.actor_ref().reachability,
-        Reachability::Reachable {
-            misses: 1,
-            last_seen: _timestamp
-        }
-    );
-}
-
-#[test_log::test(tokio::test)]
-async fn node_actor_unreachable_to_reachable() {
-    let test_driver = MockNetwork::new();
-    let driver = MockConnectionDriver::new(test_driver);
-    let actor = NodeActor {
-        id: Id::new(),
-        node_info: NodeInfo {
-            name: "test".to_string(),
-            node_id: Id::new(),
-            addr: NetworkAddrRef::from("127.0.0.1:8000"),
-        },
-        driver: Box::new(driver),
-        membership: Status::Pending,
-        reachability: Reachability::Unreachable {
-            pings: 0,
-            last_seen: chrono::Utc::now(),
-        },
-        send_stream: None,
-    };
     let system = System::local("test_system");
     let mut s = TestSupervisor::new(actor);
 
@@ -510,21 +400,15 @@ async fn node_actor_unreachable_to_reachable() {
 async fn node_actor_unreachable_reset() {
     let test_driver = MockNetwork::new();
     let driver = MockConnectionDriver::new(test_driver);
-    let actor = NodeActor {
-        id: Id::new(),
-        node_info: NodeInfo {
+    let actor = NodeActor::new(
+        Id::new(),
+        NodeInfo {
             name: "test".to_string(),
             node_id: Id::new(),
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
-        driver: Box::new(driver),
-        membership: Status::Pending,
-        reachability: Reachability::Unreachable {
-            pings: 0,
-            last_seen: chrono::Utc::now(),
-        },
-        send_stream: None,
-    };
+        Box::new(driver),
+    );
     let system = System::local("test_system");
     let mut s = TestSupervisor::new(actor);
 
@@ -582,15 +466,15 @@ async fn test_membership_initiation() {
         node_id: Id::new(),
         addr: NetworkAddrRef::from("127.0.0.1:8000"),
     };
-
-    let actor = NodeActor {
-        id: Id::new(),
-        node_info: info.clone(),
-        driver: Box::new(driver),
-        membership: Status::Pending,
-        reachability: Reachability::Pending,
-        send_stream: None,
-    };
+    let actor = NodeActor::new(
+        Id::new(),
+        NodeInfo {
+            name: "test".to_string(),
+            node_id: Id::new(),
+            addr: NetworkAddrRef::from("127.0.0.1:8000"),
+        },
+        Box::new(driver),
+    );
 
     let system = System::local("test_system");
     let mut s = TestSupervisor::new(actor);

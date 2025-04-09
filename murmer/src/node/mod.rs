@@ -107,14 +107,7 @@ impl Node {
         let id = node_info.node_id.clone();
 
         let driver = Box::new(QuicConnectionDriver::new(node_info.clone(), socket, tls));
-        let endpoint = system.spawn_with(NodeActor {
-            node_info,
-            id: cluster_id.id.clone(),
-            driver,
-            membership: Status::Pending,
-            reachability: Reachability::Pending,
-            send_stream: None,
-        });
+        let endpoint = system.spawn_with(NodeActor::new(cluster_id.id.clone(), node_info, driver));
         endpoint.map(|e| Node { id, endpoint: e }).ok()
     }
 }

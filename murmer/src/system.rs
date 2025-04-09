@@ -297,7 +297,7 @@ where
         path: Arc<ActorPath>,
         actor: A,
     ) -> (Self, MailboxSender<SupervisorCommand<A>>) {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(1024);
         let mailbox_sender = MailboxSender::new(tx);
         let runtime = SupervisorRuntime {
             actor,

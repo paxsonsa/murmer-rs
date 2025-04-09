@@ -208,7 +208,6 @@ pub enum NodeMessage {
         node_id: Id,
     },
     Join {
-        node_id: Id,
         name: String,
         capabilities: Vec<String>,
     },

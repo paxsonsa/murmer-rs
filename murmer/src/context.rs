@@ -90,7 +90,6 @@ where
 
     /// Send a message to the actor's endpoint.
     pub fn send(&self, msg: impl Message) {
-        todo!()
     }
 
     /// Send a message to the actor's endpoint with a priority.
