@@ -1,6 +1,41 @@
 //! Simple test utilities for easier actor testing
 //! 
 //! This module provides a basic TestHarness for actor testing.
+//! 
+//! # Example
+//! 
+//! See `test_utils_example.rs` for a complete, self-contained example of how to use 
+//! the test harness, including:
+//! 
+//! - Basic actor testing with assertions
+//! - Testing actors with external state
+//! - Error handling test patterns
+//! 
+//! # Quick Start
+//! 
+//! ```
+//! use crate::test_utils::prelude::*;
+//! 
+//! #[test_log::test(tokio::test)]
+//! async fn test_my_actor() {
+//!     // Create test harness
+//!     let test = ActorTestHarness::new();
+//!     
+//!     // Spawn actor
+//!     let mut actor = test.spawn(MyActor::new());
+//!     
+//!     // Start the actor
+//!     actor.start().await;
+//!     
+//!     // Send messages and check results
+//!     let result = actor.send(MyMessage).await.unwrap();
+//!     
+//!     // Assert on internal state
+//!     actor.assert_state(|state| {
+//!         assert_eq!(state.some_value, expected_value);
+//!     });
+//! }
+//! ```
 
 use std::time::Duration;
 
@@ -38,9 +73,9 @@ impl ActorTestHarness {
 /// Handle for a specific actor under test
 pub struct ActorTestHandle<A: Actor> {
     /// The supervisor for this actor
-    supervisor: TestSupervisor<A>,
+    pub supervisor: TestSupervisor<A>,
     /// The system for this actor
-    system: System,
+    pub system: System,
 }
 
 impl<A: Actor> ActorTestHandle<A> {
@@ -68,12 +103,49 @@ impl<A: Actor> ActorTestHandle<A> {
         self.supervisor.tick(self.system.clone(), Some(Duration::from_millis(100))).await;
     }
     
+    /// Process multiple messages in the actor's mailbox
+    pub async fn process_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.process_one().await;
+        }
+    }
+    
     /// Assert a condition about the actor's state
     pub fn assert_state<F>(&self, check_fn: F) 
     where
         F: FnOnce(&A),
     {
         check_fn(self.actor_ref());
+    }
+    
+    /// Wait for a specific condition to be true in the actor's state
+    /// Will process messages until the condition is true or until the timeout is reached
+    pub async fn wait_for_state<F>(&mut self, condition: F, timeout_ms: u64) -> Result<(), &'static str> 
+    where
+        F: Fn(&A) -> bool,
+    {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        
+        // Check initial state first
+        if condition(self.actor_ref()) {
+            return Ok(());
+        }
+        
+        while start.elapsed() < timeout {
+            // Process one message
+            self.process_one().await;
+            
+            // Check if condition is now true
+            if condition(self.actor_ref()) {
+                return Ok(());
+            }
+            
+            // Small sleep to avoid tight loop
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        
+        Err("Timed out waiting for condition")
     }
 }
 

@@ -13,6 +13,8 @@ mod system;
 mod tls;
 #[cfg(test)]
 mod test_utils;
+#[cfg(test)]
+mod test_utils_example;
 
 // TODO: Add clustering functionality for both local and remote actors
 // TODO: Implement receptionist auto register traits for actors
