@@ -11,6 +11,8 @@ pub mod prelude;
 mod receptionist;
 mod system;
 mod tls;
+#[cfg(test)]
+mod test_utils;
 
 // TODO: Add clustering functionality for both local and remote actors
 // TODO: Implement receptionist auto register traits for actors
@@ -70,8 +72,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Handler<MyMessage> for MyActor {
-        fn handle(&mut self, ctx: &mut Context<Self>, message: MyMessage) -> SystemId {
+        async fn handle(&mut self, ctx: &mut Context<Self>, message: MyMessage) -> SystemId {
             (self.on_handle)(ctx, message);
             System::current().id()
         }
@@ -151,8 +154,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Handler<CounterMessage> for CounterActor {
-        fn handle(&mut self, _ctx: &mut Context<Self>, message: CounterMessage) -> usize {
+        async fn handle(&mut self, _ctx: &mut Context<Self>, message: CounterMessage) -> usize {
             match message {
                 CounterMessage::Increment => {
                     self.counter += 1;

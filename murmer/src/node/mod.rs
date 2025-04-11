@@ -9,6 +9,10 @@ use std::sync::Arc;
 #[path = "mod.test.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "harness_test.rs"]
+mod harness_tests;
+
 mod actor;
 use actor::*;
 
