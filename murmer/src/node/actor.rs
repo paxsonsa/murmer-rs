@@ -152,36 +152,15 @@ impl Actor for NodeActor {
             }
         });
 
-        // Instead of using intervals which aren't implemented yet, let's use separate
-        // tasks with sleeps to handle periodic actions
+        // Use the new interval pattern for periodic tasks
         
         // Setup a heartbeat deadman switch to periodically check the reachability of the node
-        let endpoint = ctx.endpoint();
-        ctx.spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                
-                if let Err(err) = endpoint.send(NodeActorHeartbeatCheckMessage {
-                    timestamp: Utc::now(),
-                }).await {
-                    tracing::error!(error=%err, "Failed to send heartbeat check message from timer");
-                    break;
-                }
-            }
+        ctx.interval(Duration::from_secs(1), || NodeActorHeartbeatCheckMessage {
+            timestamp: Utc::now(),
         });
         
         // Setup a timer to periodically send heartbeats to the remote node
-        let endpoint = ctx.endpoint();
-        ctx.spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                
-                if let Err(err) = endpoint.send(NodeActorSendHeartbeatMessage {}).await {
-                    tracing::error!(error=%err, "Failed to send heartbeat message from timer");
-                    break;
-                }
-            }
-        });
+        ctx.interval(Duration::from_secs(5), || NodeActorSendHeartbeatMessage {});
     }
 }
 
@@ -253,9 +232,8 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
             net::NodeMessage::InitAck { node_id } => {
                 tracing::info!(?node_id, "Received InitAck");
                 
-                // Use the send_to_self method to handle this message asynchronously
-                // This avoids spawning a separate task explicitly and is more readable
-                ctx.send_to_self(NodeActorInitAckMessage { 
+                // Handle this message asynchronously
+                ctx.send(NodeActorInitAckMessage { 
                     node_id: node_id.clone() 
                 });
             },
@@ -325,9 +303,8 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
                 // Update reachability with new heartbeat
                 let now = Utc::now();
                 
-                // Use send_to_self to update our heartbeat tracking
-                // This is cleaner than explicitly spawning a task
-                ctx.send_to_self(NodeActorHeartbeatUpdateMessage { 
+                // Update our heartbeat tracking
+                ctx.send(NodeActorHeartbeatUpdateMessage { 
                     timestamp: now 
                 });
                 

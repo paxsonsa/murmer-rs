@@ -254,6 +254,38 @@ impl System {
             } => root_cancellation.cancel(),
         }
     }
+
+    /// Creates a new subsystem that inherits properties from the parent system.
+    /// 
+    /// This is useful for creating actor hierarchies with different supervision
+    /// scopes while still maintaining a connection to the parent system.
+    pub fn create_subsystem(&self) -> Self {
+        match self {
+            Self::Local { name, root_cancellation, context: _, receptionist } => {
+                let subsystem_name = format!("{}/subsystem-{}", name, self.id());
+                let child_cancellation = root_cancellation.child_token();
+                let context = Arc::new(RwLock::new(SystemContext::new()));
+                
+                Self::Local {
+                    name: subsystem_name,
+                    root_cancellation: child_cancellation,
+                    context,
+                    receptionist: receptionist.clone(),
+                }
+            },
+            Self::Clustered { cluster, root_cancellation, context: _, receptionist } => {
+                let child_cancellation = root_cancellation.child_token();
+                let context = Arc::new(RwLock::new(SystemContext::new()));
+                
+                Self::Clustered {
+                    cluster: cluster.clone(),
+                    root_cancellation: child_cancellation,
+                    context,
+                    receptionist: receptionist.clone(),
+                }
+            },
+        }
+    }
 }
 
 /// Commands that can be sent to an actor's supervisor

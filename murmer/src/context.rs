@@ -4,7 +4,7 @@ use futures::channel::oneshot::Cancellation;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    actor::Actor,
+    actor::{Actor, Handler},
     message::Message,
     system::{Endpoint, System},
 };
@@ -39,6 +39,19 @@ where
     }
 }
 
+impl<A> Clone for Context<A> 
+where
+    A: Actor,
+{
+    fn clone(&self) -> Self {
+        Context {
+            endpoint: self.endpoint.clone(),
+            cancellation: self.cancellation.clone(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<A> Context<A>
 where
     A: Actor,
@@ -51,12 +64,7 @@ where
 
     /// Access the actor system.
     pub fn system(&self) -> System {
-        todo!()
-    }
-
-    /// Return a subsystem that is a child to actor's system.
-    pub fn subsystem(&self) -> System {
-        todo!()
+        System::current()
     }
 
     /// Return a cancellation token for this actor.
@@ -64,12 +72,53 @@ where
         self.cancellation.clone()
     }
 
-    /// Establish an interval to execute a given closure at a fixed interval.
-    pub fn interval<F>(&self, interval: std::time::Duration, f: F)
+    /// Establish an interval that sends a message to the actor at a fixed interval.
+    ///
+    /// This method takes a message factory function that creates a new message instance
+    /// each time the interval triggers. The actor must implement Handler<M> for the 
+    /// message type.
+    ///
+    /// # Example
+    /// ```
+    /// // Create an interval that sends a Tick message every second
+    /// ctx.interval(Duration::from_secs(1), || Tick);
+    /// 
+    /// // Create an interval with dynamic message content
+    /// let counter = Arc::new(AtomicUsize::new(0));
+    /// let counter_clone = counter.clone();
+    /// ctx.interval(Duration::from_secs(5), move || {
+    ///     let count = counter_clone.fetch_add(1, Ordering::SeqCst);
+    ///     StatusUpdate { count }
+    /// });
+    /// ```
+    pub fn interval<F, M>(&self, interval: std::time::Duration, message_factory: F)
     where
-        F: FnMut(&Context<A>) + Send + 'static,
+        F: Fn() -> M + Send + 'static,
+        M: Message + Send + 'static,
+        A: Handler<M>,
+        M::Result: Send,
     {
-        todo!()
+        let endpoint = self.endpoint();
+        let cancellation = self.cancellation.child_token();
+        
+        tokio::spawn(async move {
+            let mut interval_timer = tokio::time::interval(interval);
+            
+            loop {
+                tokio::select! {
+                    _ = interval_timer.tick() => {
+                        let msg = message_factory();
+                        if let Err(err) = endpoint.send(msg).await {
+                            tracing::error!(error=%err, "Failed to send interval message");
+                            break;
+                        }
+                    },
+                    _ = cancellation.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Spawn the future on the actor's runtime/lifecycle.
@@ -91,24 +140,7 @@ where
     }
 
     /// Send a message to the actor's endpoint.
-    pub fn send(&self, msg: impl Message) {
-    }
-
-    /// Send a message to the actor's endpoint with a priority.
-    pub fn send_priority(&self, msg: impl Message) {
-        todo!()
-    }
-    
-    /// Send a message to the actor itself using tokio::spawn.
-    ///
-    /// This is a convenience method for self-messaging patterns. It spawns
-    /// a background task to send the message, avoiding potential deadlocks.
-    ///
-    /// Example:
-    /// ```
-    /// ctx.send_to_self(UpdateStateMessage { value: 42 });
-    /// ```
-    pub fn send_to_self<M>(&self, msg: M)
+    pub fn send<M>(&self, msg: M)
     where
         A: crate::actor::Handler<M>,
         M: Message + Send + 'static,
@@ -117,7 +149,7 @@ where
         let endpoint = self.endpoint();
         tokio::spawn(async move {
             if let Err(err) = endpoint.send(msg).await {
-                tracing::error!(error=%err, "Failed to send message to self");
+                tracing::error!(error=%err, "Failed to send message");
             }
         });
     }
