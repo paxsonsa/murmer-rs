@@ -24,6 +24,7 @@ where
     _phantom: std::marker::PhantomData<A>,
 }
 
+
 impl<A> Context<A>
 where
     A: Actor,
@@ -46,6 +47,7 @@ where
     pub fn endpoint(&self) -> Endpoint<A> {
         self.endpoint.clone()
     }
+
 
     /// Access the actor system.
     pub fn system(&self) -> System {
@@ -95,5 +97,28 @@ where
     /// Send a message to the actor's endpoint with a priority.
     pub fn send_priority(&self, msg: impl Message) {
         todo!()
+    }
+    
+    /// Send a message to the actor itself using tokio::spawn.
+    ///
+    /// This is a convenience method for self-messaging patterns. It spawns
+    /// a background task to send the message, avoiding potential deadlocks.
+    ///
+    /// Example:
+    /// ```
+    /// ctx.send_to_self(UpdateStateMessage { value: 42 });
+    /// ```
+    pub fn send_to_self<M>(&self, msg: M)
+    where
+        A: crate::actor::Handler<M>,
+        M: Message + Send + 'static,
+        M::Result: Send,
+    {
+        let endpoint = self.endpoint();
+        tokio::spawn(async move {
+            if let Err(err) = endpoint.send(msg).await {
+                tracing::error!(error=%err, "Failed to send message to self");
+            }
+        });
     }
 }
