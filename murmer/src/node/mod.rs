@@ -16,7 +16,7 @@ mod harness_tests;
 mod actor;
 use actor::*;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Pending,
     Up,
@@ -27,7 +27,7 @@ pub enum Status {
     Failed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Reachability {
     Pending,
     Reachable {
@@ -41,6 +41,19 @@ pub enum Reachability {
         last_seen: DateTime<Utc>,
     },
 }
+
+impl PartialEq for Reachability {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pending, Self::Pending) => true,
+            (Self::Reachable { misses: s_m, .. }, Self::Reachable { misses: o_m, .. }) => s_m == o_m,
+            (Self::Unreachable { pings: s_p, .. }, Self::Unreachable { pings: o_p, .. }) => s_p == o_p,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Reachability {}
 
 impl Reachability {
     pub fn reachable_now() -> Self {
@@ -96,8 +109,8 @@ impl From<NetworkAddrRef> for NodeInfo {
 
 #[derive(Clone)]
 pub struct Node {
-    id: Id,
-    endpoint: Endpoint<NodeActor>,
+    pub id: Id,
+    pub endpoint: Endpoint<NodeActor>,
 }
 
 impl Node {

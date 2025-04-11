@@ -24,3 +24,5 @@ pub use super::system::{
     System,      // The actor system itself (renamed from System)
     SystemError, // System-level errors
 };
+
+pub use super::receptionist::{Key, Listing, Receptionist};
