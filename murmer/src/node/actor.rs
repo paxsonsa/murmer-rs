@@ -1,4 +1,5 @@
 use crate::net::{self, FrameWriter, NetworkDriver};
+use crate::receptionist::Key;
 use chrono::{DateTime, Utc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,54 @@ impl NodeActor {
             send_stream: None,
             inner_state: State::Init,
             node_id: None,
+        }
+    }
+    
+    // Send a status update to the cluster
+    async fn update_status_and_notify(&mut self, ctx: &mut Context<Self>) {
+        // Log the status change for debugging
+        tracing::debug!(
+            node_id=%self.node_info.node_id,
+            status=?self.membership,
+            reachability=?self.reachability,
+            "Node status changed"
+        );
+        
+        // Try to find the cluster actor through the receptionist
+        let key = crate::receptionist::Key::<crate::cluster::ClusterActor>::default();
+        
+        // Attempt to lookup the cluster actor but don't require it to be present
+        // This enables testing without needing to mock the cluster
+        let lookup_result = ctx.system().receptionist().lookup_one(key).await;
+        
+        if let Ok(endpoint) = lookup_result {
+            let cluster = crate::cluster::Cluster::new(endpoint);
+            
+            // Determine if this is a configured node (based on whether it was initialized from config)
+            // For now we'll assume all nodes were configured - in a real implementation
+            // we'd track this information properly
+            let is_configured = true;
+            
+            // Send the status update
+            let status_update = crate::cluster::NodeStatusUpdate {
+                node_id: self.node_info.node_id.clone(),
+                status: self.membership.clone(),
+                reachability: self.reachability.clone(),
+                is_configured,
+                timestamp: chrono::Utc::now(),
+            };
+            
+            if let Err(err) = cluster.update_node_status(status_update).await {
+                tracing::error!(error=%err, "Failed to send status update to cluster");
+            } else {
+                tracing::debug!(
+                    node_id=%self.node_info.node_id,
+                    "Successfully sent status update to cluster"
+                );
+            }
+        } else {
+            // This is expected in tests where no cluster is registered
+            tracing::debug!("No cluster actor registered, skipping status update");
         }
     }
 
@@ -182,7 +231,7 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
                 return;
             }
         };
-        let header = frame.header;
+        let _header = frame.header;
         let payload = frame.payload;
 
         let msg = match payload {
@@ -335,8 +384,8 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
                 // We'll set the send_stream to None to prevent further sends
                 self.send_stream = None;
                 
-                // This debug print was useful to debug the test, but we don't need it anymore
-                // Remove the log that pollutes the terminal output
+                // Notify the cluster about disconnection
+                self.update_status_and_notify(ctx).await;
             },
         }
     }
@@ -353,9 +402,12 @@ impl Message for NodeActorInitAckMessage {
 
 #[async_trait]
 impl Handler<NodeActorInitAckMessage> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorInitAckMessage) {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorInitAckMessage) {
         // Call our async init_ack method to properly process the InitAck
         self.init_ack(msg.node_id).await;
+        
+        // Notify the cluster about our state change
+        self.update_status_and_notify(ctx).await;
     }
 }
 
@@ -369,8 +421,10 @@ impl Message for NodeActorHeartbeatUpdateMessage {
 }
 #[async_trait]
 impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatUpdateMessage) {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorHeartbeatUpdateMessage) {
         let ping_time = msg.timestamp;
+        let old_reachability = self.reachability.clone();
+        
         match self.reachability {
             Reachability::Unreachable { pings, last_seen } => {
                 self.reachability = Reachability::Unreachable {
@@ -396,6 +450,16 @@ impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
                     last_seen: ping_time,
                 };
             }
+        }
+        
+        // If reachability changed, notify the cluster
+        if self.reachability != old_reachability {
+            tracing::debug!(
+                old_reachability=?old_reachability, 
+                new_reachability=?self.reachability, 
+                "Node reachability changed"
+            );
+            self.update_status_and_notify(ctx).await;
         }
     }
 }
@@ -460,8 +524,11 @@ impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
 #[async_trait]
 impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
     /// Check the reachability of the node and update the reachability state accordingly.
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeActorHeartbeatCheckMessage) {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorHeartbeatCheckMessage) {
         let timestamp = msg.timestamp;
+        let old_reachability = self.reachability.clone();
+        let old_status = self.membership.clone();
+        
         match &self.reachability {
             Reachability::Reachable { misses, last_seen } => {
                 if last_seen.signed_duration_since(timestamp) > chrono::TimeDelta::seconds(-3) {
@@ -474,6 +541,11 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                         pings: 0,
                         last_seen: last_seen.clone(),
                     };
+                    
+                    // If we can't reach the node after multiple attempts, mark it as Down
+                    if !matches!(self.membership, Status::Down | Status::Failed) {
+                        self.membership = Status::Down;
+                    }
                 } else {
                     self.reachability = Reachability::Reachable {
                         misses: misses + 1,
@@ -489,6 +561,11 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                         misses: 0,
                         last_seen: last_seen.clone(),
                     };
+                    
+                    // If the node was Down but now is reachable again, mark it as Up
+                    if matches!(self.membership, Status::Down) {
+                        self.membership = Status::Up;
+                    }
                 } else {
                     self.reachability = Reachability::Unreachable {
                         pings: *pings,
@@ -497,6 +574,18 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                 }
             }
             _ => {}
+        }
+        
+        // If reachability or status changed, notify the cluster
+        if self.reachability != old_reachability || self.membership != old_status {
+            tracing::debug!(
+                old_reachability=?old_reachability, 
+                new_reachability=?self.reachability,
+                old_status=?old_status,
+                new_status=?self.membership,
+                "Node status or reachability changed"
+            );
+            self.update_status_and_notify(ctx).await;
         }
     }
 }
