@@ -622,6 +622,42 @@ impl RawStream {
 // Network Driver Implementations
 //
 
+/// A future that resolves to a RawStream when a connection is accepted.
+/// This can be awaited multiple times to accept multiple streams.
+pub struct AcceptStream {
+    accept_fn: Box<
+        dyn FnMut() -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<RawStream, ConnectionError>> + Send>,
+            > + Send,
+    >,
+}
+
+impl AcceptStream {
+    /// Create a new AcceptStream with a custom implementation
+    pub fn new<F, Fut>(mut accept_fn: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<RawStream, ConnectionError>> + Send + 'static,
+    {
+        AcceptStream {
+            accept_fn: Box::new(move || Box::pin(accept_fn())),
+        }
+    }
+}
+
+impl std::future::Future for AcceptStream {
+    type Output = Result<RawStream, ConnectionError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Call the accept function and poll the resulting future
+        let mut future = (self.accept_fn)();
+        future.as_mut().poll(cx)
+    }
+}
+
 /// Network driver trait for establishing connections and opening streams
 #[async_trait::async_trait]
 pub trait NetworkDriver: Send {
@@ -630,7 +666,11 @@ pub trait NetworkDriver: Send {
 
     /// Open a new bidirectional stream for communication
     /// Returns a type-erased stream that can be converted to a typed stream
-    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError>;
+    async fn open_stream(&mut self) -> Result<RawStream, ConnectionError>;
+
+    /// Accept a new bidirectional stream for communication
+    /// Returns an AcceptStream future that will resolve to a RawStream when awaited
+    async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError>;
 }
 
 #[derive(Debug)]
@@ -728,7 +768,7 @@ impl NetworkDriver for QuicConnectionDriver {
         }
     }
 
-    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError> {
+    async fn open_stream(&mut self) -> Result<RawStream, ConnectionError> {
         match &self.state {
             QuicConnectionState::Connected { connection } => {
                 // Open a bidirectional stream
@@ -738,6 +778,36 @@ impl NetworkDriver for QuicConnectionDriver {
 
                 // Create the raw stream
                 Ok(RawStream::new(Box::new(recv), Box::new(send)))
+            }
+            QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
+            QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+                format!("Connection is disconnected: {}", reason),
+            )),
+        }
+    }
+
+    async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError> {
+        match &self.state {
+            QuicConnectionState::Connected { connection } => {
+                // Clone the connection to move it into the AcceptStream future
+                let connection_clone = connection.clone();
+
+                // Return an AcceptStream future that will resolve to a RawStream when awaited
+                Ok(AcceptStream::new(move || {
+                    let connection = connection_clone.clone();
+                    async move {
+                        // Accept a bidirectional stream
+                        let (send, recv) = connection.accept_bi().await.map_err(|e| {
+                            ConnectionError::ConnectionFailed(format!(
+                                "Failed to accept stream: {}",
+                                e
+                            ))
+                        })?;
+
+                        // Create the raw stream
+                        Ok(RawStream::new(Box::new(recv), Box::new(send)))
+                    }
+                }))
             }
             QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
             QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(

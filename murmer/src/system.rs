@@ -256,34 +256,44 @@ impl System {
     }
 
     /// Creates a new subsystem that inherits properties from the parent system.
-    /// 
+    ///
     /// This is useful for creating actor hierarchies with different supervision
     /// scopes while still maintaining a connection to the parent system.
     pub fn create_subsystem(&self) -> Self {
         match self {
-            Self::Local { name, root_cancellation, context: _, receptionist } => {
+            Self::Local {
+                name,
+                root_cancellation,
+                context: _,
+                receptionist,
+            } => {
                 let subsystem_name = format!("{}/subsystem-{}", name, self.id());
                 let child_cancellation = root_cancellation.child_token();
                 let context = Arc::new(RwLock::new(SystemContext::new()));
-                
+
                 Self::Local {
                     name: subsystem_name,
                     root_cancellation: child_cancellation,
                     context,
                     receptionist: receptionist.clone(),
                 }
-            },
-            Self::Clustered { cluster, root_cancellation, context: _, receptionist } => {
+            }
+            Self::Clustered {
+                cluster,
+                root_cancellation,
+                context: _,
+                receptionist,
+            } => {
                 let child_cancellation = root_cancellation.child_token();
                 let context = Arc::new(RwLock::new(SystemContext::new()));
-                
+
                 Self::Clustered {
                     cluster: cluster.clone(),
                     root_cancellation: child_cancellation,
                     context,
                     receptionist: receptionist.clone(),
                 }
-            },
+            }
         }
     }
 }
@@ -470,15 +480,14 @@ where
             .await
     }
 
-    pub async fn tick(&mut self, system: System, timeout: Option<std::time::Duration>) {
+    pub async fn tick(&mut self, system: System, timeout: Option<std::time::Duration>) -> bool {
         let timeout_duration = timeout.unwrap_or(std::time::Duration::from_millis(500));
         ACTIVE_SYSTEM
             .scope(system, async move {
-                tokio::time::timeout(timeout_duration, self.runtime.tick(&mut self.ctx))
-                    .await
-                    .unwrap();
+                tokio::time::timeout(timeout_duration, self.runtime.tick(&mut self.ctx)).await
             })
             .await
+            .is_ok()
     }
 }
 
@@ -785,9 +794,7 @@ impl<A: Actor> EndpointSender<A> {
             let mut ctx = ctx.lock();
             let mut actor = actor.lock();
             let fut = envelope.0.handle_async(&mut *ctx, &mut *actor);
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(fut)
-            });
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut));
 
             Box::pin(async { Ok(()) })
                 as Pin<Box<dyn Future<Output = Result<(), ActorError>> + Send>>

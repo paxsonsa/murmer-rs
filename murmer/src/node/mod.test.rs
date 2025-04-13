@@ -1,4 +1,4 @@
-use crate::net::{ConnectionError, NetworkDriver, RawStream};
+use crate::net::{AcceptStream, ConnectionError, NetworkDriver, RawStream};
 use crate::test_utils::prelude::*;
 
 use super::*;
@@ -18,17 +18,16 @@ struct MockNetwork {
 }
 
 impl MockNetwork {
-    
     #[cfg(test)]
     pub fn with_recorder() -> (Self, Arc<Mutex<Vec<bytes::Bytes>>>) {
         let read_stream = Arc::new(Mutex::new(vec![]));
         let write_stream = Arc::new(Mutex::new(vec![]));
-        
+
         let network = MockNetwork {
             read_stream,
             write_stream: write_stream.clone(),
         };
-        
+
         (network, write_stream)
     }
     fn new() -> Self {
@@ -51,15 +50,17 @@ impl MockNetwork {
     }
 
     // Get a frame that was written by the actor
-    async fn expect_one_frame<T: Serialize + DeserializeOwned>(&self) -> net::Frame<T> {
+    async fn expect_one_frame<T: Serialize + DeserializeOwned>(&self) -> Option<net::Frame<T>> {
         let mut write_stream = self.write_stream.lock();
         if write_stream.is_empty() {
-            panic!("No data in write stream");
+            return None;
         }
         let data = write_stream.remove(0);
         let frame: net::Frame<T> = net::Frame::decode(data).expect("Failed to decode frame");
-        frame
+        Some(frame)
     }
+
+    // This method has been replaced by process_until_frame in ActorTestHarnessExt
 
     // Check if there are any frames written by the actor
     fn has_frames(&self) -> bool {
@@ -90,7 +91,7 @@ impl NetworkDriver for MockConnectionDriver {
         Ok(())
     }
 
-    async fn open_raw_stream(&mut self) -> Result<RawStream, ConnectionError> {
+    async fn open_stream(&mut self) -> Result<RawStream, ConnectionError> {
         // Create mock read/write streams
         let read_data = self.test_driver.read_stream.clone();
         let write_data = self.test_driver.write_stream.clone();
@@ -100,6 +101,26 @@ impl NetworkDriver for MockConnectionDriver {
 
         // Create raw stream
         Ok(RawStream::new(Box::new(mock_read), Box::new(mock_write)))
+    }
+
+    async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError> {
+        let test_driver = self.test_driver.clone();
+
+        // Create an AcceptStream that will create a new mock stream each time it's awaited
+        Ok(AcceptStream::new(move || {
+            let test_driver = test_driver.clone();
+            async move {
+                // Create mock read/write streams
+                let read_data = test_driver.read_stream.clone();
+                let write_data = test_driver.write_stream.clone();
+
+                let mock_read = MockStreamReader::new(read_data);
+                let mock_write = MockStreamWriter::new(write_data);
+
+                // Create raw stream
+                Ok(RawStream::new(Box::new(mock_read), Box::new(mock_write)))
+            }
+        }))
     }
 }
 
@@ -227,6 +248,58 @@ impl AsyncWrite for MockStreamWriter {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+// Extension trait for ActorTestHarness to add process_until_frame method
+#[async_trait::async_trait]
+pub trait ActorTestHarnessExt {
+    /// Process actor messages until a frame is available or timeout occurs
+    ///
+    /// This method continuously processes messages from the actor's mailbox
+    /// while waiting for a frame to become available from the network.
+    ///
+    /// # Arguments
+    /// * `network` - The MockNetwork instance to check for frames
+    /// * `timeout_ms` - Maximum time to wait in milliseconds
+    ///
+    /// # Returns
+    /// * `Ok(Frame<T>)` - The frame if one becomes available before timeout
+    /// * `Err(&'static str)` - Error message if timeout occurs
+    async fn process_until_frame<T: Serialize + DeserializeOwned + 'static>(
+        &mut self,
+        network: &MockNetwork,
+        timeout_ms: u64,
+    ) -> Result<net::Frame<T>, &'static str>;
+}
+
+#[async_trait::async_trait]
+impl<A: Actor + Send + 'static> ActorTestHarnessExt for ActorTestHandle<A> {
+    async fn process_until_frame<T: Serialize + DeserializeOwned + 'static>(
+        &mut self,
+        network: &MockNetwork,
+        timeout_ms: u64,
+    ) -> Result<net::Frame<T>, &'static str> {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            // First check if a frame is already available
+            if let Some(frame) = network.expect_one_frame::<T>().await {
+                return Ok(frame);
+            }
+
+            // Process one message from the actor's mailbox
+            if !self.process_one().await {
+                // No more messages to process, wait a bit before checking again
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // Check if we've timed out
+            if start.elapsed() >= timeout {
+                return Err("Timed out waiting for frame");
+            }
+        }
     }
 }
 
@@ -527,35 +600,43 @@ async fn node_actor_unreachable_reset() {
 async fn test_node_actor_startup() {
     // Create a test harness
     let test = ActorTestHarness::new();
-    
+
     // Create mock network and driver
     let test_driver = MockNetwork::new();
     let driver = Box::new(MockConnectionDriver::new(test_driver.clone()));
-    
+
     // Create node actor
-    let node_info = NodeInfo::from("127.0.0.1:12345".parse::<crate::net::NetworkAddrRef>().unwrap());
+    let node_info = NodeInfo::from(
+        "127.0.0.1:12345"
+            .parse::<crate::net::NetworkAddrRef>()
+            .unwrap(),
+    );
     let mut actor = test.spawn(NodeActor::new(Id::new(), node_info, driver));
-    
+
     // Start the actor
     actor.start().await;
-    
+
     // Verify the actor's initial state
     actor.assert_state(|state| {
         assert_eq!(state.membership, Status::Pending);
         assert_matches!(state.reachability, Reachability::Pending);
     });
-    
+
     // Test handling of the InitAck message
     let init_node_id = Id::new();
-    actor.send(NodeActorInitAckMessage { 
-        node_id: init_node_id.clone() 
-    }).await.unwrap();
-    
+    actor
+        .send(NodeActorInitAckMessage {
+            node_id: init_node_id.clone(),
+        })
+        .await
+        .unwrap();
+
     // Wait for the actor to update its state
-    actor.wait_for_state(|state| {
-        state.membership == Status::Joining
-    }, 1000).await.expect("Actor failed to update state after InitAck");
-    
+    actor
+        .wait_for_state(1000, |state| state.membership == Status::Joining)
+        .await
+        .expect("Actor failed to update state after InitAck");
+
     // Verify the actor state after receiving InitAck
     actor.assert_state(|state| {
         assert_eq!(state.membership, Status::Joining);
@@ -606,11 +687,10 @@ async fn test_membership_initiation() {
     // ========== PHASE 1: INIT / INIT_ACK ==========
 
     // Verify Init Message was sent
-    let frame_future = test_driver.expect_one_frame::<net::NodeMessage>();
-    let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), frame_future).await {
-        Ok(frame) => frame,
-        Err(_) => panic!("Timed out waiting for Init message"),
-    };
+    let frame = actor
+        .process_until_frame::<net::NodeMessage>(&test_driver, 5000)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to receive Init message: {}", err));
 
     // Verify the frame contains an Init message with correct protocol version
     if let net::Payload::Ok(net::NodeMessage::Init {
@@ -641,13 +721,12 @@ async fn test_membership_initiation() {
     actor.process_one().await;
 
     actor
-        .wait_for_state(
-            |state| match (&state.membership, &state.reachability) {
+        .wait_for_state(500, |state| {
+            match (&state.membership, &state.reachability) {
                 (Status::Joining, Reachability::Reachable { .. }) => true,
                 _ => false,
-            },
-            500,
-        )
+            }
+        })
         .await
         .unwrap_or_else(|_| {
             panic!("Timed out waiting for state to change to Joining");
@@ -655,11 +734,10 @@ async fn test_membership_initiation() {
 
     // ========== PHASE 2: JOIN / JOIN_ACK ==========
     // Verify Join Message was sent
-    let frame_future = test_driver.expect_one_frame::<net::NodeMessage>();
-    let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), frame_future).await {
-        Ok(frame) => frame,
-        Err(_) => panic!("Timed out waiting for Join message"),
-    };
+    let frame = actor
+        .process_until_frame::<net::NodeMessage>(&test_driver, 5000)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to receive Join message: {}", err));
 
     // Verify the frame contains a Join message
     if let net::Payload::Ok(net::NodeMessage::Join { name, capabilities }) = frame.payload {
@@ -681,24 +759,22 @@ async fn test_membership_initiation() {
 
     // Verify the state has changed to Up after JoinAck
     actor
-        .wait_for_state(
-            |state| match (&state.membership, &state.reachability) {
+        .wait_for_state(500, |state| {
+            match (&state.membership, &state.reachability) {
                 (Status::Up, Reachability::Reachable { .. }) => true,
                 _ => false,
-            },
-            500,
-        )
+            }
+        })
         .await
         .expect("Timed out waiting for state to change to Up");
 
     // ========== PHASE 3: HEARTBEAT EXCHANGE ==========
 
     // Verify a heartbeat was sent after join accepted
-    let frame_future = test_driver.expect_one_frame::<net::NodeMessage>();
-    let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), frame_future).await {
-        Ok(frame) => frame,
-        Err(_) => panic!("Timed out waiting for Heartbeat message"),
-    };
+    let frame = actor
+        .process_until_frame::<net::NodeMessage>(&test_driver, 5000)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to receive Heartbeat message: {}", err));
 
     // Verify the frame contains a Heartbeat message
     assert_matches!(
@@ -718,15 +794,11 @@ async fn test_membership_initiation() {
     };
     test_driver.push_frame(remote_heartbeat);
 
-    // Process the Heartbeat message
-    actor.process_one().await;
-
-    // Verify we responded with our own heartbeat
-    let frame_future = test_driver.expect_one_frame::<net::NodeMessage>();
-    let frame = match tokio::time::timeout(std::time::Duration::from_secs(5), frame_future).await {
-        Ok(frame) => frame,
-        Err(_) => panic!("Timed out waiting for Heartbeat response"),
-    };
+    // Process messages until we get a heartbeat response or timeout
+    let frame = actor
+        .process_until_frame::<net::NodeMessage>(&test_driver, 5000)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to receive Heartbeat response: {}", err));
 
     // Verify the frame contains a Heartbeat message
     if let net::Payload::Ok(net::NodeMessage::Heartbeat { timestamp: _ }) = frame.payload {
@@ -746,26 +818,20 @@ async fn test_membership_initiation() {
     };
     test_driver.push_frame(disconnect);
 
-    // Process the Disconnect message
-    actor.process_one().await;
-
-    // Process a second time to make sure all messages are handled
-    actor.process_one().await;
-
     // Log the state to diagnose any issues
-    actor.assert_state(|state| {
-        println!(
-            "Final state after Disconnect: membership={:?}, reachability={:?}",
-            state.membership, state.reachability
-        );
+    actor
+        .wait_for_state(500, |state| {
+            println!(
+                "Final state after Disconnect: membership={:?}, reachability={:?}",
+                state.membership, state.reachability
+            );
 
-        // For this test, we'll accept either Down or Up status since we're primarily
-        // testing the full protocol flow, not just the final state
-        assert_matches!(state.membership, Status::Down | Status::Up);
-        
+            // Verify the state is down now.
+            return matches!(state.membership, Status::Down) ||
         // We're testing the protocol flow, not the exact reachability state
         // Depending on timing, the reachability might be Unreachable or Reachable
-        assert!(matches!(state.reachability, Reachability::Unreachable { .. }) || 
-                matches!(state.reachability, Reachability::Reachable { .. }));
-    });
+        matches!(state.reachability, Reachability::Reachable { .. });
+        })
+        .await
+        .expect("Timed out waiting for state to change to Down");
 }

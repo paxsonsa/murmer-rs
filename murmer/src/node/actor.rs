@@ -34,7 +34,7 @@ impl NodeActor {
             node_id: None,
         }
     }
-    
+
     // Send a status update to the cluster
     async fn update_status_and_notify(&mut self, ctx: &mut Context<Self>) {
         // Log the status change for debugging
@@ -44,22 +44,22 @@ impl NodeActor {
             reachability=?self.reachability,
             "Node status changed"
         );
-        
+
         // Try to find the cluster actor through the receptionist
         let key = crate::receptionist::Key::<crate::cluster::ClusterActor>::default();
-        
+
         // Attempt to lookup the cluster actor but don't require it to be present
         // This enables testing without needing to mock the cluster
         let lookup_result = ctx.system().receptionist().lookup_one(key).await;
-        
+
         if let Ok(endpoint) = lookup_result {
             let cluster = crate::cluster::Cluster::new(endpoint);
-            
+
             // Determine if this is a configured node (based on whether it was initialized from config)
             // For now we'll assume all nodes were configured - in a real implementation
             // we'd track this information properly
             let is_configured = true;
-            
+
             // Send the status update
             let status_update = crate::cluster::NodeStatusUpdate {
                 node_id: self.node_info.node_id.clone(),
@@ -68,7 +68,7 @@ impl NodeActor {
                 is_configured,
                 timestamp: chrono::Utc::now(),
             };
-            
+
             if let Err(err) = cluster.update_node_status(status_update).await {
                 tracing::error!(error=%err, "Failed to send status update to cluster");
             } else {
@@ -145,7 +145,7 @@ impl Actor for NodeActor {
         }
 
         // Open new raw stream for initial cluster communication
-        let raw_stream = match self.driver.open_raw_stream().await {
+        let raw_stream = match self.driver.open_stream().await {
             Ok(stream) => stream,
             Err(e) => {
                 tracing::error!(error=%e, "Failed to establish member connection stream");
@@ -202,12 +202,12 @@ impl Actor for NodeActor {
         });
 
         // Use the new interval pattern for periodic tasks
-        
+
         // Setup a heartbeat deadman switch to periodically check the reachability of the node
         ctx.interval(Duration::from_secs(1), || NodeActorHeartbeatCheckMessage {
             timestamp: Utc::now(),
         });
-        
+
         // Setup a timer to periodically send heartbeats to the remote node
         ctx.interval(Duration::from_secs(5), || NodeActorSendHeartbeatMessage {});
     }
@@ -248,70 +248,70 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
                 id,
             } => {
                 tracing::info!(protocol_version=%protocol_version, id=%id, "Received Init message");
-                
+
                 // Validate protocol version
                 if protocol_version != net::CURRENT_PROTOCOL_VERSION {
                     tracing::error!(
-                        received=%protocol_version, 
-                        expected=%net::CURRENT_PROTOCOL_VERSION, 
+                        received=%protocol_version,
+                        expected=%net::CURRENT_PROTOCOL_VERSION,
                         "Protocol version mismatch"
                     );
                     // We could send a Disconnect message here, but for now just ignore
                     return;
                 }
-                
+
                 // Store the remote node ID
                 self.node_id = Some(id.clone());
-                
+
                 // Send InitAck response
-                let init_ack = net::NodeMessage::InitAck { 
-                    node_id: self.node_info.node_id.clone() 
+                let init_ack = net::NodeMessage::InitAck {
+                    node_id: self.node_info.node_id.clone(),
                 };
-                
+
                 // Send the InitAck message
                 if let Err(err) = self.send_message(init_ack).await {
                     tracing::error!(error=%err, "Failed to send InitAck");
                     return;
                 }
-                
+
                 // Update state
                 self.membership = Status::Pending;
                 self.reachability = Reachability::reachable_now();
-            },
+            }
             net::NodeMessage::InitAck { node_id } => {
                 tracing::info!(?node_id, "Received InitAck");
-                
+
                 // Handle this message asynchronously
-                ctx.send(NodeActorInitAckMessage { 
-                    node_id: node_id.clone() 
+                ctx.send(NodeActorInitAckMessage {
+                    node_id: node_id.clone(),
                 });
-            },
+            }
             net::NodeMessage::Join { name, capabilities } => {
                 tracing::info!(name=%name, ?capabilities, "Received Join message");
-                
+
                 // A node is trying to join our cluster
                 // Update membership state for the remote node
                 self.membership = Status::Joining;
-                
+
                 // Respond with JoinAck
                 let join_ack = net::NodeMessage::JoinAck {
                     accepted: true,
                     reason: None,
                 };
-                
+
                 if let Err(err) = self.send_message(join_ack).await {
                     tracing::error!(error=%err, "Failed to send JoinAck");
                     return;
                 }
-                
+
                 // Once we've accepted the join, the node is considered Up
                 self.membership = Status::Up;
-            },
+            }
             net::NodeMessage::JoinAck { accepted, reason } => {
                 if accepted {
                     tracing::info!("Join accepted");
                     self.membership = Status::Up;
-                    
+
                     // Send first heartbeat
                     let heartbeat = net::NodeMessage::Heartbeat {
                         timestamp: SystemTime::now()
@@ -319,44 +319,39 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
                             .unwrap_or_default()
                             .as_millis() as u64,
                     };
-                    
+
                     if let Err(err) = self.send_message(heartbeat).await {
                         tracing::error!(error=%err, "Failed to send initial heartbeat");
                     }
-                    
-                    // We don't need to set up heartbeat interval here since it's already
-                    // set up in the started method
                 } else {
                     tracing::error!(reason=?reason, "Join rejected");
                     self.membership = Status::Failed;
                 }
-            },
+            }
             net::NodeMessage::Handshake { capabilities } => {
                 tracing::info!(?capabilities, "Received Handshake");
-                
+
                 // Store capabilities or negotiate features here if needed
                 // For now, just acknowledge with our capabilities
                 let handshake_ack = net::NodeMessage::HandshakeAck {
                     capabilities: Vec::new(), // Add actual capabilities here
                 };
-                
+
                 if let Err(err) = self.send_message(handshake_ack).await {
                     tracing::error!(error=%err, "Failed to send HandshakeAck");
                 }
-            },
+            }
             net::NodeMessage::HandshakeAck { capabilities } => {
                 tracing::info!(?capabilities, "Received HandshakeAck");
                 // Store negotiated capabilities if needed
-            },
+            }
             net::NodeMessage::Heartbeat { timestamp: _ } => {
                 // Update reachability with new heartbeat
                 let now = Utc::now();
-                
+
                 // Update our heartbeat tracking
-                ctx.send(NodeActorHeartbeatUpdateMessage { 
-                    timestamp: now 
-                });
-                
+                ctx.send(NodeActorHeartbeatUpdateMessage { timestamp: now });
+
                 // Respond with our own heartbeat
                 let response_heartbeat = net::NodeMessage::Heartbeat {
                     timestamp: SystemTime::now()
@@ -364,29 +359,29 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
                         .unwrap_or_default()
                         .as_millis() as u64,
                 };
-                
+
                 if let Err(err) = self.send_message(response_heartbeat).await {
                     tracing::error!(error=%err, "Failed to send heartbeat response");
                 }
-            },
+            }
             net::NodeMessage::Disconnect { reason } => {
                 tracing::error!(reason=%reason, "Received Disconnect message"); // Use error level for visibility
-                
+
                 // Update node status
                 self.membership = Status::Down;
                 self.reachability = Reachability::Unreachable {
                     pings: 0,
                     last_seen: Utc::now(),
                 };
-                
+
                 // Close the connection
                 // This would be done by dropping the connection in the driver
                 // We'll set the send_stream to None to prevent further sends
                 self.send_stream = None;
-                
+
                 // Notify the cluster about disconnection
                 self.update_status_and_notify(ctx).await;
-            },
+            }
         }
     }
 }
@@ -405,7 +400,7 @@ impl Handler<NodeActorInitAckMessage> for NodeActor {
     async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorInitAckMessage) {
         // Call our async init_ack method to properly process the InitAck
         self.init_ack(msg.node_id).await;
-        
+
         // Notify the cluster about our state change
         self.update_status_and_notify(ctx).await;
     }
@@ -424,7 +419,7 @@ impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
     async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorHeartbeatUpdateMessage) {
         let ping_time = msg.timestamp;
         let old_reachability = self.reachability.clone();
-        
+
         match self.reachability {
             Reachability::Unreachable { pings, last_seen } => {
                 self.reachability = Reachability::Unreachable {
@@ -451,12 +446,12 @@ impl Handler<NodeActorHeartbeatUpdateMessage> for NodeActor {
                 };
             }
         }
-        
+
         // If reachability changed, notify the cluster
         if self.reachability != old_reachability {
             tracing::debug!(
-                old_reachability=?old_reachability, 
-                new_reachability=?self.reachability, 
+                old_reachability=?old_reachability,
+                new_reachability=?self.reachability,
                 "Node reachability changed"
             );
             self.update_status_and_notify(ctx).await;
@@ -484,9 +479,9 @@ impl Message for NodeActorSendHeartbeatMessage {
 impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, _msg: NodeActorSendHeartbeatMessage) {
         // Only send heartbeats if we're in an appropriate state
-        if matches!(self.membership, Status::Up | Status::Joining) && 
-           !matches!(self.reachability, Reachability::Unreachable { .. }) {
-            
+        if matches!(self.membership, Status::Up | Status::Joining)
+            && !matches!(self.reachability, Reachability::Unreachable { .. })
+        {
             // Create and send a heartbeat message
             let heartbeat = net::NodeMessage::Heartbeat {
                 timestamp: SystemTime::now()
@@ -494,10 +489,10 @@ impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
                     .unwrap_or_default()
                     .as_millis() as u64,
             };
-            
+
             if let Err(err) = self.send_message(heartbeat).await {
                 tracing::error!(error=%err, "Failed to send heartbeat");
-                
+
                 // If we fail to send a heartbeat, update our reachability
                 match self.reachability {
                     Reachability::Reachable { misses, last_seen } => {
@@ -505,7 +500,7 @@ impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
                             misses: misses + 1,
                             last_seen,
                         };
-                        
+
                         // If we've missed too many, mark as unreachable
                         if misses + 1 >= 3 {
                             self.reachability = Reachability::Unreachable {
@@ -513,8 +508,8 @@ impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
                                 last_seen,
                             };
                         }
-                    },
-                    _ => {},
+                    }
+                    _ => {}
                 }
             }
         }
@@ -528,7 +523,7 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
         let timestamp = msg.timestamp;
         let old_reachability = self.reachability.clone();
         let old_status = self.membership.clone();
-        
+
         match &self.reachability {
             Reachability::Reachable { misses, last_seen } => {
                 if last_seen.signed_duration_since(timestamp) > chrono::TimeDelta::seconds(-3) {
@@ -541,7 +536,7 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                         pings: 0,
                         last_seen: last_seen.clone(),
                     };
-                    
+
                     // If we can't reach the node after multiple attempts, mark it as Down
                     if !matches!(self.membership, Status::Down | Status::Failed) {
                         self.membership = Status::Down;
@@ -561,7 +556,7 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                         misses: 0,
                         last_seen: last_seen.clone(),
                     };
-                    
+
                     // If the node was Down but now is reachable again, mark it as Up
                     if matches!(self.membership, Status::Down) {
                         self.membership = Status::Up;
@@ -575,11 +570,11 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
             }
             _ => {}
         }
-        
+
         // If reachability or status changed, notify the cluster
         if self.reachability != old_reachability || self.membership != old_status {
             tracing::debug!(
-                old_reachability=?old_reachability, 
+                old_reachability=?old_reachability,
                 new_reachability=?self.reachability,
                 old_status=?old_status,
                 new_status=?self.membership,
