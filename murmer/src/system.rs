@@ -201,7 +201,7 @@ impl System {
         Ok(system)
     }
 
-    pub fn receptionist(&self) -> &Receptionist {
+    pub fn receptionist_ref(&self) -> &Receptionist {
         match self {
             Self::Local { receptionist, .. } => receptionist,
             Self::Clustered { receptionist, .. } => receptionist,

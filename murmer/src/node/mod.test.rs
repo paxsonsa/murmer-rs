@@ -771,10 +771,10 @@ async fn test_membership_initiation() {
             );
 
             // Verify the state is down now.
-            return matches!(state.membership, Status::Down) ||
+            return matches!(state.membership, Status::Down) &&
         // We're testing the protocol flow, not the exact reachability state
         // Depending on timing, the reachability might be Unreachable or Reachable
-        matches!(state.reachability, Reachability::Reachable { .. });
+        matches!(state.reachability, Reachability::Unreachable { .. });
         })
         .await
         .expect("Timed out waiting for state to change to Down");

@@ -9,13 +9,20 @@ enum State {
     /// Initial State of a node actor that represents a actor that is initializing a connection to
     /// some remote node.
     Init,
-    /// Initial acknowledgement has been received or sent and is await the final steps to become a
+
+    /// Initial acknowledgement has been received or sent and is awaiting the final steps to become a
     /// running instance.
     InitAck,
+
     /// Initialized and now running. All incoming init/join events are error'd.
     Running,
 }
 
+/// The node actor is responsible for managing the connection to a remote node in the cluster.
+///
+/// This actor handles the initial connection and sending and receiving messages to/from the remote
+/// node in the cluster and managing proxies for actors on the remote node.
+///
 pub struct NodeActor {
     pub cluster_node_id: Id,
     pub node_info: NodeInfo,
@@ -104,6 +111,7 @@ impl NodeActor {
 
     async fn handle_init_frame(&mut self, protocol_version: u16, id: Id) {
         tracing::info!(protocol_version=%protocol_version, id=%id, "Received Init message");
+
         // Validate protocol version
         if protocol_version != net::CURRENT_PROTOCOL_VERSION {
             tracing::error!(
@@ -257,6 +265,49 @@ impl NodeActor {
             self.membership = Status::Failed;
         }
         self.update_status_and_notify(ctx).await;
+
+        // Start the Accept Stream Hook
+        let Ok(mut accept_stream) = self.driver.accept_stream().await else {
+            tracing::error!("Failed to accept stream");
+            // TODO: Failure Handling by sending disconnect message.
+            self.membership = Status::Failed;
+            self.inner_state = State::Init;
+            return;
+        };
+
+        // Start a new
+        let endpoint = ctx.endpoint();
+        let accept_cancellation = ctx.spawn(async move {
+            loop {
+                match accept_stream.accept().await {
+                    Ok(stream) => {
+                        // Handle the new stream
+                        tracing::debug!("Accepted new actor stream from remote node");
+                        // Create a new local actor proxy for the accepted stream
+                        let msg = NodeActorAcceptStreamMessage(stream);
+                        endpoint.send(msg).await.unwrap_or_else(|err| {
+                            tracing::error!(error=%err, "Failed to send local actor message");
+                        });
+                    }
+                    Err(err) => {
+                        tracing::error!(error=%err, "Failed to accept stream");
+                        // If we get a connection error, we might want to break the loop
+                        // depending on the error type
+                        if matches!(
+                            err,
+                            net::ConnectionError::ConnectionClosed(_)
+                                | net::ConnectionError::Reset
+                                | net::ConnectionError::TimedOut
+                                | net::ConnectionError::LocallyClosed
+                        ) {
+                            break;
+                        }
+                        // For other errors, we might want to retry after a delay
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
     }
 
     async fn handle_disconnect_frame(&mut self, ctx: &mut Context<Self>, reason: String) {
@@ -420,17 +471,10 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
             net::NodeMessage::Disconnect { reason } => {
                 self.handle_disconnect_frame(ctx, reason).await;
             }
+            net::NodeMessage::ActorAdd { actor_path } => {}
+            net::NodeMessage::ActorRemove { actor_path } => {}
         }
     }
-}
-
-#[derive(Debug)]
-pub struct NodeActorHeartbeatCheckMessage {
-    pub timestamp: DateTime<Utc>,
-}
-
-impl Message for NodeActorHeartbeatCheckMessage {
-    type Result = ();
 }
 
 #[derive(Debug)]
@@ -476,6 +520,15 @@ impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
             }
         }
     }
+}
+
+#[derive(Debug)]
+pub struct NodeActorHeartbeatCheckMessage {
+    pub timestamp: DateTime<Utc>,
+}
+
+impl Message for NodeActorHeartbeatCheckMessage {
+    type Result = ();
 }
 
 #[async_trait]
@@ -549,5 +602,56 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
             );
             self.update_status_and_notify(ctx).await;
         }
+    }
+}
+
+struct NodeActorAcceptStreamMessage(net::RawStream);
+
+impl Message for NodeActorAcceptStreamMessage {
+    type Result = ();
+}
+
+#[async_trait]
+impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorAcceptStreamMessage) {
+        // Handle the accepted stream
+        let stream = msg.0;
+        tracing::info!("Accepted new actor stream from remote node");
+
+        let (tx, rx) = stream.into_frame_stream::<net::ActorMessage>();
+
+        let receptionist = ctx.system().receptionist_ref().clone();
+
+        // Spawn a background task to wait for the initial stream message for the proxy.
+        ctx.spawn(async move {
+            let mut stream_rx = rx;
+            let frame = match stream_rx.read_frame().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    tracing::error!("Stream closed before reading initial message");
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error=%e, "Failed to read stream acknowledgment");
+                    return;
+                }
+            };
+            let net::Payload::Ok(net::ActorMessage::Init { actor_key }) = frame.payload else {
+                tracing::error!("Invalid initial message");
+                return;
+            };
+
+            // Look up the actor key in the receptionist
+            let Some(endpoint) = receptionist.raw_lookup_one(actor_key).await else {
+                tracing::error!("Actor key not found in receptionist");
+                return;
+            };
+
+            // Cast the AnyEndpoint into a RemoteMessage receiver
+            let Some(endpoint) = endpoint.downcast_into_recepient_of::<RemoteMessage>() else {
+                tracing::error!("Failed to downcast endpoint into remote message receiver");
+                return;
+            };
+        });
     }
 }

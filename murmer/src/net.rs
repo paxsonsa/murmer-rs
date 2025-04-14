@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::id::Id;
 use crate::node::NodeInfo;
+use crate::path::ActorPath;
+use crate::receptionist::RawKey;
 use crate::tls::TlsConfig;
 use crate::tls::TlsConfigError;
 
@@ -221,11 +223,20 @@ pub enum NodeMessage {
     Disconnect {
         reason: String,
     },
+    ActorAdd {
+        actor_path: ActorPath,
+    },
+    ActorRemove {
+        actor_path: ActorPath,
+    },
 }
 
 /// Actor messages with addressing information
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActorMessage {}
+pub enum ActorMessage {
+    Init { actor_key: RawKey },
+    Error { reason: String },
+}
 
 /// Member information for cluster state
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -616,13 +627,19 @@ impl RawStream {
 // Network Driver Implementations
 //
 
-/// A future that resolves to a RawStream when a connection is accepted.
-/// This can be awaited multiple times to accept multiple streams.
+/// A stream-like object that can be used to accept multiple connections.
+/// This is designed to be used in a loop to accept multiple connections over time.
 pub struct AcceptStream {
     accept_fn: Box<
         dyn FnMut() -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<RawStream, ConnectionError>> + Send>,
             > + Send,
+    >,
+    // The current future being polled, if any
+    current_future: Option<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RawStream, ConnectionError>> + Send>,
+        >,
     >,
 }
 
@@ -635,20 +652,52 @@ impl AcceptStream {
     {
         AcceptStream {
             accept_fn: Box::new(move || Box::pin(accept_fn())),
+            current_future: None,
         }
+    }
+
+    /// Accept the next connection
+    pub async fn accept(&mut self) -> Result<RawStream, ConnectionError> {
+        // Create a future that polls the next connection
+        AcceptFuture { stream: self }.await
     }
 }
 
-impl std::future::Future for AcceptStream {
+/// A future that represents a single accept operation
+struct AcceptFuture<'a> {
+    stream: &'a mut AcceptStream,
+}
+
+impl<'a> std::future::Future for AcceptFuture<'a> {
     type Output = Result<RawStream, ConnectionError>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // Call the accept function and poll the resulting future
-        let mut future = (self.accept_fn)();
-        future.as_mut().poll(cx)
+        let this = &mut *self;
+
+        // If we don't have a future yet, create one
+        if this.stream.current_future.is_none() {
+            this.stream.current_future = Some((this.stream.accept_fn)());
+        }
+
+        // Poll the current future
+        match this
+            .stream
+            .current_future
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .poll(cx)
+        {
+            std::task::Poll::Ready(result) => {
+                // Clear the current future so we'll create a new one next time
+                this.stream.current_future = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 

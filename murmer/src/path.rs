@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,42 +9,42 @@ use crate::id::Id;
 /// Represents a unique path-like address for any actor in the system, whether local or remote.
 /// Format: system://host:port/actor_type/instance_id
 /// Examples:
-/// - local://system1/user/abc-123 (local actor)
-/// - tcp://127.0.0.1:4000/user/def-456 (remote actor)
+/// - local://user/abc-123 (local actor)
+/// - remote://127.0.0.1:4000/user/def-456 (remote actor)
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct ActorPath {
     /// The scheme (local, tcp, etc)
     pub scheme: AddressScheme,
-    /// The actor type path (e.g., "user", "system/receptionist")
-    pub type_path: Arc<str>,
+    /// The actor type path (e.g., "User", "Receptionist")
+    pub type_id: Arc<str>,
     /// The unique instance identifier
     pub instance_id: Arc<Id>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum AddressScheme {
     Local,
-    Tcp { host: String, port: u16 },
+    Remote { host: String, port: u16 },
 }
 
 impl AddressScheme {
     const LOCAL_SCHEME: &'static str = "local";
-    const TCP_SCHEME: &'static str = "tcp";
+    const REMOTE_SCHEME: &'static str = "remote";
 }
 
 impl ActorPath {
     pub fn local(type_path: String, instance_id: Id) -> Self {
         Self {
             scheme: AddressScheme::Local,
-            type_path: type_path.into(),
+            type_id: type_path.into(),
             instance_id: instance_id.into(),
         }
     }
 
     pub fn remote(host: String, port: u16, type_path: String, instance_id: Id) -> Self {
         Self {
-            scheme: AddressScheme::Tcp { host, port },
-            type_path: type_path.into(),
+            scheme: AddressScheme::Remote { host, port },
+            type_id: type_path.into(),
             instance_id: instance_id.into(),
         }
     }
@@ -57,6 +58,26 @@ impl ActorPath {
     }
 }
 
+impl serde::Serialize for ActorPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let path_str = self.to_string();
+        serializer.serialize_str(&path_str)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ActorPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let path_str = String::deserialize(deserializer)?;
+        ActorPath::from_str(&path_str).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for ActorPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.scheme {
@@ -65,18 +86,18 @@ impl fmt::Display for ActorPath {
                     f,
                     "{}://{}/{}",
                     AddressScheme::LOCAL_SCHEME,
-                    self.type_path,
+                    self.type_id,
                     self.instance_id
                 )
             }
-            AddressScheme::Tcp { host, port } => {
+            AddressScheme::Remote { host, port } => {
                 write!(
                     f,
                     "{}://{}:{}/{}/{}",
-                    AddressScheme::TCP_SCHEME,
+                    AddressScheme::REMOTE_SCHEME,
                     host,
                     port,
-                    self.type_path,
+                    self.type_id,
                     self.instance_id
                 )
             }
@@ -130,7 +151,7 @@ impl FromStr for ActorPath {
 
                 Ok(ActorPath::local(type_path, instance_id))
             }
-            AddressScheme::TCP_SCHEME => {
+            AddressScheme::REMOTE_SCHEME => {
                 if path_parts.len() < 3 {
                     return Err(ActorPathError::MissingComponents);
                 }

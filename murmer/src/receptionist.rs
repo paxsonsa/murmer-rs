@@ -1,4 +1,5 @@
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet, VecDeque},
@@ -21,6 +22,23 @@ use crate::{
 #[cfg(test)]
 #[path = "receptionist.test.rs"]
 mod tests;
+
+/// A raw key used for registering and looking up actors when you
+/// cannot utilize a type-safe key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawKey {
+    /// The type ID of the actor
+    type_id: String,
+    /// The string identifier for this key
+    id: String,
+}
+
+impl RawKey {
+    /// Creates a new raw key with the given type ID and string identifier
+    pub const fn new(type_id: String, id: String) -> Self {
+        Self { type_id, id }
+    }
+}
 
 /// A type-safe key used for registering and looking up actors
 ///
@@ -63,6 +81,12 @@ impl<T: Actor> Clone for Key<T> {
             id: self.id,
             _phantom: PhantomData,
         }
+    }
+}
+
+impl<T: Actor> Into<RawKey> for Key<T> {
+    fn into(self) -> RawKey {
+        RawKey::new(std::any::type_name::<T>().to_string(), self.id.to_string())
     }
 }
 
