@@ -1,6 +1,6 @@
 //! Examples of using the new test harness for testing node actors
 use assert_matches::assert_matches;
-use net::{AcceptStream, ConnectionError};
+use net::{AcceptStream, ConnectionError, NodeMessage};
 
 use crate::id::Id;
 use crate::net::NetworkAddrRef;
@@ -38,10 +38,9 @@ async fn test_node_actor_with_harness() {
     });
 
     // Send a heartbeat update message
-    let timestamp = chrono::Utc::now();
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: timestamp.clone(),
-    };
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let frame = net::Frame::ok(Id::new(), None, NodeMessage::Heartbeat { timestamp });
+    let msg = NodeActorRecvFrameMessage(Ok(frame));
     actor.send(msg).await.unwrap();
 
     // Now verify the reachability state has changed

@@ -215,14 +215,8 @@ pub enum NodeMessage {
         accepted: bool,
         reason: Option<String>,
     },
-    Handshake {
-        capabilities: Vec<String>,
-    },
-    HandshakeAck {
-        capabilities: Vec<String>,
-    },
     Heartbeat {
-        timestamp: u64,
+        timestamp: i64,
     },
     Disconnect {
         reason: String,

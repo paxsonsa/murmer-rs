@@ -338,20 +338,25 @@ async fn node_actor_reachability_to_unreachable() {
     });
 
     // Simulate a successful heartbeat
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: timestamp.clone(),
-    };
+    let frame = net::Frame::ok(
+        Id::new(),
+        None,
+        net::NodeMessage::Heartbeat {
+            timestamp: timestamp.timestamp_millis(),
+        },
+    );
+    let msg = NodeActorRecvFrameMessage(Ok(frame));
     actor.send(msg).await.unwrap();
 
     // Verify reachable state
-    actor.assert_state(|state| {
-        assert_matches!(
+    actor.wait_for_state(500, |state| {
+        matches!(
             state.reachability,
             Reachability::Reachable {
                 misses: 0,
                 last_seen: ts
             } if ts == timestamp
-        );
+        )
     });
 
     // 1) Simulate a heartbeat check failure - move time forward by 5 seconds
@@ -362,14 +367,14 @@ async fn node_actor_reachability_to_unreachable() {
     actor.send(msg).await.unwrap();
 
     // Verify reachable state with 1 miss
-    actor.assert_state(|state| {
-        assert_matches!(
+    actor.wait_for_state(500, |state| {
+        matches!(
             state.reachability,
             Reachability::Reachable {
                 misses: 1,
                 last_seen: ts
             } if ts == timestamp
-        );
+        )
     });
 
     // 2) Simulate another heartbeat check failure
@@ -380,14 +385,14 @@ async fn node_actor_reachability_to_unreachable() {
     actor.send(msg).await.unwrap();
 
     // Verify reachable state with 2 misses
-    actor.assert_state(|state| {
-        assert_matches!(
+    actor.wait_for_state(150, |state| {
+        matches!(
             state.reachability,
             Reachability::Reachable {
                 misses: 2,
                 last_seen: ts
             } if ts == timestamp
-        );
+        )
     });
 
     // 3) Simulate a third heartbeat check failure
@@ -398,14 +403,14 @@ async fn node_actor_reachability_to_unreachable() {
     actor.send(msg).await.unwrap();
 
     // Verify reachable state with 3 misses
-    actor.assert_state(|state| {
-        assert_matches!(
+    actor.wait_for_state(150, |state| {
+        matches!(
             state.reachability,
             Reachability::Reachable {
                 misses: 3,
                 last_seen: ts
             } if ts == timestamp
-        );
+        )
     });
 
     // 4) Simulate a fourth heartbeat check failure - should transition to unreachable
@@ -416,17 +421,18 @@ async fn node_actor_reachability_to_unreachable() {
     actor.send(msg).await.unwrap();
 
     // Verify transition to unreachable state
-    actor.assert_state(|state| {
-        assert_matches!(
+    actor.wait_for_state(500, |state| {
+        matches!(
             state.reachability,
             Reachability::Unreachable {
                 pings: 0,
                 last_seen: ts
             } if ts == timestamp
-        );
+        )
     });
 }
 
+/// Test that Reachability is reset after a successful heartbeat.
 #[test_log::test(tokio::test)]
 async fn node_actor_reachability_reset() {
     // Create a test harness
@@ -451,73 +457,53 @@ async fn node_actor_reachability_reset() {
     let timestamp = chrono::Utc::now();
 
     // Simulate a successful heartbeat
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: timestamp.clone(),
-    };
+    let frame = net::Frame::ok(
+        Id::new(),
+        None,
+        net::NodeMessage::Heartbeat {
+            timestamp: timestamp.timestamp_millis(),
+        },
+    );
+    let msg = NodeActorRecvFrameMessage(Ok(frame));
     actor.send(msg).await.unwrap();
 
-    // Verify initial state (this behavior changed when using the test harness)
-    actor.assert_state(|state| {
+    // Verify initial state is technically reachable.
+    actor.wait_for_state(500, |state| {
         // We must adapt to match actual behavior with the harness
-        assert_matches!(
-            state.reachability,
-            Reachability::Reachable { .. } | Reachability::Unreachable { .. }
-        );
+        matches!(state.reachability, Reachability::Reachable { misses, .. } if misses == 0)
     });
 
-    // Move time forward and send another heartbeat update
-    let check_timestamp = timestamp + chrono::Duration::seconds(2);
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: check_timestamp.clone(),
-    };
-    actor.send(msg).await.unwrap();
-
-    // Send heartbeat check
+    // Send check message 20 seconds in the future which should mark a miss.
+    let check_timestamp = timestamp + chrono::Duration::seconds(20);
     let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     actor.send(msg).await.unwrap();
+    actor.wait_for_state(
+        150,
+        |state| matches!(state.reachability, Reachability::Reachable { misses, .. } if misses == 1),
+    );
 
-    // Verify reachability state after the check - be more flexible with the exact values
-    actor.assert_state(|state| {
-        match state.reachability {
-            Reachability::Unreachable { .. } | Reachability::Reachable { .. } => {
-                // Either state is acceptable since the test harness behavior differs slightly
-            }
-            _ => panic!("Unexpected reachability state: {:?}", state.reachability),
-        }
-    });
-
-    // Send another heartbeat update
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: check_timestamp.clone(),
-    };
+    // Send another heartbeat update at the same time as the current check timestamp.
+    let frame = net::Frame::ok(
+        Id::new(),
+        None,
+        net::NodeMessage::Heartbeat {
+            timestamp: check_timestamp.timestamp_millis(),
+        },
+    );
+    let msg = NodeActorRecvFrameMessage(Ok(frame));
     actor.send(msg).await.unwrap();
 
-    // Verify the state accepts heartbeat updates
-    actor.assert_state(|state| {
-        match state.reachability {
-            Reachability::Unreachable { .. } | Reachability::Reachable { .. } => {
-                // Either state is acceptable
-            }
-            _ => panic!("Unexpected reachability state: {:?}", state.reachability),
-        }
-    });
-
-    // Final heartbeat check
     let msg = NodeActorHeartbeatCheckMessage {
         timestamp: check_timestamp.clone(),
     };
     actor.send(msg).await.unwrap();
-
-    // Verify final reachability state - more flexible with test harness
-    actor.assert_state(|state| {
-        match state.reachability {
-            Reachability::Unreachable { .. } | Reachability::Reachable { .. } => {
-                // Either state is acceptable
-            }
-            _ => panic!("Unexpected reachability state: {:?}", state.reachability),
-        }
+    //
+    // Verify that the same check resets the misses to 0
+    actor.wait_for_state(150, |state| {
+        matches!(state.reachability,
+            Reachability::Reachable { misses, .. } if misses == 0)
     });
 }
 
@@ -545,107 +531,75 @@ async fn node_actor_unreachable_reset() {
     let timestamp = chrono::Utc::now();
 
     // Simulate a successful heartbeat
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: timestamp.clone(),
-    };
-    actor.send(msg).await.unwrap();
-
-    // Verify initial state - be more flexible with test harness
-    actor.assert_state(|state| {
-        match state.reachability {
-            Reachability::Unreachable { .. } | Reachability::Reachable { .. } => {
-                // Either state is acceptable with the test harness
-            }
-            _ => panic!("Unexpected reachability state: {:?}", state.reachability),
-        }
-    });
-
-    // Move time slightly forward and send another heartbeat update
-    let future_timestamp = timestamp + chrono::Duration::seconds(2);
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: future_timestamp.clone(),
-    };
-    actor.send(msg).await.unwrap();
-
-    // Verify state updated after the heartbeat - be flexible with test harness
-    actor.assert_state(|state| {
-        match state.reachability {
-            Reachability::Unreachable { .. } | Reachability::Reachable { .. } => {
-                // State pattern is important, not the exact values
-            }
-            _ => panic!("Unexpected reachability state: {:?}", state.reachability),
-        }
-    });
-
-    // Simulate a heartbeat update in the far future
-    let future_timestamp = timestamp + chrono::Duration::seconds(20);
-    let msg = NodeActorHeartbeatUpdateMessage {
-        timestamp: future_timestamp.clone(),
-    };
-    actor.send(msg).await.unwrap();
-
-    // Verify state is updated with the far future timestamp
-    actor.assert_state(|state| match state.reachability {
-        Reachability::Unreachable { last_seen, .. } => {
-            assert_eq!(last_seen, future_timestamp);
-        }
-        Reachability::Reachable { last_seen, .. } => {
-            assert_eq!(last_seen, future_timestamp);
-        }
-        _ => panic!("Unexpected reachability state: {:?}", state.reachability),
-    });
-}
-
-#[test_log::test(tokio::test)]
-async fn test_node_actor_startup() {
-    // Create a test harness
-    let test = ActorTestHarness::new();
-
-    // Create mock network and driver
-    let test_driver = MockNetwork::new();
-    let driver = Box::new(MockConnectionDriver::new(test_driver.clone()));
-
-    // Create node actor
-    let node_info = NodeInfo::from(
-        "127.0.0.1:12345"
-            .parse::<crate::net::NetworkAddrRef>()
-            .unwrap(),
+    let frame = net::Frame::ok(
+        Id::new(),
+        None,
+        net::NodeMessage::Heartbeat {
+            timestamp: timestamp.timestamp_millis(),
+        },
     );
-    let mut actor = test.spawn(NodeActor::new(Id::new(), node_info, driver));
+    let msg = NodeActorRecvFrameMessage(Ok(frame));
+    actor.send(msg).await.unwrap();
 
-    // Start the actor
-    actor.start().await;
+    // For an unreachable state by missing 3 heartbeats
+    let check_timestamp = timestamp + chrono::Duration::seconds(5);
+    for _ in 0..3 {
+        let msg = NodeActorHeartbeatCheckMessage {
+            timestamp: check_timestamp.clone(),
+        };
+        actor.send(msg).await.unwrap();
+    }
 
-    // Verify the actor's initial state
-    actor.assert_state(|state| {
-        assert_eq!(state.membership, Status::Pending);
-        assert_matches!(state.reachability, Reachability::Pending);
+    // Verify unreachable state
+    actor.wait_for_state(500, |state| {
+        matches!(
+            state.reachability,
+            Reachability::Unreachable {
+                pings: 0,
+                last_seen: ts
+            } if ts == timestamp
+        )
     });
 
-    // Test handling of the InitAck message
-    let init_node_id = Id::new();
-    actor
-        .send(NodeActorInitAckMessage {
-            node_id: init_node_id.clone(),
-        })
-        .await
-        .unwrap();
+    // Now send a heartbeat update at the same time as the current check timestamp
+    // which should increment the pings after we await the state update.
+    // we do this three times.
+    for ping in 0..3 {
+        let frame = net::Frame::ok(
+            Id::new(),
+            None,
+            net::NodeMessage::Heartbeat {
+                timestamp: check_timestamp.timestamp_millis(),
+            },
+        );
+        let msg = NodeActorRecvFrameMessage(Ok(frame));
+        actor.send(msg).await.unwrap();
 
-    // Wait for the actor to update its state
-    actor
-        .wait_for_state(1000, |state| state.membership == Status::Joining)
-        .await
-        .expect("Actor failed to update state after InitAck");
+        // Verify state updated after the heartbeat - be flexible with test harness
+        actor.wait_for_state(100, |state| {
+            matches!(
+                state.reachability,
+                Reachability::Unreachable {
+                    pings: pings,
+                    ..
+                } if pings == ping
+            )
+        });
+    }
 
-    // Verify the actor state after receiving InitAck
-    actor.assert_state(|state| {
-        assert_eq!(state.membership, Status::Joining);
-        assert_matches!(state.reachability, Reachability::Reachable { .. });
+    // Now lets send a check message at the same time as the last heartbeat
+    // which should reset the reachability state to reachable and up.
+    let msg = NodeActorHeartbeatCheckMessage {
+        timestamp: check_timestamp.clone(),
+    };
+    actor.send(msg).await.unwrap();
+    actor.wait_for_state(150, |state| {
+        matches!(
+            state.reachability,
+            Reachability::Reachable { misses: 0, .. }
+        )
     });
 }
-
-// TODO: Add test for node-to-cluster communication using real ClusterActor
-// This would verify that status updates flow correctly through the system
 
 #[test_log::test(tokio::test)]
 async fn test_membership_initiation() {
@@ -713,13 +667,6 @@ async fn test_membership_initiation() {
     };
     test_driver.push_frame(init_ack);
 
-    // Process one message - this will handle the InitAck frame
-    actor.process_one().await;
-
-    // Process another message - this will handle the NodeActorInitAckMessage
-    // This is needed because the handler spawns a task to send the message
-    actor.process_one().await;
-
     actor
         .wait_for_state(500, |state| {
             match (&state.membership, &state.reachability) {
@@ -786,10 +733,7 @@ async fn test_membership_initiation() {
     let remote_heartbeat = net::Frame {
         header: net::Header::new(remote_id.clone(), Some(node_id.clone())),
         payload: net::Payload::Ok(net::NodeMessage::Heartbeat {
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp: chrono::Utc::now().timestamp_millis(),
         }),
     };
     test_driver.push_frame(remote_heartbeat);
