@@ -40,7 +40,7 @@
 use std::time::Duration;
 
 use crate::actor::*;
-use crate::message::Message;
+use crate::message::{Message, SendError};
 use crate::system::{System, TestSupervisor};
 
 /// Main test harness for testing actors
@@ -90,7 +90,7 @@ impl<A: Actor> ActorTestHandle<A> {
     }
 
     /// Send a message to the actor and get the result
-    pub async fn send<M>(&mut self, message: M) -> Result<M::Result, ActorError>
+    pub async fn send<M>(&mut self, message: M) -> Result<M::Result, SendError>
     where
         M: Message + 'static,
         A: Handler<M>,
@@ -159,4 +159,3 @@ impl<A: Actor> ActorTestHandle<A> {
 pub mod prelude {
     pub use super::{ActorTestHandle, ActorTestHarness};
 }
-

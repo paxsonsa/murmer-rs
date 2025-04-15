@@ -462,7 +462,7 @@ where
         self.runtime.actor.started(&mut self.ctx).await;
     }
 
-    pub async fn send<M>(&mut self, system: &System, msg: M) -> Result<M::Result, ActorError>
+    pub async fn send<M>(&mut self, system: &System, msg: M) -> Result<M::Result, SendError>
     where
         M: Message + 'static,
         A: Handler<M>,
@@ -641,7 +641,7 @@ impl<A: Actor> Endpoint<A> {
         &self.path
     }
 
-    pub async fn send_in_background<M>(&self, message: M) -> Result<(), ActorError>
+    pub async fn send_in_background<M>(&self, message: M) -> Result<(), SendError>
     where
         M: Message + 'static,
         A: Handler<M>,
@@ -649,12 +649,20 @@ impl<A: Actor> Endpoint<A> {
         self.sender.background_send(message)
     }
 
-    pub async fn send<M>(&self, message: M) -> Result<M::Result, ActorError>
+    pub async fn send<M>(&self, message: M) -> Result<M::Result, SendError>
     where
         M: Message + 'static,
         A: Handler<M>,
     {
         self.sender.send(message).await
+    }
+
+    pub fn recepient_of<M>(&self) -> RecepientOf<M>
+    where
+        M: Message + 'static,
+        A: Handler<M>,
+    {
+        RecepientOf::new(Box::new(self.sender.clone()))
     }
 }
 
@@ -683,8 +691,8 @@ impl<A: Actor> Debug for Endpoint<A> {
 
 /// Type-erased version of an Endpoint that can hold any actor type
 pub struct AnyEndpoint {
-    // Box containing the type-erased endpoint
-    endpoint: Box<dyn Any + Send + Sync>,
+    // Box containing the type-erased endpoint sender
+    endpoint_sender: Box<dyn Any + Send + Sync>,
     // Type ID for runtime type checking during downcasting
     type_id: TypeId,
     // Type name for better debugging and error messages
@@ -696,7 +704,7 @@ pub struct AnyEndpoint {
 impl<A: Actor> From<Endpoint<A>> for AnyEndpoint {
     fn from(endpoint: Endpoint<A>) -> Self {
         Self {
-            endpoint: Box::new(endpoint.clone()),
+            endpoint_sender: Box::new(endpoint.sender.clone()),
             type_id: TypeId::of::<A>(),
             type_name: std::any::type_name::<A>(),
             path: endpoint.path.clone(),
@@ -715,9 +723,14 @@ impl Debug for AnyEndpoint {
 
 impl AnyEndpoint {
     /// Attempt to downcast the AnyEndpoint back to a specific Endpoint<A> type
-    pub fn downcast<A: Actor + 'static>(&self) -> Option<&Endpoint<A>> {
+    pub fn downcast<A: Actor + 'static>(&self) -> Option<Endpoint<A>> {
         if self.type_id == TypeId::of::<A>() {
-            self.endpoint.downcast_ref::<Endpoint<A>>()
+            self.endpoint_sender
+                .downcast_ref::<EndpointSender<A>>()
+                .map(|b| {
+                    let sender = b.clone();
+                    Endpoint::new(sender.clone(), self.path.clone())
+                })
         } else {
             None
         }
@@ -726,7 +739,13 @@ impl AnyEndpoint {
     /// Attempt to downcast the AnyEndpoint back to a specific Endpoint<A> type, consuming self
     pub fn into_downcast<A: Actor + 'static>(self) -> Option<Endpoint<A>> {
         if self.type_id == TypeId::of::<A>() {
-            self.endpoint.downcast::<Endpoint<A>>().ok().map(|b| *b)
+            self.endpoint_sender
+                .downcast::<EndpointSender<A>>()
+                .ok()
+                .map(|b| {
+                    let sender = *b;
+                    Endpoint::new(sender, self.path.clone())
+                })
         } else {
             None
         }
@@ -734,6 +753,18 @@ impl AnyEndpoint {
 
     pub fn path(&self) -> &ActorPath {
         &self.path
+    }
+
+    pub fn as_recepient_of<M>(&self) -> Option<RecepientOf<M>>
+    where
+        M: Message + 'static,
+    {
+        self.endpoint_sender
+            .downcast_ref::<Box<dyn MessageSender<M>>>()
+            .map(|b| {
+                let sender = (*b).clone();
+                RecepientOf::new(sender)
+            })
     }
 }
 
@@ -743,7 +774,7 @@ pub(crate) struct EndpointSender<A: Actor> {
             dyn Fn(
                     Envelope<A>,
                 ) -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<(), ActorError>> + Send>,
+                    Box<dyn std::future::Future<Output = Result<(), SendError>> + Send>,
                 > + Send
                 + Sync,
         >,
@@ -759,8 +790,8 @@ impl<A: Actor> EndpointSender<A> {
                 sender
                     .send(QoSLevel::Normal, cmd)
                     .await
-                    .map_err(|_| ActorError::MailboxClosed)
-            }) as Pin<Box<dyn Future<Output = Result<(), ActorError>> + Send>>
+                    .map_err(|_| SendError::MailboxClosed)
+            }) as Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>>
         });
         Self {
             send_fn: Arc::new(send_fn),
@@ -773,8 +804,8 @@ impl<A: Actor> EndpointSender<A> {
             Box::pin(async move {
                 tx.send(envelope)
                     .await
-                    .map_err(|_| ActorError::MailboxClosed)
-            }) as Pin<Box<dyn Future<Output = Result<(), ActorError>> + Send>>
+                    .map_err(|_| SendError::MailboxClosed)
+            }) as Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>>
         });
         Self {
             send_fn: Arc::new(send_fn),
@@ -797,7 +828,7 @@ impl<A: Actor> EndpointSender<A> {
             tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut));
 
             Box::pin(async { Ok(()) })
-                as Pin<Box<dyn Future<Output = Result<(), ActorError>> + Send>>
+                as Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>>
         });
         Self {
             send_fn: Arc::new(send_fn),
@@ -805,7 +836,7 @@ impl<A: Actor> EndpointSender<A> {
     }
 
     /// Sends a message to the actor without waiting for a response
-    pub fn background_send<M>(&self, msg: M) -> Result<(), ActorError>
+    pub fn background_send<M>(&self, msg: M) -> Result<(), SendError>
     where
         M: Message + 'static,
         A: Handler<M>,
@@ -816,7 +847,7 @@ impl<A: Actor> EndpointSender<A> {
         Ok(())
     }
 
-    pub async fn send<M>(&self, msg: M) -> Result<M::Result, ActorError>
+    pub async fn send<M>(&self, msg: M) -> Result<M::Result, SendError>
     where
         M: Message + 'static,
         A: Handler<M>,
@@ -825,10 +856,10 @@ impl<A: Actor> EndpointSender<A> {
         let envelope = Envelope::new(msg, tx);
 
         if let Err(_) = (self.send_fn)(envelope).await {
-            return Err(ActorError::MailboxClosed);
+            return Err(SendError::MailboxClosed);
         }
 
-        Ok(rx.await.map_err(|_| ActorError::ResponseDropped)?)
+        Ok(rx.await.map_err(|_| SendError::ResponseDropped)?)
     }
 }
 
@@ -837,5 +868,21 @@ impl<A: Actor> Clone for EndpointSender<A> {
         Self {
             send_fn: self.send_fn.clone(),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl<A: Actor, M: Message> MessageSender<M> for EndpointSender<A>
+where
+    A: Handler<M>,
+    M::Result: Send,
+    M: Message + Send + 'static,
+{
+    async fn send(&self, msg: M) -> Result<M::Result, SendError> {
+        self.send(msg).await
+    }
+
+    async fn send_no_response(&self, msg: M) -> Result<(), SendError> {
+        self.background_send(msg)
     }
 }

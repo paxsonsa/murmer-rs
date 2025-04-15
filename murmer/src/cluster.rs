@@ -1,7 +1,8 @@
+use crate::actor::Registered;
 use crate::net::{NetworkAddrError, NetworkAddrRef};
+use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::{net::SocketAddr, sync::Arc};
-use chrono::Utc;
 
 use hostname;
 
@@ -152,6 +153,10 @@ impl ClusterActor {
     }
 }
 
+impl Registered for ClusterActor {
+    const RECEPTIONIST_KEY: &'static str = "cluster";
+}
+
 #[async_trait::async_trait]
 impl Actor for ClusterActor {
     async fn started(&mut self, ctx: &mut Context<Self>) {
@@ -175,10 +180,10 @@ impl Actor for ClusterActor {
                 tracing::error!("Failed to spawn member actor");
                 continue;
             };
-            
+
             // Add this node ID to the configured nodes set
             self.configured_node_ids.insert(member.id.clone());
-            
+
             // Initialize node status
             let node_status = NodeStatus {
                 node: member.clone(),
@@ -187,21 +192,26 @@ impl Actor for ClusterActor {
                 is_configured: true,
                 last_updated: chrono::Utc::now(),
             };
-            
+
             // Add to members map
             self.members.insert(member.id.clone(), node_status);
         }
-        
+
         self.state = State::Running;
-        
+
         // Register with the receptionist so nodes can find us
         let key = crate::receptionist::Key::<ClusterActor>::default();
-        if let Err(e) = ctx.system().receptionist().register(key, &ctx.endpoint()).await {
+        if let Err(e) = ctx
+            .system()
+            .receptionist_ref()
+            .register(key, &ctx.endpoint())
+            .await
+        {
             tracing::error!(error=?e, "Failed to register cluster actor with receptionist");
         } else {
             tracing::info!("Registered cluster actor with receptionist");
         }
-        
+
         // Schedule a periodic cleanup task to remove unreachable non-configured nodes
         ctx.interval(std::time::Duration::from_secs(30), move || {
             CleanupUnreachableNodes {}
@@ -210,19 +220,27 @@ impl Actor for ClusterActor {
 }
 
 #[async_trait::async_trait]
+impl Handler<RemoteMessage> for ClusterActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: RemoteMessage) {
+        tracing::info!(msg=?msg, "Received remote message");
+        panic!("Remote message handling not implemented");
+    }
+}
+
+#[async_trait::async_trait]
 impl Handler<NewIncomingConnection> for ClusterActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NewIncomingConnection) {
         let addr = msg.addr;
         tracing::info!(addr=%addr, "Handling new incoming connection");
-        
+
         // Here we'd create a NodeActor for the incoming connection
         // For now, we'll just log it and accept it as a dynamic node
-        
+
         // This is where we would:
         // 1. Create a NodeInfo for the dynamic connection
         // 2. Spawn a NodeActor for it
         // 3. Add it to our members list as a non-configured node
-        
+
         // TODO: Create a non-configured NodeActor
     }
 }
@@ -237,18 +255,18 @@ impl Handler<NodeStatusUpdate> for ClusterActor {
             is_configured=%msg.is_configured,
             "Node status update"
         );
-        
+
         // Update the node's status in our tracking map
         if let Some(node_status) = self.members.get_mut(&msg.node_id) {
             node_status.status = msg.status;
             node_status.reachability = msg.reachability;
             node_status.last_updated = msg.timestamp;
-            
+
             // If the node is Down or Failed and not a configured node, consider cleaning it up
-            if matches!(node_status.status, Status::Down | Status::Failed) 
-                && !node_status.is_configured 
-                && matches!(node_status.reachability, Reachability::Unreachable { .. }) {
-                    
+            if matches!(node_status.status, Status::Down | Status::Failed)
+                && !node_status.is_configured
+                && matches!(node_status.reachability, Reachability::Unreachable { .. })
+            {
                 tracing::info!(node_id=%msg.node_id, "Non-configured node is unreachable, marked for cleanup");
                 // We'll let the cleanup interval task handle actual removal
             }
@@ -264,21 +282,21 @@ impl Handler<RemoveNode> for ClusterActor {
         // Remove the node if it exists
         if let Some(node_status) = self.members.remove(&msg.node_id) {
             tracing::info!(
-                node_id=%msg.node_id, 
+                node_id=%msg.node_id,
                 status=?node_status.status,
                 is_configured=%node_status.is_configured,
                 "Removed node from cluster"
             );
-            
+
             // If it was a configured node, keep track of that
             if node_status.is_configured {
                 // We could add it to a "removed_configured_nodes" list if needed
                 tracing::warn!(node_id=%msg.node_id, "Removed a configured node from cluster");
             }
-            
+
             return true;
         }
-        
+
         tracing::warn!(node_id=%msg.node_id, "Attempted to remove non-existent node");
         false
     }
@@ -288,27 +306,29 @@ impl Handler<RemoveNode> for ClusterActor {
 impl Handler<CleanupUnreachableNodes> for ClusterActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, _msg: CleanupUnreachableNodes) -> usize {
         // Find all non-configured nodes that are unreachable and clean them up
-        let unreachable_nodes: Vec<Id> = self.members.iter()
+        let unreachable_nodes: Vec<Id> = self
+            .members
+            .iter()
             .filter(|(_, status)| {
-                !status.is_configured && 
-                matches!(status.status, Status::Down | Status::Failed) &&
-                matches!(status.reachability, Reachability::Unreachable { .. })
+                !status.is_configured
+                    && matches!(status.status, Status::Down | Status::Failed)
+                    && matches!(status.reachability, Reachability::Unreachable { .. })
             })
             .map(|(id, _)| id.clone())
             .collect();
-        
+
         let count = unreachable_nodes.len();
-        
+
         if count > 0 {
             tracing::info!(count=%count, "Cleaning up unreachable non-configured nodes");
-            
+
             // Remove each unreachable node
             for node_id in unreachable_nodes {
                 self.members.remove(&node_id);
                 tracing::debug!(node_id=%node_id, "Removed unreachable non-configured node");
             }
         }
-        
+
         count
     }
 }
@@ -338,14 +358,13 @@ async fn accept_connection(
     };
 
     // Send a message to the cluster actor about the new incoming connection
-    if let Err(err) = endpoint.send(NewIncomingConnection { 
-        connection, 
-        addr 
-    }).await {
+    if let Err(err) = endpoint
+        .send(NewIncomingConnection { connection, addr })
+        .await
+    {
         tracing::error!(error=%err, "Failed to notify cluster about new connection");
     }
 }
-
 
 // Message sent by a node actor to update its status
 #[derive(Debug, Clone)]
@@ -399,14 +418,14 @@ impl Cluster {
     pub fn new(endpoint: Endpoint<ClusterActor>) -> Self {
         Cluster { endpoint }
     }
-    
+
     // Send a status update to the cluster
-    pub async fn update_node_status(&self, update: NodeStatusUpdate) -> Result<(), ActorError> {
+    pub async fn update_node_status(&self, update: NodeStatusUpdate) -> Result<(), SendError> {
         self.endpoint.send(update).await
     }
-    
+
     // Request removal of a node from the cluster
-    pub async fn remove_node(&self, node_id: Id) -> Result<bool, ActorError> {
+    pub async fn remove_node(&self, node_id: Id) -> Result<bool, SendError> {
         self.endpoint.send(RemoveNode { node_id }).await
     }
 }

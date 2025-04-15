@@ -15,6 +15,10 @@ impl Id {
     pub fn from_u128(id: u128) -> Self {
         Self(Uuid::from_u128(id))
     }
+
+    pub const fn nil() -> Self {
+        Self(Uuid::nil())
+    }
 }
 
 impl Display for Id {

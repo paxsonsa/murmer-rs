@@ -10,11 +10,11 @@ mod path;
 pub mod prelude;
 mod receptionist;
 mod system;
-mod tls;
 #[cfg(test)]
 mod test_utils;
 #[cfg(test)]
 mod test_utils_example;
+mod tls;
 
 // TODO: Add clustering functionality for both local and remote actors
 // TODO: Implement receptionist auto register traits for actors
@@ -23,7 +23,8 @@ mod test_utils_example;
 
 #[cfg(test)]
 mod tests {
-    use crate::receptionist::Key;
+    use crate::actor::Registered;
+    use crate::receptionist::StaticKey;
     use crate::system::SystemId;
     use crate::tls::TlsConfig;
 
@@ -149,10 +150,21 @@ mod tests {
     }
 
     impl CounterActor {
-        const COUNTER_SERVICE: Key<CounterActor> = Key::new("counter");
+        const COUNTER_SERVICE: StaticKey<CounterActor> = StaticKey::default();
 
         fn new(notify: Arc<tokio::sync::Notify>) -> Self {
             Self { counter: 0, notify }
+        }
+    }
+
+    impl Registered for CounterActor {
+        const RECEPTIONIST_KEY: &'static str = "counter";
+    }
+
+    #[async_trait]
+    impl Handler<RemoteMessage> for CounterActor {
+        async fn handle(&mut self, _ctx: &mut Context<Self>, _message: RemoteMessage) -> () {
+            panic!("RemoteMessage is not supported for CounterActor");
         }
     }
 
@@ -197,8 +209,8 @@ mod tests {
             .spawn_with(local_actor)
             .expect("Failed to spawn actor");
         system_a
-            .receptionist()
-            .register(CounterActor::COUNTER_SERVICE, &local_actor)
+            .receptionist_ref()
+            .register(CounterActor::COUNTER_SERVICE.into(), &local_actor)
             .await
             .expect("Failed to register actor");
 
@@ -206,8 +218,8 @@ mod tests {
         notification.notified().await;
 
         let remote_actor = system_b
-            .receptionist()
-            .lookup_one(CounterActor::COUNTER_SERVICE)
+            .receptionist_ref()
+            .lookup_one(CounterActor::COUNTER_SERVICE.into())
             .await
             .expect("Failed to loopup actor");
 

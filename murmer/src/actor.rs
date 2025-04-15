@@ -1,19 +1,8 @@
 //! Core actor traits and types for the actor system.
 use crate::context::Context;
 
-use super::message::Message;
+use super::message::{Message, RemoteMessage};
 pub use async_trait::async_trait;
-
-/// Errors that can occur during actor operations
-#[derive(thiserror::Error, Debug)]
-pub enum ActorError {
-    /// Returned when trying to send a message to an actor whose mailbox has been closed
-    #[error("Actor mailbox has been closed")]
-    MailboxClosed,
-    /// Returned when the response channel was dropped before receiving the result
-    #[error("Actor response was dropped unexpectedly")]
-    ResponseDropped,
-}
 
 /// The core actor trait that must be implemented by all actors.
 ///
@@ -35,6 +24,13 @@ pub trait Actor: Unpin + Sized + Send + 'static {
     /// Called after the actor has been shut down and finished processing messages.
     /// Use this for final cleanup.
     async fn stopped(&mut self, _ctx: &mut Context<Self>) {}
+}
+
+pub trait Registered
+where
+    Self: Actor + Handler<RemoteMessage>,
+{
+    const RECEPTIONIST_KEY: &'static str;
 }
 
 /// A trait for handling specific message types.

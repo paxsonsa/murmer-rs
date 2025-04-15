@@ -63,7 +63,7 @@ impl NodeActor {
 
         // Attempt to lookup the cluster actor but don't require it to be present
         // This enables testing without needing to mock the cluster
-        let lookup_result = ctx.system().receptionist().lookup_one(key).await;
+        let lookup_result = ctx.system().receptionist_ref().lookup_one(key).await;
 
         if let Ok(endpoint) = lookup_result {
             let cluster = crate::cluster::Cluster::new(endpoint);
@@ -607,6 +607,12 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
 
 struct NodeActorAcceptStreamMessage(net::RawStream);
 
+impl std::fmt::Debug for NodeActorAcceptStreamMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NodeActorAcceptStreamMessage").finish()
+    }
+}
+
 impl Message for NodeActorAcceptStreamMessage {
     type Result = ();
 }
@@ -642,14 +648,11 @@ impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
             };
 
             // Look up the actor key in the receptionist
-            let Some(endpoint) = receptionist.raw_lookup_one(actor_key).await else {
+            let Ok(endpoint) = receptionist
+                .lookup_one_recepient_of::<RemoteMessage>(actor_key)
+                .await
+            else {
                 tracing::error!("Actor key not found in receptionist");
-                return;
-            };
-
-            // Cast the AnyEndpoint into a RemoteMessage receiver
-            let Some(endpoint) = endpoint.downcast_into_recepient_of::<RemoteMessage>() else {
-                tracing::error!("Failed to downcast endpoint into remote message receiver");
                 return;
             };
         });

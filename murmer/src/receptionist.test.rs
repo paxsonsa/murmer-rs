@@ -4,10 +4,22 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 
 use super::*;
+use crate::actor::Registered as RegisteredActor;
 use crate::prelude::*;
 use crate::system::EndpointSender;
 
 struct FakeActor;
+
+impl RegisteredActor for FakeActor {
+    const RECEPTIONIST_KEY: &'static str = "fake";
+}
+
+#[async_trait::async_trait]
+impl Handler<RemoteMessage> for FakeActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, _message: RemoteMessage) -> () {
+        panic!("RemoteMessage is not supported for FakeActor");
+    }
+}
 
 impl Actor for FakeActor {}
 
@@ -41,55 +53,67 @@ fn create_receptionist_context() -> Context<ReceptionistActor> {
 }
 
 /// Helper function to register an endpoint with a receptionist
-async fn register_endpoint<T: Actor>(
+async fn register_endpoint<T: RegisteredActor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
     endpoint: &Endpoint<T>,
 ) {
     let message = Register {
-        key: key.clone(),
+        key: key.clone().into(),
         endpoint: endpoint.clone(),
     };
     assert!(receptionist.handle(ctx, message).await);
 }
 
 /// Helper function to deregister an endpoint from a receptionist
-async fn deregister_endpoint<T: Actor>(
+async fn deregister_endpoint<T: RegisteredActor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
     endpoint: &Endpoint<T>,
 ) {
     let message = Deregister {
-        key: key.clone(),
+        key: key.into(),
         endpoint: endpoint.clone(),
     };
     let _ = receptionist.handle(ctx, message).await;
 }
 
 /// Helper function to lookup endpoints for a key
-async fn lookup_endpoints<T: Actor>(
+async fn lookup_endpoints<T: RegisteredActor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
 ) -> Listing<T> {
-    let message = Lookup { key: key.clone() };
-    receptionist.handle(ctx, message).await.expect("lookup failed")
+    let message = Lookup {
+        key: key.into(),
+        _phantom: PhantomData,
+    };
+    receptionist
+        .handle(ctx, message)
+        .await
+        .expect("lookup failed")
 }
 
 /// Helper function to subscribe to a key
-async fn subscribe_to_key<T: Actor>(
+async fn subscribe_to_key<T: RegisteredActor>(
     receptionist: &mut ReceptionistActor,
     ctx: &mut Context<ReceptionistActor>,
     key: &Key<T>,
 ) -> ListingSubscription<T> {
-    let message = Subscribe { key: key.clone() };
-    receptionist.handle(ctx, message).await.expect("subscribe failed")
+    let message = Subscribe {
+        key: key.into(),
+        _phantom: PhantomData,
+    };
+    receptionist
+        .handle(ctx, message)
+        .await
+        .expect("subscribe failed")
 }
 
 /// Helper function to assert a registered update
-fn assert_registered_update<T: Actor>(
+fn assert_registered_update<T: RegisteredActor>(
     listing: &mut ListingSubscription<T>,
     expected_endpoint: &Endpoint<T>,
 ) {
@@ -151,7 +175,7 @@ async fn test_receptionist_subscription() {
 async fn test_receptionist_subscription_stream() {
     let mut receptionist = ReceptionistActor::default();
     let mut ctx = create_receptionist_context();
-    let key = Key::<FakeActor>::new("actor");
+    let key = Key::<FakeActor>::new("fake");
 
     // Create and register first endpoint
     let endpoint_a = create_endpoint("testA");

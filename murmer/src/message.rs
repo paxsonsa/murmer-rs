@@ -3,10 +3,39 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use super::actor::*;
+use bytes::Bytes;
+use dyn_clone::DynClone;
+use tokio::sync::oneshot;
+
 use crate::context::Context;
 
-use super::actor::*;
-use tokio::sync::oneshot;
+/// Errors that can occur during actor operations
+#[derive(thiserror::Error, Debug)]
+pub enum SendError {
+    /// Returned when trying to send a message to an actor whose mailbox has been closed
+    #[error("Actor mailbox has been closed")]
+    MailboxClosed,
+    /// Returned when the response channel was dropped before receiving the result
+    #[error("Actor response was dropped unexpectedly")]
+    ResponseDropped,
+}
+
+/// A trait for representing a Sender of some message type.
+#[async_trait::async_trait]
+pub trait MessageSender<M>: DynClone + Send + Sync
+where
+    M: Message + Send,
+    M::Result: Send,
+{
+    /// Sends a message to the actor.
+    async fn send(&self, msg: M) -> Result<M::Result, SendError>;
+
+    /// Sends a message to the actor without expecting a response.
+    async fn send_no_response(&self, msg: M) -> Result<(), SendError>;
+}
+
+dyn_clone::clone_trait_object!(<M> MessageSender<M> where M: Message + Send, M::Result: Send);
 
 /// A trait for messages that can be sent to actors.
 ///
@@ -20,9 +49,9 @@ pub trait Message: std::fmt::Debug + Send + 'static {
 
 pub trait EnvelopeProxy<A: Actor>: Send {
     fn handle_async<'a>(
-        &'a mut self, 
-        ctx: &'a mut Context<A>, 
-        actor: &'a mut A
+        &'a mut self,
+        ctx: &'a mut Context<A>,
+        actor: &'a mut A,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
@@ -81,7 +110,7 @@ where
     fn handle_async<'a>(
         &'a mut self,
         ctx: &'a mut Context<A>,
-        actor: &'a mut A
+        actor: &'a mut A,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             let msg = self.msg.take().expect("message is missing, this is a bug.");
@@ -106,5 +135,43 @@ where
                 }
             }
         })
+    }
+}
+
+/// A special remote message that is used to send messages to remote actors
+/// through the networking layer.
+#[derive(Debug)]
+pub struct RemoteMessage {
+    pub type_name: String,
+    pub message_data: Bytes,
+}
+
+impl Message for RemoteMessage {
+    type Result = ();
+}
+
+pub struct RecepientOf<M: Message> {
+    pub sender: Box<dyn MessageSender<M>>,
+}
+
+impl<M: Message> RecepientOf<M> {
+    pub fn new(sender: Box<dyn MessageSender<M>>) -> Self {
+        Self { sender }
+    }
+
+    pub async fn send(&self, msg: M) -> Result<M::Result, SendError> {
+        self.sender.send(msg).await
+    }
+
+    pub async fn send_no_response(&self, msg: M) -> Result<(), SendError> {
+        self.sender.send_no_response(msg).await
+    }
+}
+
+impl<M: Message> std::fmt::Debug for RecepientOf<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecepientOf")
+            .field("sender", &std::any::type_name::<M>())
+            .finish()
     }
 }
