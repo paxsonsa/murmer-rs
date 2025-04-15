@@ -1,5 +1,4 @@
 use crate::net::{self, FrameWriter, NetworkDriver};
-use crate::receptionist::Key;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
@@ -277,7 +276,7 @@ impl NodeActor {
 
         // Start a new
         let endpoint = ctx.endpoint();
-        let accept_cancellation = ctx.spawn(async move {
+        let _accept_cancellation = ctx.spawn(async move {
             loop {
                 match accept_stream.accept().await {
                     Ok(stream) => {
@@ -471,8 +470,8 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
             net::NodeMessage::Disconnect { reason } => {
                 self.handle_disconnect_frame(ctx, reason).await;
             }
-            net::NodeMessage::ActorAdd { actor_path } => {}
-            net::NodeMessage::ActorRemove { actor_path } => {}
+            net::NodeMessage::ActorAdd { actor_path: _ } => {}
+            net::NodeMessage::ActorRemove { actor_path: _ } => {}
         }
     }
 }
@@ -624,7 +623,7 @@ impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
         let stream = msg.0;
         tracing::info!("Accepted new actor stream from remote node");
 
-        let (tx, rx) = stream.into_frame_stream::<net::ActorMessage>();
+        let (_tx, rx) = stream.into_frame_stream::<net::ActorMessage>();
 
         let receptionist = ctx.system().receptionist_ref().clone();
 
@@ -648,7 +647,7 @@ impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
             };
 
             // Look up the actor key in the receptionist
-            let Ok(endpoint) = receptionist
+            let Ok(_endpoint) = receptionist
                 .lookup_one_recepient_of::<RemoteMessage>(actor_key)
                 .await
             else {

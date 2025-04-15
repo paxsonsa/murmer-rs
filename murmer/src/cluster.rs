@@ -1,10 +1,8 @@
 use crate::actor::Registered;
-use crate::net::{NetworkAddrError, NetworkAddrRef};
-use chrono::Utc;
+use crate::net::NetworkAddrRef;
 use std::collections::{HashMap, HashSet};
 use std::{net::SocketAddr, sync::Arc};
 
-use hostname;
 
 use super::node::*;
 use super::prelude::*;

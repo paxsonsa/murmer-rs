@@ -1,5 +1,5 @@
 use crate::cluster::ClusterId;
-use crate::net::{self, FrameWriter, NetworkAddrRef, NetworkDriver, QuicConnectionDriver};
+use crate::net::{self, NetworkAddrRef, QuicConnectionDriver};
 use crate::prelude::*;
 use crate::tls::TlsConfig;
 use chrono::{DateTime, Utc};

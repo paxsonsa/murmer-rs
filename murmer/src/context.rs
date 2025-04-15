@@ -1,6 +1,5 @@
 use std::future::Future;
 
-use futures::channel::oneshot::Cancellation;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
