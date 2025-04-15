@@ -100,15 +100,15 @@ impl<T: RegisteredActor> fmt::Debug for StaticKey<T> {
 impl<T: RegisteredActor> Clone for StaticKey<T> {
     fn clone(&self) -> Self {
         Self {
-            group_id: self.group_id.clone(),
+            group_id: self.group_id,
             _phantom: PhantomData,
         }
     }
 }
 
-impl<T: RegisteredActor> Into<RawKey> for StaticKey<T> {
-    fn into(self) -> RawKey {
-        RawKey::new_with_id(T::RECEPTIONIST_KEY.to_string(), self.group_id.to_string())
+impl<T: RegisteredActor> From<StaticKey<T>> for RawKey {
+    fn from(val: StaticKey<T>) -> Self {
+        RawKey::new_with_id(T::RECEPTIONIST_KEY.to_string(), val.group_id.to_string())
     }
 }
 
@@ -158,9 +158,9 @@ impl<T: RegisteredActor> Clone for Key<T> {
     }
 }
 
-impl<T: RegisteredActor> Into<RawKey> for Key<T> {
-    fn into(self) -> RawKey {
-        RawKey::new_with_id(T::RECEPTIONIST_KEY.to_string(), self.group_id)
+impl<T: RegisteredActor> From<Key<T>> for RawKey {
+    fn from(val: Key<T>) -> Self {
+        RawKey::new_with_id(T::RECEPTIONIST_KEY.to_string(), val.group_id)
     }
 }
 
@@ -296,7 +296,7 @@ pub struct ListingSubscription<T: RegisteredActor> {
 impl<T: RegisteredActor> ListingSubscription<T> {
     /// Returns the key this subscription is monitoring
     pub fn key(&self) -> Key<T> {
-        return Key::new(self.key.group_id.clone());
+        Key::new(self.key.group_id.clone())
     }
 
     /// Attempts to get the next update without blocking
@@ -325,6 +325,7 @@ impl<T: RegisteredActor> Stream for ListingSubscription<T> {
 }
 
 /// The core actor that manages service discovery and registration
+#[derive(Default)]
 pub struct ReceptionistActor {
     /// Nested map of type ID -> key -> set of registrations
     registrations: HashMap<String, HashMap<String, HashSet<Registration>>>,
@@ -332,14 +333,6 @@ pub struct ReceptionistActor {
     subscriptions: HashMap<String, HashMap<String, Vec<Subscriber>>>,
 }
 
-impl Default for ReceptionistActor {
-    fn default() -> Self {
-        Self {
-            registrations: HashMap::new(),
-            subscriptions: HashMap::new(),
-        }
-    }
-}
 
 impl ReceptionistActor {}
 
@@ -448,7 +441,7 @@ impl<T: RegisteredActor> Handler<Deregister<T>> for ReceptionistActor {
             .get_mut(&key)
             .and_then(|regs| regs.get_mut(&group_id))
             .and_then(|set| set.remove(&registration).then_some(()))
-            .and_then(|_| {
+            .map(|_| {
                 // Notify subscribers
                 if let Some(subs) = self.subscriptions.get(&key) {
                     if let Some(subscribers) = subs.get(&group_id) {
@@ -459,7 +452,7 @@ impl<T: RegisteredActor> Handler<Deregister<T>> for ReceptionistActor {
                         }
                     }
                 }
-                Some(())
+                ()
             })
             // Return whether the endpoint was deregistered
             .is_some()
@@ -716,7 +709,7 @@ impl Receptionist {
         match self
             .inner_endpoint
             .send(RecepientLookup {
-                key: key.clone().into(),
+                key: key.clone(),
                 _phantom: PhantomData,
             })
             .await

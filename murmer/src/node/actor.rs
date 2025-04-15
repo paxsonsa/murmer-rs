@@ -74,7 +74,7 @@ impl NodeActor {
 
             // Send the status update
             let status_update = crate::cluster::NodeStatusUpdate {
-                node_id: self.node_info.node_id.clone(),
+                node_id: self.node_info.node_id,
                 status: self.membership.clone(),
                 reachability: self.reachability.clone(),
                 is_configured,
@@ -97,7 +97,7 @@ impl NodeActor {
 
     async fn send_message(&mut self, message: net::NodeMessage) -> Result<(), NodeError> {
         if let Some(ref mut stream) = self.send_stream {
-            let frame = net::Frame::ok(self.node_info.node_id.clone(), None, message);
+            let frame = net::Frame::ok(self.node_info.node_id, None, message);
             if let Err(e) = stream.write_frame(&frame).await {
                 tracing::error!(error=%e, "Failed to send message");
                 return Err(NodeError::NodeNetworkError(e));
@@ -123,11 +123,11 @@ impl NodeActor {
         }
 
         // Store the remote node ID
-        self.node_id = Some(id.clone());
+        self.node_id = Some(id);
 
         // Send InitAck response
         let init_ack = net::NodeMessage::InitAck {
-            node_id: self.node_info.node_id.clone(),
+            node_id: self.node_info.node_id,
         };
 
         // Send the InitAck message
@@ -148,7 +148,7 @@ impl NodeActor {
             // TODO: Send Error
             return;
         };
-        self.node_id = Some(node_id.clone());
+        self.node_id = Some(node_id);
         self.inner_state = State::InitAck;
         self.membership = Status::Joining;
         self.reachability = Reachability::reachable_now();
@@ -163,7 +163,6 @@ impl NodeActor {
             tracing::error!(error=%err, "Failed to send join message");
             self.membership = Status::Failed;
             self.inner_state = State::Init;
-            return;
         }
     }
 
@@ -370,7 +369,7 @@ impl Actor for NodeActor {
         // Send initial message
         let init = net::NodeMessage::Init {
             protocol_version: 1, // FIXME: Use a real protocol version
-            id: self.cluster_node_id.clone(),
+            id: self.cluster_node_id,
         };
         if let Err(err) = self.send_message(init).await {
             tracing::error!(error=%err, "Failed to send initial message");
@@ -380,7 +379,7 @@ impl Actor for NodeActor {
 
         // Start the receive loop for the main node stream
         let endpoint = ctx.endpoint();
-        let node_id = self.node_info.node_id.clone();
+        let node_id = self.node_info.node_id;
         let mut running = true;
         ctx.spawn(async move {
             let span = tracing::trace_span!("member-rx", node_id=%node_id);
@@ -499,22 +498,19 @@ impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
                 tracing::error!(error=%err, "Failed to send heartbeat");
 
                 // If we fail to send a heartbeat, update our reachability
-                match self.reachability {
-                    Reachability::Reachable { misses, last_seen } => {
-                        self.reachability = Reachability::Reachable {
-                            misses: misses + 1,
+                if let Reachability::Reachable { misses, last_seen } = self.reachability {
+                    self.reachability = Reachability::Reachable {
+                        misses: misses + 1,
+                        last_seen,
+                    };
+
+                    // If we've missed too many, mark as unreachable
+                    if misses + 1 >= 3 {
+                        self.reachability = Reachability::Unreachable {
+                            pings: 0,
                             last_seen,
                         };
-
-                        // If we've missed too many, mark as unreachable
-                        if misses + 1 >= 3 {
-                            self.reachability = Reachability::Unreachable {
-                                pings: 0,
-                                last_seen,
-                            };
-                        }
                     }
-                    _ => {}
                 }
             }
         }
@@ -545,14 +541,14 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                 if last_seen.signed_duration_since(timestamp) > chrono::TimeDelta::seconds(-3) {
                     self.reachability = Reachability::Reachable {
                         misses: 0,
-                        last_seen: last_seen.clone(),
+                        last_seen: *last_seen,
                     };
                 // When the miss is 3 seconds or more and we have hit three misses,
                 // it is unreachable and we mark it as Down.
                 } else if *misses >= 3 {
                     self.reachability = Reachability::Unreachable {
                         pings: 0,
-                        last_seen: last_seen.clone(),
+                        last_seen: *last_seen,
                     };
 
                     // If we can't reach the node after multiple attempts, mark it as Down
@@ -563,7 +559,7 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                 } else {
                     self.reachability = Reachability::Reachable {
                         misses: misses + 1,
-                        last_seen: last_seen.clone(),
+                        last_seen: *last_seen,
                     };
                 }
             }
@@ -573,7 +569,7 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                 {
                     self.reachability = Reachability::Reachable {
                         misses: 0,
-                        last_seen: last_seen.clone(),
+                        last_seen: *last_seen,
                     };
 
                     // If the node was Down but now is reachable again, mark it as Up
@@ -583,7 +579,7 @@ impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
                 } else {
                     self.reachability = Reachability::Unreachable {
                         pings: *pings,
-                        last_seen: last_seen.clone(),
+                        last_seen: *last_seen,
                     };
                 }
             }

@@ -180,7 +180,7 @@ impl Actor for ClusterActor {
             };
 
             // Add this node ID to the configured nodes set
-            self.configured_node_ids.insert(member.id.clone());
+            self.configured_node_ids.insert(member.id);
 
             // Initialize node status
             let node_status = NodeStatus {
@@ -192,7 +192,7 @@ impl Actor for ClusterActor {
             };
 
             // Add to members map
-            self.members.insert(member.id.clone(), node_status);
+            self.members.insert(member.id, node_status);
         }
 
         self.state = State::Running;
@@ -312,7 +312,7 @@ impl Handler<CleanupUnreachableNodes> for ClusterActor {
                     && matches!(status.status, Status::Down | Status::Failed)
                     && matches!(status.reachability, Reachability::Unreachable { .. })
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect();
 
         let count = unreachable_nodes.len();

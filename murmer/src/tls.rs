@@ -6,7 +6,6 @@ use std::{
 
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls_pemfile;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -120,7 +119,7 @@ impl TlsConfig {
     }
 
     fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
-        let key_data = fs::read(path).map_err(|e| TlsConfigError::IoError(e))?;
+        let key_data = fs::read(path).map_err(TlsConfigError::IoError)?;
 
         if path.extension().is_some_and(|x| x == "der") {
             Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_data)))
@@ -132,7 +131,7 @@ impl TlsConfig {
     }
 
     fn load_certificate_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
-        let cert_data = fs::read(path).map_err(|e| TlsConfigError::IoError(e))?;
+        let cert_data = fs::read(path).map_err(TlsConfigError::IoError)?;
 
         if path.extension().is_some_and(|x| x == "der") {
             Ok(vec![CertificateDer::from(cert_data)])
@@ -184,14 +183,14 @@ impl TlsConfig {
         );
 
         let cert = rcgen::generate_simple_self_signed(
-            hostnames.iter().map(|s| s.clone()).collect::<Vec<_>>(),
+            hostnames.iter().cloned().collect::<Vec<_>>(),
         )?;
         let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let cert = cert.cert.into();
 
-        fs::create_dir_all(dir).map_err(|e| TlsConfigError::IoError(e))?;
-        fs::write(cert_path, &cert).map_err(|e| TlsConfigError::IoError(e))?;
-        fs::write(key_path, key.secret_pkcs8_der()).map_err(|e| TlsConfigError::IoError(e))?;
+        fs::create_dir_all(dir).map_err(TlsConfigError::IoError)?;
+        fs::write(cert_path, &cert).map_err(TlsConfigError::IoError)?;
+        fs::write(key_path, key.secret_pkcs8_der()).map_err(TlsConfigError::IoError)?;
 
         Ok((vec![cert], key.into()))
     }

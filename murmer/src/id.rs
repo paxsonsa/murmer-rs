@@ -7,6 +7,12 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Id(uuid::Uuid);
 
+impl Default for Id {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Id {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())

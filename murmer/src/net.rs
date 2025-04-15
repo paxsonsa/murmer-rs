@@ -668,7 +668,7 @@ struct AcceptFuture<'a> {
     stream: &'a mut AcceptStream,
 }
 
-impl<'a> std::future::Future for AcceptFuture<'a> {
+impl std::future::Future for AcceptFuture<'_> {
     type Output = Result<RawStream, ConnectionError>;
 
     fn poll(

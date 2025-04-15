@@ -580,7 +580,7 @@ async fn node_actor_unreachable_reset() {
             matches!(
                 state.reachability,
                 Reachability::Unreachable {
-                    pings: pings,
+                    pings,
                     ..
                 } if pings == ping
             )

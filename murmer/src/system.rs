@@ -397,12 +397,9 @@ where
 
     #[tracing::instrument(skip(ctx))]
     async fn tick(&mut self, ctx: &mut Context<A>) {
-        match self.mailbox.recv().await {
-            Some(cmd) => {
-                tracing::trace!(?cmd, "command received");
-                self.handle_command(ctx, cmd).await;
-            }
-            None => {}
+        if let Some(cmd) = self.mailbox.recv().await {
+            tracing::trace!(?cmd, "command received");
+            self.handle_command(ctx, cmd).await;
         };
     }
 }
@@ -526,10 +523,10 @@ impl<A: Actor, S: State + Clone> Clone for Supervisor<A, S> {
     }
 }
 
-impl<A: Actor> Into<Endpoint<A>> for Supervisor<A, Initialized> {
-    fn into(self) -> Endpoint<A> {
-        let sender = EndpointSender::from_sender(self.sender);
-        Endpoint::new(sender, self.path)
+impl<A: Actor> From<Supervisor<A, Initialized>> for Endpoint<A> {
+    fn from(val: Supervisor<A, Initialized>) -> Self {
+        let sender = EndpointSender::from_sender(val.sender);
+        Endpoint::new(sender, val.path)
     }
 }
 
@@ -859,7 +856,7 @@ impl<A: Actor> EndpointSender<A> {
             return Err(SendError::MailboxClosed);
         }
 
-        Ok(rx.await.map_err(|_| SendError::ResponseDropped)?)
+        rx.await.map_err(|_| SendError::ResponseDropped)
     }
 }
 
