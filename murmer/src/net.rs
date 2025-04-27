@@ -706,6 +706,9 @@ impl std::future::Future for AcceptFuture<'_> {
 /// Network driver trait for establishing connections and opening streams
 #[async_trait::async_trait]
 pub trait NetworkDriver: Send {
+    /// Is this driver already connected
+    fn connected(&self) -> bool;
+
     /// Connect to a remote node
     async fn connect(&mut self) -> Result<(), ConnectionError>;
 
@@ -728,30 +731,50 @@ pub enum QuicConnectionState {
 /// QUIC-based implementation of the NetworkDriver trait
 pub struct QuicConnectionDriver {
     node_info: NodeInfo,
-    socket: quinn::Endpoint,
+    socket: Option<quinn::Endpoint>,
     tls: TlsConfig,
     state: QuicConnectionState,
 }
 
 impl QuicConnectionDriver {
-    pub fn new(node_info: NodeInfo, socket: quinn::Endpoint, tls: TlsConfig) -> Self {
+    pub fn unconnected(node_info: NodeInfo, socket: quinn::Endpoint, tls: TlsConfig) -> Self {
         QuicConnectionDriver {
             node_info,
-            socket,
+            socket: Some(socket),
             tls,
             state: QuicConnectionState::NotReady,
+        }
+    }
+
+    pub fn connected(node_info: NodeInfo, connection: quinn::Connection, tls: TlsConfig) -> Self {
+        QuicConnectionDriver {
+            node_info,
+            socket: None,
+            tls,
+            state: QuicConnectionState::Connected { connection },
         }
     }
 }
 
 #[async_trait::async_trait]
 impl NetworkDriver for QuicConnectionDriver {
+    fn connected(&self) -> bool {
+        match &self.state {
+            QuicConnectionState::Connected { .. } => true,
+            _ => false,
+        }
+    }
     async fn connect(&mut self) -> Result<(), ConnectionError> {
+        let Some(socket) = &self.socket else {
+            return Err(ConnectionError::ConnectionFailed(
+                "Socket is not available".to_string(),
+            ));
+        };
         match &self.state {
             QuicConnectionState::NotReady | QuicConnectionState::Disconnected { .. } => {
                 let tls = self.tls.clone();
                 let addr = self.node_info.addr.clone();
-                let socket = self.socket.clone();
+                let socket = socket.clone();
 
                 let crypto = tls.into_client_config()?;
                 let sock_addr = addr.to_sock_addrs()?;

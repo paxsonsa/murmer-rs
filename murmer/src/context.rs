@@ -23,7 +23,6 @@ where
     _phantom: std::marker::PhantomData<A>,
 }
 
-
 impl<A> Context<A>
 where
     A: Actor,
@@ -38,7 +37,7 @@ where
     }
 }
 
-impl<A> Clone for Context<A> 
+impl<A> Clone for Context<A>
 where
     A: Actor,
 {
@@ -60,7 +59,6 @@ where
         self.endpoint.clone()
     }
 
-
     /// Access the actor system.
     pub fn system(&self) -> System {
         System::current()
@@ -74,14 +72,14 @@ where
     /// Establish an interval that sends a message to the actor at a fixed interval.
     ///
     /// This method takes a message factory function that creates a new message instance
-    /// each time the interval triggers. The actor must implement Handler<M> for the 
+    /// each time the interval triggers. The actor must implement Handler<M> for the
     /// message type.
     ///
     /// # Example
     /// ```
     /// // Create an interval that sends a Tick message every second
     /// ctx.interval(Duration::from_secs(1), || Tick);
-    /// 
+    ///
     /// // Create an interval with dynamic message content
     /// let counter = Arc::new(AtomicUsize::new(0));
     /// let counter_clone = counter.clone();
@@ -99,10 +97,10 @@ where
     {
         let endpoint = self.endpoint();
         let cancellation = self.cancellation.child_token();
-        
+
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
-            
+
             loop {
                 tokio::select! {
                     _ = interval_timer.tick() => {
@@ -136,6 +134,19 @@ where
             };
         });
         cancellation_ret
+    }
+
+    /// Spawn the actor in the actor's runtime/lifecycle.
+    ///
+    /// The given actor will be cancelled if the parent actor is shutdown/dropped.
+    /// As such, the actor should be cancel safe as the actor may be cancelled
+    /// without notice. Once the actor is cancelled, it will not be restarted.
+    ///
+    /// Sub-actors are not remote accessible and are not registered with the system.
+    ///
+    pub fn spawn_actor<C: Actor>(&self, child_actor: C) -> CancellationToken {
+        // TODO: Needs to have a supervisor trait so it can receive lifecycle events.
+        todo!("implement spawn_actor");
     }
 
     /// Send a message to the actor's endpoint.

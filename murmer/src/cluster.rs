@@ -1,6 +1,6 @@
 use crate::actor::Registered;
 use crate::message::RemoteMessageError;
-use crate::net::NetworkAddrRef;
+use crate::net::{NetworkAddr, NetworkAddrRef, QuicConnectionDriver};
 use std::collections::{HashMap, HashSet};
 use std::{net::SocketAddr, sync::Arc};
 
@@ -168,12 +168,18 @@ impl Actor for ClusterActor {
 
         // Connect to each peer defined in the initial configuration
         for peer in self.config.peers.iter() {
+            let node_info = NodeInfo::from(peer.clone());
+            let driver = Box::new(QuicConnectionDriver::unconnected(
+                node_info.clone(),
+                self.socket.clone(),
+                self.config.tls.clone(),
+            ));
+
             let Some(member) = Node::spawn(
                 ctx.system(),
                 self.config.cluster_id.clone(),
-                NodeInfo::from(peer.clone()),
-                self.socket.clone(),
-                self.config.tls.clone(),
+                node_info,
+                driver,
             ) else {
                 tracing::error!("Failed to spawn member actor");
                 continue;
@@ -231,9 +237,11 @@ impl Handler<RemoteMessage> for ClusterActor {
 
 #[async_trait::async_trait]
 impl Handler<NewIncomingConnection> for ClusterActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NewIncomingConnection) {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: NewIncomingConnection) {
         let addr = msg.addr;
-        tracing::info!(addr=%addr, "Handling new incoming connection");
+        let addr = NetworkAddr::Socket(addr);
+        let addr = NetworkAddrRef(Arc::new(addr));
+        tracing::info!(addr=%addr, "new incoming connection");
 
         // Here we'd create a NodeActor for the incoming connection
         // For now, we'll just log it and accept it as a dynamic node
@@ -242,8 +250,33 @@ impl Handler<NewIncomingConnection> for ClusterActor {
         // 1. Create a NodeInfo for the dynamic connection
         // 2. Spawn a NodeActor for it
         // 3. Add it to our members list as a non-configured node
+        let node_info = NodeInfo::new(addr);
+        let connection = msg.connection;
+        let driver = Box::new(QuicConnectionDriver::connected(
+            node_info.clone(),
+            connection,
+            self.config.tls.clone(),
+        ));
 
-        // TODO: Create a non-configured NodeActor
+        let Some(node) = Node::spawn(
+            ctx.system(),
+            self.config.cluster_id.clone(),
+            node_info,
+            driver,
+        ) else {
+            tracing::error!("Failed to spawn member actor");
+            return;
+        };
+        let node_status = NodeStatus {
+            node: node.clone(),
+            status: Status::Pending,
+            reachability: Reachability::Pending,
+            is_configured: true,
+            last_updated: chrono::Utc::now(),
+        };
+
+        // Add to members map
+        self.members.insert(node.id, node_status);
     }
 }
 
@@ -271,6 +304,7 @@ impl Handler<NodeStatusUpdate> for ClusterActor {
             {
                 tracing::info!(node_id=%msg.id, "Non-configured node is unreachable, marked for cleanup");
                 // We'll let the cleanup interval task handle actual removal
+                // TODO: CleanUp
             }
         } else {
             tracing::warn!(node_id=%msg.id, "Received status update for unknown node");

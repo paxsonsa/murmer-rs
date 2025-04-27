@@ -77,7 +77,7 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-    fn new(addr: NetworkAddrRef) -> Self {
+    pub fn new(addr: NetworkAddrRef) -> Self {
         NodeInfo {
             display_name: format!("{}", addr),
             addr,
@@ -115,12 +115,9 @@ impl Node {
         system: System,
         cluster_id: Arc<ClusterId>,
         node_info: NodeInfo,
-        socket: quinn::Endpoint,
-        tls: TlsConfig,
+        driver: Box<dyn net::NetworkDriver>,
     ) -> Option<Node> {
         let id = Id::new();
-
-        let driver = Box::new(QuicConnectionDriver::new(node_info.clone(), socket, tls));
         let endpoint = system.spawn_with(NodeActor::new(cluster_id.id, id, node_info, driver));
         endpoint.map(|e| Node { id, endpoint: e }).ok()
     }

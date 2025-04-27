@@ -58,6 +58,10 @@ struct MockNetworkDriver;
 
 #[async_trait::async_trait]
 impl crate::net::NetworkDriver for MockNetworkDriver {
+    fn connected(&self) -> bool {
+        false
+    }
+
     async fn connect(&mut self) -> Result<(), ConnectionError> {
         Ok(())
     }

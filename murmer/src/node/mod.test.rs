@@ -76,17 +76,25 @@ impl MockNetwork {
 }
 
 struct MockConnectionDriver {
+    connected: bool,
     test_driver: MockNetwork,
 }
 
 impl MockConnectionDriver {
     fn new(test_driver: MockNetwork) -> Self {
-        MockConnectionDriver { test_driver }
+        MockConnectionDriver {
+            connected: false,
+            test_driver,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl NetworkDriver for MockConnectionDriver {
+    fn connected(&self) -> bool {
+        self.connected
+    }
+
     async fn connect(&mut self) -> Result<(), ConnectionError> {
         Ok(())
     }

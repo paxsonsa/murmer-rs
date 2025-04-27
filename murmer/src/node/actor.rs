@@ -13,6 +13,10 @@ enum State {
     /// some remote node.
     Init,
 
+    /// Intial state of a node actor that represents a actor that is accepting a connection from
+    /// some remote node.
+    InitAccept,
+
     /// Initial acknowledgement has been received or sent and is awaiting the final steps to become a
     /// running instance.
     InitAck,
@@ -36,6 +40,7 @@ pub struct NodeActor {
     pub membership: Status,
     pub reachability: Reachability,
     pub send_stream: Option<FrameWriter<net::NodeMessage>>,
+    local_proxies: Vec<LocalProxy>,
     inner_state: State,
 }
 
@@ -55,6 +60,7 @@ impl NodeActor {
             membership: Status::Pending,
             reachability: Reachability::Pending,
             send_stream: None,
+            local_proxies: Vec::new(),
             inner_state: State::Init,
         }
     }
@@ -152,6 +158,7 @@ impl NodeActor {
         // Update state
         self.membership = Status::Pending;
         self.reachability = Reachability::reachable_now();
+        self.inner_state = State::InitAck;
     }
 
     #[tracing::instrument(skip(self), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
@@ -290,7 +297,7 @@ impl NodeActor {
             return;
         };
 
-        // Start a new
+        // Begin a new accept stream of incoming streams from the remote node.
         let endpoint = ctx.endpoint();
         let _accept_cancellation = ctx.spawn(async move {
             loop {
@@ -356,45 +363,74 @@ impl Actor for NodeActor {
         self.membership = Status::Pending;
         self.reachability = Reachability::Pending;
 
-        // Establish the connection regardless of the current state
-        if let Err(err) = self.driver.connect().await {
-            tracing::error!(error=%err, "Failed to establish connection");
-            self.membership = Status::Failed;
-            self.reachability = Reachability::Unreachable {
-                pings: 0,
-                last_seen: Utc::now(),
-            };
-            return;
-        }
-
-        // Open new raw stream for initial cluster communication
-        let raw_stream = match self.driver.open_stream().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::error!(error=%e, "Failed to establish member connection stream");
-                self.membership = Status::Failed;
-                self.reachability = Reachability::Unreachable {
-                    pings: 0,
-                    last_seen: Utc::now(),
+        let mut stream_rx = match self.driver.connected() {
+            // We are connected already so we are accepting a stream instead of opening one.
+            true => {
+                let Ok(mut accept_stream) = self.driver.accept_stream().await else {
+                    tracing::error!("Failed to accept stream");
+                    self.membership = Status::Failed;
+                    self.inner_state = State::InitAccept;
+                    return;
                 };
-                return;
+
+                let raw_stream = match accept_stream.accept().await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::error!(error=%e, "Failed to accept stream");
+                        self.membership = Status::Failed;
+                        self.inner_state = State::InitAccept;
+                        return;
+                    }
+                };
+                // Convert the raw stream to a typed stream
+                let (stream_tx, stream_rx) = raw_stream.into_frame_stream::<net::NodeMessage>();
+                self.send_stream = Some(stream_tx);
+                stream_rx
+            }
+            // We are not connected yet so we are opening a stream instead of accepting one.
+            false => {
+                // Establish the connection regardless of the current state
+                if let Err(err) = self.driver.connect().await {
+                    tracing::error!(error=%err, "Failed to establish connection");
+                    self.membership = Status::Failed;
+                    self.reachability = Reachability::Unreachable {
+                        pings: 0,
+                        last_seen: Utc::now(),
+                    };
+                    return;
+                }
+
+                // Open new raw stream for initial cluster communication
+                let raw_stream = match self.driver.open_stream().await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::error!(error=%e, "Failed to establish member connection stream");
+                        self.membership = Status::Failed;
+                        self.reachability = Reachability::Unreachable {
+                            pings: 0,
+                            last_seen: Utc::now(),
+                        };
+                        return;
+                    }
+                };
+
+                // Convert the raw stream to a typed stream
+                let (stream_tx, stream_rx) = raw_stream.into_frame_stream::<net::NodeMessage>();
+                self.send_stream = Some(stream_tx);
+
+                // Send initial message
+                let init = net::NodeMessage::Init {
+                    protocol_version: 1, // FIXME: Use a real protocol version
+                    host_id: self.host_id,
+                };
+                if let Err(err) = self.send_message(init).await {
+                    tracing::error!(error=%err, "Failed to send initial message");
+                    self.membership = Status::Failed;
+                    return;
+                }
+                stream_rx
             }
         };
-
-        // Convert the raw stream to a typed stream
-        let (stream_tx, mut stream_rx) = raw_stream.into_frame_stream::<net::NodeMessage>();
-        self.send_stream = Some(stream_tx);
-
-        // Send initial message
-        let init = net::NodeMessage::Init {
-            protocol_version: 1, // FIXME: Use a real protocol version
-            host_id: self.host_id,
-        };
-        if let Err(err) = self.send_message(init).await {
-            tracing::error!(error=%err, "Failed to send initial message");
-            self.membership = Status::Failed;
-            return;
-        }
 
         // Start the receive loop for the main node stream
         let endpoint = ctx.endpoint();
@@ -649,7 +685,7 @@ impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
         let receptionist = ctx.system().receptionist_ref().clone();
 
         // Spawn a background task to wait for the initial stream message for the proxy.
-        let node_id = self.host_id.clone();
+        let host_id = self.host_id.clone();
         let remote_id = self.remote_id.get().unwrap();
         ctx.spawn(async move {
             let mut stream_rx = rx;
@@ -682,18 +718,25 @@ impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
             // Create the LocalProxy for the actor and let it handle the stream.
             let local_proxy = LocalProxy::new(
                 actor_key,
-                node_id,
+                host_id,
                 remote_id,
                 endpoint.clone(),
                 recepient,
                 stream_rx,
                 stream_tx,
             );
-            endpoint.send_in_background(NodeActorAddLocalProxyMessage(local_proxy));
-            // TODO: Implement Accept Connection version of NodeActor
+            if let Err(err) = endpoint
+                .send_in_background(NodeActorAddLocalProxyMessage(local_proxy))
+                .await
+            {
+                tracing::error!(error=%err, "Failed to send local proxy message, discarding stream");
+                return;
+            }
             // TODO: Implement RemoteProxy and handle the stream
             // TODO: Implement ActorAdd/ActorRemove messages, need to think about this actor path
             // stuff with the receptionist key and host names.
+            // TODO: Create Seperate Node Actor generic for Accepting vs Connecting action
+            // TODO: Simplify th connection set to be a simple two sided init and join.
         });
     }
 }
@@ -711,7 +754,7 @@ impl Handler<NodeActorAddLocalProxyMessage> for NodeActor {
         let local_proxy = message.0;
 
         tracing::info!(?local_proxy, "Adding local proxy");
-        let _ = ctx.spawn(local_proxy.open());
+        let cancellation = ctx.spawn(local_proxy.open());
     }
 }
 
@@ -798,6 +841,7 @@ impl LocalProxy {
             );
             if let Err(e) = self.stream_tx.write_frame(&frame).await {
                 tracing::error!(error=%e, "Failed to send message");
+                // TODO: Send Node Actor Update
                 break;
             }
         }
