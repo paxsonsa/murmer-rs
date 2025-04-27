@@ -315,9 +315,9 @@ async fn node_actor_reachability_to_unreachable() {
     // Create and spawn the actor
     let mut actor = test.spawn(NodeActor::new(
         Id::new(),
+        Id::new(),
         NodeInfo {
-            name: "test".to_string(),
-            node_id: Id::new(),
+            display_name: "test".to_string(),
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         Box::new(driver),
@@ -445,9 +445,9 @@ async fn node_actor_reachability_reset() {
     // Create and spawn the actor
     let mut actor = test.spawn(NodeActor::new(
         Id::new(),
+        Id::new(),
         NodeInfo {
-            name: "test".to_string(),
-            node_id: Id::new(),
+            display_name: "test".to_string(),
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         Box::new(driver),
@@ -519,9 +519,9 @@ async fn node_actor_unreachable_reset() {
     // Create and spawn the actor
     let mut actor = test.spawn(NodeActor::new(
         Id::new(),
+        Id::new(),
         NodeInfo {
-            name: "test".to_string(),
-            node_id: Id::new(),
+            display_name: "test".to_string(),
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         Box::new(driver),
@@ -612,19 +612,19 @@ async fn test_membership_initiation() {
 
     // Setup node IDs
     let cluster_id = Id::new();
-    let node_id = Id::new();
+    let instance_id = Id::new();
     let remote_id = Id::new();
 
     // Setup node info
     let info = NodeInfo {
-        name: "test-node".to_string(),
-        node_id: node_id.clone(),
+        display_name: "test-node".to_string(),
         addr: NetworkAddrRef::from("127.0.0.1:8000"),
     };
 
     // Create and spawn the actor
     let mut actor = test.spawn(NodeActor::new(
         cluster_id.clone(),
+        instance_id.clone(),
         info.clone(),
         Box::new(driver),
     ));
@@ -648,19 +648,19 @@ async fn test_membership_initiation() {
 
     // Verify the frame contains an Init message with correct protocol version
     if let net::Payload::Ok(net::NodeMessage::Init {
-        id,
+        host_id,
         protocol_version,
     }) = frame.payload
     {
         assert_eq!(protocol_version, 1);
-        assert_eq!(id, cluster_id);
+        assert_eq!(host_id, cluster_id);
     } else {
         panic!("Expected Init message, got: {:?}", frame.payload);
     }
 
     // Simulate receiving InitAck response
     let init_ack = net::Frame {
-        header: net::Header::new(remote_id.clone(), Some(node_id.clone())),
+        header: net::Header::new(remote_id.clone(), Some(cluster_id.clone())),
         payload: net::Payload::Ok(net::NodeMessage::InitAck {
             node_id: remote_id.clone(),
         }),
@@ -696,7 +696,7 @@ async fn test_membership_initiation() {
 
     // Simulate receiving JoinAck response (accepted)
     let join_ack = net::Frame {
-        header: net::Header::new(remote_id.clone(), Some(node_id.clone())),
+        header: net::Header::new(remote_id.clone(), Some(cluster_id.clone())),
         payload: net::Payload::Ok(net::NodeMessage::JoinAck {
             accepted: true,
             reason: None,
@@ -731,7 +731,7 @@ async fn test_membership_initiation() {
 
     // Simulate receiving a Heartbeat from the remote node
     let remote_heartbeat = net::Frame {
-        header: net::Header::new(remote_id.clone(), Some(node_id.clone())),
+        header: net::Header::new(remote_id.clone(), Some(cluster_id.clone())),
         payload: net::Payload::Ok(net::NodeMessage::Heartbeat {
             timestamp: chrono::Utc::now().timestamp_millis(),
         }),
@@ -755,7 +755,7 @@ async fn test_membership_initiation() {
 
     // Simulate receiving a Disconnect message
     let disconnect = net::Frame {
-        header: net::Header::new(remote_id.clone(), Some(node_id.clone())),
+        header: net::Header::new(remote_id.clone(), Some(cluster_id.clone())),
         payload: net::Payload::Ok(net::NodeMessage::Disconnect {
             reason: "Node shutting down".to_string(),
         }),

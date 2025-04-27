@@ -10,6 +10,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::id::Id;
+use crate::message::{RemoteMessage, RemoteMessageError};
 use crate::node::NodeInfo;
 use crate::path::ActorPath;
 use crate::receptionist::RawKey;
@@ -204,7 +205,7 @@ impl Header {
 pub enum NodeMessage {
     Init {
         protocol_version: u16,
-        id: Id,
+        host_id: Id,
     },
     InitAck {
         node_id: Id,
@@ -232,10 +233,11 @@ pub enum NodeMessage {
 }
 
 /// Actor messages with addressing information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ActorMessage {
-    Init { actor_key: RawKey },
-    Error { reason: String },
+    Init(RawKey),
+    Request(RemoteMessage),
+    Response(Result<RemoteMessage, RemoteMessageError>),
 }
 
 /// Member information for cluster state
@@ -279,8 +281,8 @@ pub enum ClusterMessage {
 pub enum Payload<T> {
     /// Successfully decoded payload
     Ok(T),
-    /// Failed to decode with reason
-    UnknownFailure(String),
+    /// An unhandled failure occurred.
+    UnhandledFailure(String),
 }
 
 impl<T> Payload<T> {
@@ -291,14 +293,14 @@ impl<T> Payload<T> {
 
     /// Returns true if the payload is an UnknownFailure
     pub fn is_failure(&self) -> bool {
-        matches!(self, Payload::UnknownFailure(_))
+        matches!(self, Payload::UnhandledFailure(_))
     }
 
     /// Returns the inner value if Ok, or None if failure
     pub fn ok(self) -> Option<T> {
         match self {
             Payload::Ok(value) => Some(value),
-            Payload::UnknownFailure(_) => None,
+            Payload::UnhandledFailure(_) => None,
         }
     }
 
@@ -306,7 +308,7 @@ impl<T> Payload<T> {
     pub fn as_ok(&self) -> Option<&T> {
         match self {
             Payload::Ok(value) => Some(value),
-            Payload::UnknownFailure(_) => None,
+            Payload::UnhandledFailure(_) => None,
         }
     }
 
@@ -314,7 +316,7 @@ impl<T> Payload<T> {
     pub fn failure_reason(&self) -> Option<&String> {
         match self {
             Payload::Ok(_) => None,
-            Payload::UnknownFailure(reason) => Some(reason),
+            Payload::UnhandledFailure(reason) => Some(reason),
         }
     }
 
@@ -326,7 +328,7 @@ impl<T> Payload<T> {
     {
         match self {
             Payload::Ok(value) => Payload::Ok(f(value)),
-            Payload::UnknownFailure(reason) => Payload::UnknownFailure(reason),
+            Payload::UnhandledFailure(reason) => Payload::UnhandledFailure(reason),
         }
     }
 }
@@ -347,7 +349,7 @@ where
     pub fn failure(sender_id: Id, target_id: Option<Id>, reason: String) -> Self {
         Frame {
             header: Header::new(sender_id, target_id),
-            payload: Payload::UnknownFailure(reason),
+            payload: Payload::UnhandledFailure(reason),
         }
     }
 

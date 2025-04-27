@@ -1,8 +1,8 @@
 use crate::actor::Registered;
+use crate::message::RemoteMessageError;
 use crate::net::NetworkAddrRef;
 use std::collections::{HashMap, HashSet};
 use std::{net::SocketAddr, sync::Arc};
-
 
 use super::node::*;
 use super::prelude::*;
@@ -70,7 +70,7 @@ impl From<&str> for ClusterId {
 }
 
 pub struct Config {
-    pub id: Arc<ClusterId>,
+    pub cluster_id: Arc<ClusterId>,
     pub bind_addr: SocketAddr,
     pub peers: Vec<NetworkAddrRef>,
     pub tls: TlsConfig,
@@ -131,7 +131,7 @@ impl ClusterActor {
     fn spawn_server(&self, endpoint: Endpoint<ClusterActor>) -> Result<(), ClusterError> {
         let socket = self.socket.clone();
         let cancellation = self.cancellation.clone();
-        tracing::info!(addr=%self.config.bind_addr, node_id=%self.config.id.name, "Starting cluster server");
+        tracing::info!(addr=%self.config.bind_addr, node_id=%self.config.cluster_id.name, "Starting cluster server");
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -158,7 +158,7 @@ impl Registered for ClusterActor {
 #[async_trait::async_trait]
 impl Actor for ClusterActor {
     async fn started(&mut self, ctx: &mut Context<Self>) {
-        tracing::info!(node_id=%self.config.id.name, "Cluster started");
+        tracing::info!(node_id=%self.config.cluster_id.name, "Cluster started");
         self.state = State::Starting;
         if let Err(err) = self.spawn_server(ctx.endpoint()) {
             tracing::error!(error=%err, "Failed to start cluster server");
@@ -170,7 +170,7 @@ impl Actor for ClusterActor {
         for peer in self.config.peers.iter() {
             let Some(member) = Node::spawn(
                 ctx.system(),
-                self.config.id.clone(),
+                self.config.cluster_id.clone(),
                 NodeInfo::from(peer.clone()),
                 self.socket.clone(),
                 self.config.tls.clone(),
@@ -219,7 +219,11 @@ impl Actor for ClusterActor {
 
 #[async_trait::async_trait]
 impl Handler<RemoteMessage> for ClusterActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: RemoteMessage) {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: RemoteMessage,
+    ) -> Result<RemoteMessage, RemoteMessageError> {
         tracing::info!(msg=?msg, "Received remote message");
         panic!("Remote message handling not implemented");
     }
@@ -247,7 +251,7 @@ impl Handler<NewIncomingConnection> for ClusterActor {
 impl Handler<NodeStatusUpdate> for ClusterActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: NodeStatusUpdate) {
         tracing::info!(
-            node_id=%msg.node_id,
+            node_id=%msg.id,
             status=?msg.status,
             reachability=?msg.reachability,
             is_configured=%msg.is_configured,
@@ -255,7 +259,7 @@ impl Handler<NodeStatusUpdate> for ClusterActor {
         );
 
         // Update the node's status in our tracking map
-        if let Some(node_status) = self.members.get_mut(&msg.node_id) {
+        if let Some(node_status) = self.members.get_mut(&msg.id) {
             node_status.status = msg.status;
             node_status.reachability = msg.reachability;
             node_status.last_updated = msg.timestamp;
@@ -265,11 +269,11 @@ impl Handler<NodeStatusUpdate> for ClusterActor {
                 && !node_status.is_configured
                 && matches!(node_status.reachability, Reachability::Unreachable { .. })
             {
-                tracing::info!(node_id=%msg.node_id, "Non-configured node is unreachable, marked for cleanup");
+                tracing::info!(node_id=%msg.id, "Non-configured node is unreachable, marked for cleanup");
                 // We'll let the cleanup interval task handle actual removal
             }
         } else {
-            tracing::warn!(node_id=%msg.node_id, "Received status update for unknown node");
+            tracing::warn!(node_id=%msg.id, "Received status update for unknown node");
         }
     }
 }
@@ -367,7 +371,7 @@ async fn accept_connection(
 // Message sent by a node actor to update its status
 #[derive(Debug, Clone)]
 pub struct NodeStatusUpdate {
-    pub node_id: Id,
+    pub id: Id,
     pub status: Status,
     pub reachability: Reachability,
     pub is_configured: bool, // Whether this node was in the initial configuration

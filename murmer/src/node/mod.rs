@@ -46,8 +46,12 @@ impl PartialEq for Reachability {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Pending, Self::Pending) => true,
-            (Self::Reachable { misses: s_m, .. }, Self::Reachable { misses: o_m, .. }) => s_m == o_m,
-            (Self::Unreachable { pings: s_p, .. }, Self::Unreachable { pings: o_p, .. }) => s_p == o_p,
+            (Self::Reachable { misses: s_m, .. }, Self::Reachable { misses: o_m, .. }) => {
+                s_m == o_m
+            }
+            (Self::Unreachable { pings: s_p, .. }, Self::Unreachable { pings: o_p, .. }) => {
+                s_p == o_p
+            }
             _ => false,
         }
     }
@@ -66,38 +70,31 @@ impl Reachability {
 
 #[derive(Clone)]
 pub struct NodeInfo {
-    pub name: String,
+    /// The name of the node.
+    pub display_name: String,
+    /// The network address of the node.
     pub addr: NetworkAddrRef,
-    pub node_id: Id,
 }
 
 impl NodeInfo {
     fn new(addr: NetworkAddrRef) -> Self {
         NodeInfo {
-            name: hostname::get()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "default".to_string()),
+            display_name: format!("{}", addr),
             addr,
-            node_id: Id::new(),
         }
     }
 
     fn new_with_name(name: impl Into<String>, addr: NetworkAddrRef) -> Self {
         NodeInfo {
-            name: name.into(),
+            display_name: name.into(),
             addr,
-            node_id: Id::new(),
         }
     }
 }
 
 impl std::fmt::Display for NodeInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "node(name={}, addr={}, node_id={})",
-            self.name, self.addr, self.node_id
-        )
+        write!(f, "node(name={}, addr={})", self.display_name, self.addr)
     }
 }
 
@@ -121,10 +118,10 @@ impl Node {
         socket: quinn::Endpoint,
         tls: TlsConfig,
     ) -> Option<Node> {
-        let id = node_info.node_id;
+        let id = Id::new();
 
         let driver = Box::new(QuicConnectionDriver::new(node_info.clone(), socket, tls));
-        let endpoint = system.spawn_with(NodeActor::new(cluster_id.id, node_info, driver));
+        let endpoint = system.spawn_with(NodeActor::new(cluster_id.id, id, node_info, driver));
         endpoint.map(|e| Node { id, endpoint: e }).ok()
     }
 }

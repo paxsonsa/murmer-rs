@@ -6,6 +6,7 @@ use std::pin::Pin;
 use super::actor::*;
 use bytes::Bytes;
 use dyn_clone::DynClone;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::context::Context;
@@ -138,16 +139,26 @@ where
     }
 }
 
+#[derive(thiserror::Error, Debug, Serialize, Deserialize)]
+pub enum RemoteMessageError {
+    /// Returned when the message type is not registered
+    #[error("Message type is not registered")]
+    InvalidType,
+    /// Returned when the message data cannot be deserialized
+    #[error("Message data cannot be deserialized")]
+    DeserializationError,
+}
+
 /// A special remote message that is used to send messages to remote actors
 /// through the networking layer.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RemoteMessage {
     pub type_name: String,
     pub message_data: Bytes,
 }
 
 impl Message for RemoteMessage {
-    type Result = ();
+    type Result = Result<RemoteMessage, RemoteMessageError>;
 }
 
 pub struct RecepientOf<M: Message> {

@@ -24,6 +24,7 @@ mod tls;
 #[cfg(test)]
 mod tests {
     use crate::actor::Registered;
+    use crate::message::RemoteMessageError;
     use crate::receptionist::StaticKey;
     use crate::system::SystemId;
     use crate::tls::TlsConfig;
@@ -163,7 +164,11 @@ mod tests {
 
     #[async_trait]
     impl Handler<RemoteMessage> for CounterActor {
-        async fn handle(&mut self, _ctx: &mut Context<Self>, _message: RemoteMessage) -> () {
+        async fn handle(
+            &mut self,
+            _ctx: &mut Context<Self>,
+            _message: RemoteMessage,
+        ) -> Result<RemoteMessage, RemoteMessageError> {
             panic!("RemoteMessage is not supported for CounterActor");
         }
     }
@@ -187,14 +192,14 @@ mod tests {
         // TODO: ReceptionistKey, ReceptionistStorage, ReceptionistActor
         init_tracing();
         let system_a = System::clustered(ClusterConfig {
-            id: Arc::new("A".into()),
+            cluster_id: Arc::new("A".into()),
             bind_addr: "127.0.0.1:7000".parse().unwrap(),
             peers: vec![], // No peers
             tls: TlsConfig::insecure(),
         })
         .expect("failed to create system");
         let system_b = System::clustered(ClusterConfig {
-            id: Arc::new("B".into()),
+            cluster_id: Arc::new("B".into()),
             bind_addr: "127.0.0.1:7001".parse().unwrap(),
             peers: vec!["127.0.0.1:7000".parse().unwrap()], // No peers
             tls: TlsConfig::insecure(),

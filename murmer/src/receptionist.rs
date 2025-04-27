@@ -333,7 +333,6 @@ pub struct ReceptionistActor {
     subscriptions: HashMap<String, HashMap<String, Vec<Subscriber>>>,
 }
 
-
 impl ReceptionistActor {}
 
 // Actor Implementation for Receptionist

@@ -1,4 +1,8 @@
-use crate::net::{self, FrameWriter, NetworkDriver};
+use crate::{
+    id::MaybeId,
+    net::{self, ActorMessage, FrameReader, FrameWriter, NetworkDriver},
+    receptionist::RawKey,
+};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
@@ -23,35 +27,44 @@ enum State {
 /// node in the cluster and managing proxies for actors on the remote node.
 ///
 pub struct NodeActor {
-    pub cluster_node_id: Id,
+    /// A unique identifier for host this actor is running on.
+    pub host_id: Id,
+    pub instance_id: Id,
+    pub remote_id: MaybeId,
     pub node_info: NodeInfo,
     pub driver: Box<dyn NetworkDriver>,
     pub membership: Status,
     pub reachability: Reachability,
     pub send_stream: Option<FrameWriter<net::NodeMessage>>,
     inner_state: State,
-    node_id: Option<Id>,
 }
 
 impl NodeActor {
-    pub fn new(id: Id, node_info: NodeInfo, driver: Box<dyn NetworkDriver>) -> Self {
+    pub fn new(
+        host_id: Id,
+        instance_id: Id,
+        node_info: NodeInfo,
+        driver: Box<dyn NetworkDriver>,
+    ) -> Self {
         NodeActor {
-            cluster_node_id: id,
+            host_id,
+            instance_id,
+            remote_id: MaybeId::unset(),
             node_info,
             driver,
             membership: Status::Pending,
             reachability: Reachability::Pending,
             send_stream: None,
             inner_state: State::Init,
-            node_id: None,
         }
     }
 
     // Send a status update to the cluster
+    #[tracing::instrument(skip(self, ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn update_status_and_notify(&mut self, ctx: &mut Context<Self>) {
         // Log the status change for debugging
         tracing::debug!(
-            node_id=%self.node_info.node_id,
+            id=%self.instance_id,
             status=?self.membership,
             reachability=?self.reachability,
             "Node status changed"
@@ -74,7 +87,7 @@ impl NodeActor {
 
             // Send the status update
             let status_update = crate::cluster::NodeStatusUpdate {
-                node_id: self.node_info.node_id,
+                id: self.instance_id.clone(),
                 status: self.membership.clone(),
                 reachability: self.reachability.clone(),
                 is_configured,
@@ -85,7 +98,7 @@ impl NodeActor {
                 tracing::error!(error=%err, "Failed to send status update to cluster");
             } else {
                 tracing::debug!(
-                    node_id=%self.node_info.node_id,
+                    instance=%self.instance_id,
                     "Successfully sent status update to cluster"
                 );
             }
@@ -95,9 +108,10 @@ impl NodeActor {
         }
     }
 
+    #[tracing::instrument(skip(self, message), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn send_message(&mut self, message: net::NodeMessage) -> Result<(), NodeError> {
         if let Some(ref mut stream) = self.send_stream {
-            let frame = net::Frame::ok(self.node_info.node_id, None, message);
+            let frame = net::Frame::ok(self.host_id.clone(), self.remote_id.get(), message);
             if let Err(e) = stream.write_frame(&frame).await {
                 tracing::error!(error=%e, "Failed to send message");
                 return Err(NodeError::NodeNetworkError(e));
@@ -108,9 +122,8 @@ impl NodeActor {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle_init_frame(&mut self, protocol_version: u16, id: Id) {
-        tracing::info!(protocol_version=%protocol_version, id=%id, "Received Init message");
-
         // Validate protocol version
         if protocol_version != net::CURRENT_PROTOCOL_VERSION {
             tracing::error!(
@@ -123,11 +136,11 @@ impl NodeActor {
         }
 
         // Store the remote node ID
-        self.node_id = Some(id);
+        self.remote_id = MaybeId::new(id);
 
         // Send InitAck response
         let init_ack = net::NodeMessage::InitAck {
-            node_id: self.node_info.node_id,
+            node_id: self.host_id.clone(),
         };
 
         // Send the InitAck message
@@ -141,14 +154,15 @@ impl NodeActor {
         self.reachability = Reachability::reachable_now();
     }
 
-    async fn handle_init_ack_frame(&mut self, node_id: Id) {
-        tracing::info!(node_id=%node_id, "Received InitAck");
+    #[tracing::instrument(skip(self), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
+    async fn handle_init_ack_frame(&mut self, remote_id: Id) {
+        tracing::info!("Received InitAck");
         let State::Init = self.inner_state else {
             tracing::error!("Invalid state for InitAck");
             // TODO: Send Error
             return;
         };
-        self.node_id = Some(node_id);
+        self.remote_id = MaybeId::new(remote_id);
         self.inner_state = State::InitAck;
         self.membership = Status::Joining;
         self.reachability = Reachability::reachable_now();
@@ -166,6 +180,7 @@ impl NodeActor {
         }
     }
 
+    #[tracing::instrument(skip(self, ctx, ping_time), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle_heartbeat_frame(&mut self, ctx: &mut Context<Self>, ping_time: DateTime<Utc>) {
         let old_reachability = self.reachability.clone();
         match self.reachability {
@@ -206,6 +221,7 @@ impl NodeActor {
         }
     }
 
+    #[tracing::instrument(skip(self, ctx, name, capabilities), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle_join_frame(
         &mut self,
         ctx: &mut Context<Self>,
@@ -232,12 +248,13 @@ impl NodeActor {
         }
 
         // Once we've accepted the join, the node is considered Up
-        self.node_info.name = name;
+        self.node_info.display_name = name;
         self.membership = Status::Up;
         self.inner_state = State::Running;
         self.update_status_and_notify(ctx).await;
     }
 
+    #[tracing::instrument(skip(self, ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle_join_ack_frame(
         &mut self,
         ctx: &mut Context<Self>,
@@ -308,6 +325,7 @@ impl NodeActor {
         });
     }
 
+    #[tracing::instrument(skip(self, ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle_disconnect_frame(&mut self, ctx: &mut Context<Self>, reason: String) {
         tracing::error!(reason=%reason, "Received Disconnect message"); // Use error level for visibility
 
@@ -330,8 +348,9 @@ impl NodeActor {
 
 #[async_trait::async_trait]
 impl Actor for NodeActor {
+    #[tracing::instrument(skip(self, ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn started(&mut self, ctx: &mut Context<Self>) {
-        tracing::info!(node_id=%self.node_info.node_id, "Member started");
+        tracing::info!("Member started");
 
         // Update membership state
         self.membership = Status::Pending;
@@ -369,7 +388,7 @@ impl Actor for NodeActor {
         // Send initial message
         let init = net::NodeMessage::Init {
             protocol_version: 1, // FIXME: Use a real protocol version
-            id: self.cluster_node_id,
+            host_id: self.host_id,
         };
         if let Err(err) = self.send_message(init).await {
             tracing::error!(error=%err, "Failed to send initial message");
@@ -379,10 +398,11 @@ impl Actor for NodeActor {
 
         // Start the receive loop for the main node stream
         let endpoint = ctx.endpoint();
-        let node_id = self.node_info.node_id;
+        let instance_id = self.instance_id.clone();
+        let host_id = self.host_id.clone();
         let mut running = true;
         ctx.spawn(async move {
-            let span = tracing::trace_span!("member-rx", node_id=%node_id);
+            let span = tracing::trace_span!("node-rx-loop", instance_id=%instance_id, host_id=%host_id);
             let _enter = span.enter();
             while running {
                 let frame = match stream_rx.read_frame().await {
@@ -424,6 +444,7 @@ impl Message for NodeActorRecvFrameMessage {
 
 #[async_trait]
 impl Handler<NodeActorRecvFrameMessage> for NodeActor {
+    #[tracing::instrument(skip(self, ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorRecvFrameMessage) {
         tracing::info!("Received frame");
         let frame = match msg.0 {
@@ -438,7 +459,7 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
 
         let msg = match payload {
             net::Payload::Ok(msg) => msg,
-            net::Payload::UnknownFailure(reason) => {
+            net::Payload::UnhandledFailure(reason) => {
                 tracing::error!(reason=%reason, "Received failure message");
                 return;
             }
@@ -447,8 +468,8 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
         match msg {
             net::NodeMessage::Init {
                 protocol_version,
-                id,
-            } => self.handle_init_frame(protocol_version, id).await,
+                host_id,
+            } => self.handle_init_frame(protocol_version, host_id).await,
             net::NodeMessage::InitAck { node_id } => {
                 tracing::info!(?node_id, "Received InitAck");
                 // Handle this message asynchronously
@@ -484,6 +505,7 @@ impl Message for NodeActorSendHeartbeatMessage {
 
 #[async_trait]
 impl Handler<NodeActorSendHeartbeatMessage> for NodeActor {
+    #[tracing::instrument(skip(self, _ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle(&mut self, _ctx: &mut Context<Self>, _msg: NodeActorSendHeartbeatMessage) {
         // Only send heartbeats if we're in an appropriate state
         if matches!(self.membership, Status::Up | Status::Joining)
@@ -529,6 +551,7 @@ impl Message for NodeActorHeartbeatCheckMessage {
 #[async_trait]
 impl Handler<NodeActorHeartbeatCheckMessage> for NodeActor {
     /// Check the reachability of the node and update the reachability state accordingly.
+    #[tracing::instrument(skip(self, ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorHeartbeatCheckMessage) {
         let timestamp = msg.timestamp;
         let old_reachability = self.reachability.clone();
@@ -614,18 +637,23 @@ impl Message for NodeActorAcceptStreamMessage {
 
 #[async_trait]
 impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
+    #[tracing::instrument(skip(self, ctx), fields(instance_id = %self.instance_id, remote_id = %self.remote_id))]
     async fn handle(&mut self, ctx: &mut Context<Self>, msg: NodeActorAcceptStreamMessage) {
         // Handle the accepted stream
         let stream = msg.0;
         tracing::info!("Accepted new actor stream from remote node");
 
-        let (_tx, rx) = stream.into_frame_stream::<net::ActorMessage>();
+        let (tx, rx) = stream.into_frame_stream::<net::ActorMessage>();
 
+        let endpoint = ctx.endpoint();
         let receptionist = ctx.system().receptionist_ref().clone();
 
         // Spawn a background task to wait for the initial stream message for the proxy.
+        let node_id = self.host_id.clone();
+        let remote_id = self.remote_id.get().unwrap();
         ctx.spawn(async move {
             let mut stream_rx = rx;
+            let stream_tx = tx;
             let frame = match stream_rx.read_frame().await {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
@@ -637,19 +665,149 @@ impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
                     return;
                 }
             };
-            let net::Payload::Ok(net::ActorMessage::Init { actor_key }) = frame.payload else {
+            let net::Payload::Ok(net::ActorMessage::Init(actor_key)) = frame.payload else {
                 tracing::error!("Invalid initial message");
                 return;
             };
 
             // Look up the actor key in the receptionist
-            let Ok(_endpoint) = receptionist
-                .lookup_one_recepient_of::<RemoteMessage>(actor_key)
+            let Ok(recepient) = receptionist
+                .lookup_one_recepient_of::<RemoteMessage>(actor_key.clone())
                 .await
             else {
                 tracing::error!("Actor key not found in receptionist");
                 return;
             };
+
+            // Create the LocalProxy for the actor and let it handle the stream.
+            let local_proxy = LocalProxy::new(
+                actor_key,
+                node_id,
+                remote_id,
+                endpoint.clone(),
+                recepient,
+                stream_rx,
+                stream_tx,
+            );
+            endpoint.send_in_background(NodeActorAddLocalProxyMessage(local_proxy));
+            // TODO: Implement Accept Connection version of NodeActor
+            // TODO: Implement RemoteProxy and handle the stream
+            // TODO: Implement ActorAdd/ActorRemove messages, need to think about this actor path
+            // stuff with the receptionist key and host names.
         });
+    }
+}
+
+#[derive(Debug)]
+struct NodeActorAddLocalProxyMessage(LocalProxy);
+
+impl Message for NodeActorAddLocalProxyMessage {
+    type Result = ();
+}
+
+#[async_trait]
+impl Handler<NodeActorAddLocalProxyMessage> for NodeActor {
+    async fn handle(&mut self, ctx: &mut Context<Self>, message: NodeActorAddLocalProxyMessage) {
+        let local_proxy = message.0;
+
+        tracing::info!(?local_proxy, "Adding local proxy");
+        let _ = ctx.spawn(local_proxy.open());
+    }
+}
+
+struct LocalProxy {
+    actor_key: RawKey,
+    node_id: Id,
+    remote_id: Id,
+    node_endpoint: Endpoint<NodeActor>,
+    recepient: RecepientOf<RemoteMessage>,
+    stream_rx: FrameReader<net::ActorMessage>,
+    stream_tx: FrameWriter<net::ActorMessage>,
+}
+
+impl LocalProxy {
+    fn new(
+        actor_key: RawKey,
+        node_id: Id,
+        remote_id: Id,
+        node_endpoint: Endpoint<NodeActor>,
+        recepient: RecepientOf<RemoteMessage>,
+        stream_rx: FrameReader<ActorMessage>,
+        stream_tx: FrameWriter<ActorMessage>,
+    ) -> Self {
+        Self {
+            actor_key,
+            node_endpoint,
+            node_id,
+            remote_id,
+            recepient,
+            stream_rx,
+            stream_tx,
+        }
+    }
+
+    pub async fn open(mut self) {
+        loop {
+            let frame = match self.stream_rx.read_frame().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    tracing::error!("Stream closed before reading message");
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error=%e, "Failed to read stream");
+                    return;
+                }
+            };
+
+            let actor_msg = match frame.payload {
+                net::Payload::Ok(msg) => msg,
+                net::Payload::UnhandledFailure(reason) => {
+                    tracing::error!(reason=%reason, "Received failure message");
+                    continue;
+                }
+            };
+
+            let response = match actor_msg {
+                ActorMessage::Init(_) => {
+                    tracing::error!("Received unexpected Init message");
+                    // TODO: Send Error.
+                    continue;
+                }
+                ActorMessage::Request(msg) => {
+                    tracing::info!(?msg, "Received message");
+                    let Ok(result) = self.recepient.send(msg).await else {
+                        tracing::error!("Failed to send message to recepient");
+                        // TODO: Send an error
+                        continue;
+                    };
+                    result
+                }
+                ActorMessage::Response(_) => {
+                    // Ignore Response Messages.
+                    tracing::error!("Received unexpected response message.");
+                    // TODO: Send an error
+                    continue;
+                }
+            };
+
+            let frame = net::Frame::ok(
+                self.node_id.clone(),
+                Some(self.remote_id.clone()),
+                ActorMessage::Response(response),
+            );
+            if let Err(e) = self.stream_tx.write_frame(&frame).await {
+                tracing::error!(error=%e, "Failed to send message");
+                break;
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalProxy")
+            .field("actor_key", &self.actor_key)
+            .finish()
     }
 }

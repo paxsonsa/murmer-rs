@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 
 use super::*;
 use crate::actor::Registered as RegisteredActor;
+use crate::message::RemoteMessageError;
 use crate::prelude::*;
 use crate::system::EndpointSender;
 
@@ -16,7 +17,11 @@ impl RegisteredActor for FakeActor {
 
 #[async_trait::async_trait]
 impl Handler<RemoteMessage> for FakeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, _message: RemoteMessage) -> () {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        _message: RemoteMessage,
+    ) -> Result<RemoteMessage, RemoteMessageError> {
         panic!("RemoteMessage is not supported for FakeActor");
     }
 }

@@ -15,9 +15,9 @@ async fn test_node_actor_with_harness() {
     // Create and initialize the node actor
     let mut actor = test.spawn(NodeActor::new(
         Id::new(),
+        Id::new(),
         NodeInfo {
-            name: "test".to_string(),
-            node_id: Id::new(),
+            display_name: "test".to_string(),
             addr: NetworkAddrRef::from("127.0.0.1:8000"),
         },
         Box::new(MockNetworkDriver),

@@ -353,7 +353,7 @@ where
         &self.actor
     }
 
-    #[tracing::instrument(skip(ctx))]
+    #[tracing::instrument(level = "trace", skip(ctx))]
     async fn handle_command(&mut self, ctx: &mut Context<A>, cmd: SupervisorCommand<A>) -> bool {
         match cmd {
             SupervisorCommand::Message(envelope) => {
@@ -395,7 +395,7 @@ where
         self.actor.stopped(&mut ctx).await;
     }
 
-    #[tracing::instrument(skip(ctx))]
+    #[tracing::instrument(level = "trace", skip(ctx))]
     async fn tick(&mut self, ctx: &mut Context<A>) {
         if let Some(cmd) = self.mailbox.recv().await {
             tracing::trace!(?cmd, "command received");

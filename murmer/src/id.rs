@@ -3,6 +3,35 @@ use std::fmt::Display;
 
 use uuid::Uuid;
 
+pub struct MaybeId(pub Option<Id>);
+
+impl MaybeId {
+    pub fn new(id: Id) -> Self {
+        Self(Some(id))
+    }
+
+    pub fn unset() -> Self {
+        Self(None)
+    }
+
+    pub fn get(&self) -> Option<Id> {
+        self.0
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Display for MaybeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(ref id) => write!(f, "{}", id),
+            None => write!(f, "unset"),
+        }
+    }
+}
+
 /// Unique identifier type within the system
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Id(uuid::Uuid);
