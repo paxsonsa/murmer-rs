@@ -6,6 +6,7 @@
 pub use super::actor::{
     Actor,       // Core actor trait
     Handler,     // Message handling trait
+    Registered,  // Receptionist registration trait
     async_trait, // Async trait macro
 };
 pub use super::cluster::{
@@ -31,3 +32,12 @@ pub use super::system::{
 };
 
 pub use super::receptionist::{Key, Listing, Receptionist};
+
+// Remote actor support
+pub use super::remote::{
+    ActorTypeRegistration,         // Registration for actor types
+    MessageTypeRegistration,       // Registration for message types
+    RemoteMessageType,             // Trait for remote-capable messages
+    RemoteRegistered,              // Enhanced registration for remote actors
+    RemoteProxy,                   // Trait for creating remote actor proxies
+};

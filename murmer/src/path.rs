@@ -32,6 +32,8 @@ impl AddressScheme {
     const REMOTE_SCHEME: &'static str = "remote";
 }
 
+// TODO: Implement a group key that aligns with the receptionist key format of that is
+// scheme://reception_id/group_id/instance_id
 impl ActorPath {
     pub fn local(type_path: String, instance_id: Id) -> Self {
         Self {
@@ -80,6 +82,9 @@ impl<'de> serde::Deserialize<'de> for ActorPath {
 
 impl fmt::Display for ActorPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TODO: Change this to be 'murmur://<scheme>/root_key/group_key/instance_id'
+        // So a remote actor is: murmur://127.0.0.1:4000/actorA/default/12345
+        // and local actor is: murmur://local/actorA/default/12345
         match &self.scheme {
             AddressScheme::Local => {
                 write!(

@@ -40,7 +40,6 @@ pub struct NodeActor {
     pub membership: Status,
     pub reachability: Reachability,
     pub send_stream: Option<FrameWriter<net::NodeMessage>>,
-    local_proxies: Vec<LocalProxy>,
     inner_state: State,
 }
 
@@ -60,7 +59,6 @@ impl NodeActor {
             membership: Status::Pending,
             reachability: Reachability::Pending,
             send_stream: None,
-            local_proxies: Vec::new(),
             inner_state: State::Init,
         }
     }
@@ -526,8 +524,53 @@ impl Handler<NodeActorRecvFrameMessage> for NodeActor {
             net::NodeMessage::Disconnect { reason } => {
                 self.handle_disconnect_frame(ctx, reason).await;
             }
-            net::NodeMessage::ActorAdd { actor_path: _ } => {}
-            net::NodeMessage::ActorRemove { actor_path: _ } => {}
+            net::NodeMessage::ActorAdd { key, instance_id } => {
+                // Handle remote actor registration - after proxy is established
+                let Some(remote_id) = self.remote_id.get() else {
+                    tracing::error!("remote node ID is not set, cannot add actor.");
+                    return;
+                };
+                
+                // Open a stream to the remote actor
+                let raw_stream = match self.driver.open_stream().await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::error!(error=%e, "Failed to open stream for actor add");
+                        return;
+                    }
+                };
+
+                let endpoint = ctx.endpoint();
+                let receptionist = ctx.system().receptionist_ref().clone();
+                let node_info = self.node_info.clone();
+                let host_id = self.host_id.clone();
+                let (stream_tx, stream_rx) = raw_stream.into_frame_stream::<net::ActorMessage>();
+
+                // We'll spawn the proxy opening and let it handle registration
+                // only after successfully establishing the connection
+                ctx.spawn(async move {
+                    // First establish the proxy connection
+                    if let Err(e) = RemoteProxy::open_and_register(
+                        host_id,
+                        endpoint,
+                        remote_id,
+                        key,
+                        instance_id,
+                        stream_tx,
+                        stream_rx,
+                        receptionist,
+                        node_info,
+                    ).await {
+                        tracing::error!(error=%e, "Failed to establish remote actor proxy");
+                    }
+                });
+            }
+            net::NodeMessage::ActorRemove { .. } => {
+                // TODO: Remove the remote actor proxy
+                // - Remove the proxy from the receptionist
+                // - Close the stream to the remote node
+                // - Delete remote actor proxy
+            }
         }
     }
 }
@@ -732,9 +775,9 @@ impl Handler<NodeActorAcceptStreamMessage> for NodeActor {
                 tracing::error!(error=%err, "Failed to send local proxy message, discarding stream");
                 return;
             }
-            // TODO: Implement RemoteProxy and handle the stream
             // TODO: Implement ActorAdd/ActorRemove messages, need to think about this actor path
             // stuff with the receptionist key and host names.
+            // TODO: Implement RemoteProxy and handle the stream
             // TODO: Create Seperate Node Actor generic for Accepting vs Connecting action
             // TODO: Simplify th connection set to be a simple two sided init and join.
         });
@@ -754,7 +797,236 @@ impl Handler<NodeActorAddLocalProxyMessage> for NodeActor {
         let local_proxy = message.0;
 
         tracing::info!(?local_proxy, "Adding local proxy");
-        let cancellation = ctx.spawn(local_proxy.open());
+        let _ = ctx.spawn(local_proxy.open());
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteProxyError {
+    #[error("Node network error: {0}")]
+    NodeNetworkError(#[from] net::NetError),
+    #[error("Not connected to remote node")]
+    NotConnected,
+    #[error("Failed to register remote actor")]
+    RegistrationFailed,
+    #[error("Error registering remote actor: {0}")]
+    RegistrationError(String),
+}
+
+struct RemoteProxy {
+    host_id: Id,
+    node_endpoint: Endpoint<NodeActor>,
+    actor_key: RawKey,
+    remote_id: Id,
+    instance_id: Id,
+    stream_tx: FrameWriter<net::ActorMessage>,
+    stream_rx: FrameReader<net::ActorMessage>,
+}
+
+impl RemoteProxy {
+    pub async fn open(
+        host_id: Id,
+        node_endpoint: Endpoint<NodeActor>,
+        remote_id: Id,
+        actor_key: RawKey,
+        instance_id: Id,
+        stream_tx: FrameWriter<net::ActorMessage>,
+        stream_rx: FrameReader<net::ActorMessage>,
+    ) {
+        let mut proxy = Self {
+            host_id,
+            node_endpoint,
+            actor_key,
+            remote_id,
+            instance_id,
+            stream_tx,
+            stream_rx,
+        };
+        if let Err(err) = proxy.init().await {
+            tracing::error!(error=%err, "Failed to initialize remote proxy");
+            return;
+        }
+        // TODO: Start main loop for remote proxy.
+    }
+    
+    /// Opens a remote proxy and registers it with the receptionist
+    /// only after successfully establishing the connection
+    pub async fn open_and_register(
+        host_id: Id,
+        node_endpoint: Endpoint<NodeActor>,
+        remote_id: Id,
+        actor_key: RawKey,
+        instance_id: Id,
+        stream_tx: FrameWriter<net::ActorMessage>,
+        stream_rx: FrameReader<net::ActorMessage>,
+        receptionist: crate::receptionist::Receptionist,
+        node_info: crate::node::NodeInfo,
+    ) -> Result<(), RemoteProxyError> {
+        // Create proxy message channel for EndpointSender to communicate with this RemoteProxy
+        let (_proxy_tx, proxy_rx) = tokio::sync::mpsc::channel::<crate::remote::RemoteProxyMessage>(32);
+        
+        // Create and initialize the proxy
+        let mut proxy = Self {
+            host_id: host_id.clone(),
+            node_endpoint,
+            actor_key: actor_key.clone(),
+            remote_id,
+            instance_id: instance_id.clone(),
+            stream_tx,
+            stream_rx,
+        };
+        
+        // Initialize the proxy connection
+        proxy.init().await?;
+        
+        // Only register after successful initialization
+        // Extract node connection info for the actor path
+        let remote_addr = node_info.addr.clone();
+        
+        // Create the actor path for this remote actor
+        let remote_path = crate::path::ActorPath::remote(
+            remote_addr.host().to_string(),
+            remote_addr.port(),
+            actor_key.receptionist_key().to_string(),
+            instance_id.clone(),
+        );
+        
+        // Register with the receptionist
+        match receptionist.register_remote(
+            actor_key.clone(),
+            remote_path.clone(),
+            actor_key.receptionist_key().to_string(),
+        ).await {
+            Ok(true) => {
+                tracing::info!(
+                    "Registered remote actor: {} with key: {:?}",
+                    actor_key.receptionist_key(), actor_key
+                );
+                
+                // Start main loop for remote proxy in a new task
+                let path_clone = remote_path.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = proxy.run(proxy_rx, path_clone).await {
+                        tracing::error!(error=%e, "Error in RemoteProxy loop");
+                    }
+                });
+                
+                Ok(())
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    "Failed to register remote actor: {} with key: {:?}",
+                    actor_key.receptionist_key(), actor_key
+                );
+                Err(RemoteProxyError::RegistrationFailed)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error=%e,
+                    "Error registering remote actor: {} with key: {:?}",
+                    actor_key.receptionist_key(), actor_key
+                );
+                Err(RemoteProxyError::RegistrationError(e.to_string()))
+            }
+        }
+    }
+
+    async fn init(&mut self) -> Result<(), RemoteProxyError> {
+        // Send the init frame for the actor
+        let init_frame = net::Frame::ok(
+            self.host_id.clone(),
+            Some(self.remote_id.clone()),
+            net::ActorMessage::Init(self.actor_key.clone()),
+        );
+
+        if let Err(e) = self.stream_tx.write_frame(&init_frame).await {
+            tracing::error!(error=%e, "Failed to send message");
+            // TODO: Send Node Actor Update
+            return Err(RemoteProxyError::NodeNetworkError(e));
+        }
+        Ok(())
+    }
+    
+    /// Main processing loop for the RemoteProxy
+    /// 
+    /// This method processes incoming messages from local actors through the proxy_rx channel
+    /// and forwards them to the remote actor, then waits for responses.
+    /// 
+    /// This implementation handles one request at a time serially, with a timeout.
+    async fn run(
+        &mut self, 
+        mut proxy_rx: tokio::sync::mpsc::Receiver<crate::remote::RemoteProxyMessage>,
+        actor_path: ActorPath
+    ) -> Result<(), RemoteProxyError> {
+        use crate::remote::RemoteProxyMessage;
+        use tokio::time::{timeout, Duration};
+        
+        // Default timeout for waiting for responses
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+        
+        tracing::info!(path=?actor_path, "Starting RemoteProxy loop");
+        
+        // Main processing loop
+        while let Some(proxy_msg) = proxy_rx.recv().await {
+            match proxy_msg {
+                RemoteProxyMessage::SendMessage { message, response_tx } => {
+                    // Create a frame with the message
+                    let frame = net::Frame::ok(
+                        self.host_id.clone(),
+                        Some(self.remote_id.clone()),
+                        net::ActorMessage::Request(message),
+                    );
+                    
+                    // Send the message to the remote actor
+                    if let Err(e) = self.stream_tx.write_frame(&frame).await {
+                        tracing::error!(error=%e, "Failed to send message to remote actor");
+                        let _ = response_tx.send(Err(crate::message::RemoteMessageError::DeserializationError));
+                        continue;
+                    }
+                    
+                    // Wait for the response with a timeout
+                    match timeout(RESPONSE_TIMEOUT, self.stream_rx.read_frame()).await {
+                        Ok(read_result) => match read_result {
+                            Ok(Some(response_frame)) => {
+                                match response_frame.payload {
+                                    net::Payload::Ok(net::ActorMessage::Response(result)) => {
+                                        // Send the result back
+                                        let _ = response_tx.send(result);
+                                    },
+                                    net::Payload::UnhandledFailure(reason) => {
+                                        tracing::error!(reason=%reason, "Received failure response");
+                                        let _ = response_tx.send(Err(crate::message::RemoteMessageError::DeserializationError));
+                                    },
+                                    _ => {
+                                        tracing::warn!("Received unexpected message type in response");
+                                        let _ = response_tx.send(Err(crate::message::RemoteMessageError::DeserializationError));
+                                    }
+                                }
+                            },
+                            Ok(None) => {
+                                // Stream closed
+                                tracing::info!("Remote actor stream closed");
+                                let _ = response_tx.send(Err(crate::message::RemoteMessageError::DeserializationError));
+                                break;
+                            },
+                            Err(e) => {
+                                tracing::error!(error=%e, "Error reading from stream");
+                                let _ = response_tx.send(Err(crate::message::RemoteMessageError::DeserializationError));
+                                return Err(RemoteProxyError::NodeNetworkError(e));
+                            }
+                        },
+                        Err(_) => {
+                            // Timeout waiting for response
+                            tracing::error!("Timeout waiting for response from remote actor");
+                            let _ = response_tx.send(Err(crate::message::RemoteMessageError::DeserializationError));
+                        }
+                    }
+                }
+            }
+        }
+        
+        tracing::info!(path=?actor_path, "Stopped RemoteProxy loop");
+        Ok(())
     }
 }
 

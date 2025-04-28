@@ -18,6 +18,7 @@ use crate::{
 };
 use crate::{
     message::RecepientOf,
+    path::ActorPath,
     system::{AnyEndpoint, Endpoint},
 };
 
@@ -31,7 +32,7 @@ mod tests;
 pub struct RawKey {
     /// The string identifier for this key
     receptionist_key: String,
-    /// The unique identifier for this instance
+    /// The unique identifier for this group of actors
     group_id: String,
 }
 
@@ -49,6 +50,16 @@ impl RawKey {
             receptionist_key: key,
             group_id,
         }
+    }
+    
+    /// Gets the receptionist key (type identifier)
+    pub fn receptionist_key(&self) -> &str {
+        &self.receptionist_key
+    }
+    
+    /// Gets the group identifier
+    pub fn group_id(&self) -> &str {
+        &self.group_id
     }
 }
 
@@ -210,7 +221,7 @@ struct Registration {
     endpoint: AnyEndpoint,
     /// The string key under which this actor is registered
     key: String,
-    /// The instance id for this actor instance
+    /// The group id for this actor instance
     group_id: String,
 }
 
@@ -327,9 +338,9 @@ impl<T: RegisteredActor> Stream for ListingSubscription<T> {
 /// The core actor that manages service discovery and registration
 #[derive(Default)]
 pub struct ReceptionistActor {
-    /// Nested map of type ID -> key -> set of registrations
+    /// Nested map of receptionist ID -> group_key -> set of registrations
     registrations: HashMap<String, HashMap<String, HashSet<Registration>>>,
-    /// Nested map of type ID -> key -> list of subscribers
+    /// Nested map of receptionist ID -> group_key -> list of subscribers
     subscriptions: HashMap<String, HashMap<String, Vec<Subscriber>>>,
 }
 
@@ -371,6 +382,30 @@ where
     }
 }
 
+/// Message to register a remote actor with the receptionist
+pub struct RegisterRemote {
+    /// The key under which to register the actor
+    pub key: RawKey,
+    /// The path to the remote actor
+    pub actor_path: ActorPath,
+    /// The actor type identifier for looking up in the registry
+    pub actor_type: String,
+}
+
+impl Message for RegisterRemote {
+    type Result = bool;
+}
+
+impl std::fmt::Debug for RegisterRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterRemote")
+            .field("key", &self.key)
+            .field("path", &self.actor_path)
+            .field("type", &self.actor_type)
+            .finish()
+    }
+}
+
 #[async_trait::async_trait]
 impl<T: RegisteredActor> Handler<Register<T>> for ReceptionistActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: Register<T>) -> bool {
@@ -399,6 +434,61 @@ impl<T: RegisteredActor> Handler<Register<T>> for ReceptionistActor {
         }
 
         true
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<RegisterRemote> for ReceptionistActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: RegisterRemote) -> bool {
+        let key = msg.key.receptionist_key().to_string();
+        let group_id = msg.key.group_id().to_string();
+        
+        // Find the actor type registration in the inventory
+        let mut registered = false;
+        
+        for registration in inventory::iter::<crate::remote::ActorTypeRegistration>() {
+            if registration.key == msg.actor_type {
+                // Create a dummy channel for testing purposes
+                // In a real implementation, this would be a channel to the RemoteProxy
+                let (proxy_tx, _) = tokio::sync::mpsc::channel(32);
+                
+                // Create the AnyEndpoint using the factory function
+                let endpoint = (registration.create_endpoint)(msg.actor_path, proxy_tx);
+                
+                // Register the endpoint
+                let registration = Registration {
+                    endpoint,
+                    key: key.clone(),
+                    group_id: group_id.clone(),
+                };
+                
+                self.registrations
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(group_id.clone())
+                    .or_default()
+                    .insert(registration);
+                
+                registered = true;
+                break;
+            }
+        }
+        
+        // Notify subscribers if we successfully registered
+        if registered {
+            if let Some(subs) = self.subscriptions.get(&key) {
+                if let Some(_subscribers) = subs.get(&group_id) {
+                    // We would normally notify with the new endpoint, but we don't have it here
+                    // Instead, we'll skip notification for now
+                    // This is a limitation of our approach
+                    tracing::debug!("Remote actor registered but subscribers not notified");
+                }
+            }
+        } else {
+            tracing::error!("Failed to register remote actor: type not found in registry");
+        }
+        
+        registered
     }
 }
 
@@ -669,6 +759,24 @@ impl Receptionist {
             .send(Register {
                 key: key.into(),
                 endpoint: endpoint.clone(),
+            })
+            .await
+    }
+    
+    /// Register a remote actor with the receptionist using actor path and type information
+    pub async fn register_remote(
+        &self,
+        key: RawKey,
+        actor_path: ActorPath, 
+        actor_type: String,
+    ) -> Result<bool, SendError> {
+        // Rather than sending the AnyEndpoint itself (which isn't Clone),
+        // we send the information needed to create one
+        self.inner_endpoint
+            .send(RegisterRemote {
+                key,
+                actor_path,
+                actor_type,
             })
             .await
     }

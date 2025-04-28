@@ -106,6 +106,24 @@ impl std::fmt::Display for NetworkAddr {
 #[derive(Clone)]
 pub struct NetworkAddrRef(pub Arc<NetworkAddr>);
 
+impl NetworkAddrRef {
+    /// Gets the host portion of the address
+    pub fn host(&self) -> &str {
+        match &*self.0 {
+            NetworkAddr::HostPort(host, _) => host,
+            NetworkAddr::Socket(addr) => "127.0.0.1", // Default host for socket addresses
+        }
+    }
+    
+    /// Gets the port number, or a default port if not specified
+    pub fn port(&self) -> u16 {
+        match &*self.0 {
+            NetworkAddr::HostPort(_, port) => *port,
+            NetworkAddr::Socket(addr) => addr.port(),
+        }
+    }
+}
+
 impl FromStr for NetworkAddrRef {
     type Err = String;
 
@@ -225,10 +243,13 @@ pub enum NodeMessage {
         reason: String,
     },
     ActorAdd {
-        actor_path: ActorPath,
+        key: RawKey,
+        instance_id: Id,
     },
     ActorRemove {
+        key: RawKey,
         actor_path: ActorPath,
+        instance_id: Id,
     },
 }
 

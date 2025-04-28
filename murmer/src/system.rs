@@ -689,13 +689,15 @@ impl<A: Actor> Debug for Endpoint<A> {
 /// Type-erased version of an Endpoint that can hold any actor type
 pub struct AnyEndpoint {
     // Box containing the type-erased endpoint sender
-    endpoint_sender: Box<dyn Any + Send + Sync>,
+    pub endpoint_sender: Box<dyn Any + Send + Sync>,
     // Type ID for runtime type checking during downcasting
-    type_id: TypeId,
+    pub type_id: TypeId,
     // Type name for better debugging and error messages
-    type_name: &'static str,
+    pub type_name: &'static str,
     // Actor's path in the system
-    path: Arc<ActorPath>,
+    pub path: Arc<ActorPath>,
+    // Optional string identifier for remote actor types
+    pub actor_type_string: Option<String>,
 }
 
 impl<A: Actor> From<Endpoint<A>> for AnyEndpoint {
@@ -705,6 +707,28 @@ impl<A: Actor> From<Endpoint<A>> for AnyEndpoint {
             type_id: TypeId::of::<A>(),
             type_name: std::any::type_name::<A>(),
             path: endpoint.path.clone(),
+            actor_type_string: None,
+        }
+    }
+}
+
+impl AnyEndpoint {
+    /// Creates a new AnyEndpoint from a remote actor
+    pub fn from_remote<A: Actor>(path: ActorPath, proxy: Box<dyn Any + Send + Sync>) -> Self {
+        let type_string = match path.is_remote() {
+            true => {
+                // For remote actors, use the type_id field from ActorPath
+                Some(path.type_id.to_string())
+            }
+            false => None,
+        };
+
+        Self {
+            endpoint_sender: proxy,
+            type_id: TypeId::of::<A>(),
+            type_name: std::any::type_name::<A>(),
+            path: Arc::new(path),
+            actor_type_string: type_string,
         }
     }
 }
@@ -714,38 +738,119 @@ impl Debug for AnyEndpoint {
         f.debug_struct("AnyEndpoint")
             .field("type_id", &format!("{:?}", self.type_id))
             .field("type_name", &self.type_name)
+            .field("actor_type", &self.actor_type_string)
             .finish()
     }
 }
 
 impl AnyEndpoint {
-    /// Attempt to downcast the AnyEndpoint back to a specific Endpoint<A> type
-    pub fn downcast<A: Actor + 'static>(&self) -> Option<Endpoint<A>> {
+    /// Private method to downcast only by TypeId, without attempting remote resolution
+    fn direct_downcast<A: Actor + 'static>(&self) -> Option<Endpoint<A>> {
         if self.type_id == TypeId::of::<A>() {
-            self.endpoint_sender
+            return self.endpoint_sender
                 .downcast_ref::<EndpointSender<A>>()
                 .map(|b| {
                     let sender = b.clone();
-                    Endpoint::new(sender.clone(), self.path.clone())
-                })
-        } else {
-            None
+                    Endpoint::new(sender, self.path.clone())
+                });
         }
+        None
     }
 
-    /// Attempt to downcast the AnyEndpoint back to a specific Endpoint<A> type, consuming self
-    pub fn into_downcast<A: Actor + 'static>(self) -> Option<Endpoint<A>> {
+    /// Attempt to downcast the AnyEndpoint back to a specific Endpoint<A> type
+    pub fn downcast<A: Actor + 'static>(&self) -> Option<Endpoint<A>> {
+        // For local actors - try direct TypeId-based downcasting
+        if self.path.is_local() {
+            return self.direct_downcast::<A>();
+        }
+        
+        // For remote actors - use the actor_type_string with inventory lookup
+        if self.path.is_remote() {
+            // First try direct downcast in case the types match
+            if let Some(endpoint) = self.direct_downcast::<A>() {
+                return Some(endpoint);
+            }
+            
+            // Check if A implements RegisteredActor first
+            if let Some(receptionist_key) = self.actor_type_string.as_ref() {
+                // Search the inventory for a matching registration
+                for registration in inventory::iter::<crate::remote::ActorTypeRegistration>() {
+                    if registration.key == receptionist_key {
+                        // For testing purposes, we'll create a dummy channel
+                        // In a real implementation, this would come from somewhere else
+                        let (proxy_tx, _) = tokio::sync::mpsc::channel(32);
+                        
+                        // Found matching registration, create typed endpoint using the proxy channel
+                        let any_endpoint = (registration.create_endpoint)((*self.path).clone(), proxy_tx);
+                        
+                        // Use direct downcast to prevent infinite recursion
+                        return any_endpoint.direct_downcast::<A>();
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+
+    /// Private method to downcast only by TypeId, without attempting remote resolution
+    fn direct_into_downcast<A: Actor + 'static>(self) -> Option<Endpoint<A>> {
         if self.type_id == TypeId::of::<A>() {
-            self.endpoint_sender
+            return self.endpoint_sender
                 .downcast::<EndpointSender<A>>()
                 .ok()
                 .map(|b| {
                     let sender = *b;
                     Endpoint::new(sender, self.path.clone())
-                })
-        } else {
-            None
+                });
         }
+        None
+    }
+
+    /// Attempt to downcast the AnyEndpoint back to a specific Endpoint<A> type, consuming self
+    pub fn into_downcast<A: Actor + 'static>(self) -> Option<Endpoint<A>> {
+        // For local actors - try direct TypeId-based downcasting
+        if self.path.is_local() {
+            return self.direct_into_downcast::<A>();
+        }
+        
+        // For remote actors - use the actor_type_string with inventory lookup
+        if self.path.is_remote() {
+            // First try direct downcast in case the types match
+            if self.type_id == TypeId::of::<A>() {
+                return self.direct_into_downcast::<A>();
+            }
+            
+            // Extract necessary information before moving self
+            let actor_path = self.path.clone();
+            let actor_type_string = self.actor_type_string;
+            
+            // Check if A implements RegisteredActor first
+            if let Some(receptionist_key) = actor_type_string {
+                // Search the inventory for a matching registration
+                for registration in inventory::iter::<crate::remote::ActorTypeRegistration>() {
+                    if registration.key == receptionist_key {
+                        // Clone path for each iteration
+                        let path_clone = (*actor_path).clone();
+                        
+                        // For testing purposes, we'll create a dummy channel
+                        // In a real implementation, this would come from somewhere else
+                        let (proxy_tx, _) = tokio::sync::mpsc::channel(32);
+                        
+                        // Found matching registration, create typed endpoint
+                        let any_endpoint = (registration.create_endpoint)(path_clone, proxy_tx);
+                        
+                        // Use direct downcast to prevent infinite recursion
+                        let endpoint_result = any_endpoint.direct_downcast::<A>();
+                        if let Some(endpoint) = endpoint_result {
+                            return Some(endpoint);
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
     }
 
     pub fn path(&self) -> &ActorPath {
@@ -756,12 +861,28 @@ impl AnyEndpoint {
     where
         M: Message + 'static,
     {
-        self.endpoint_sender
-            .downcast_ref::<Box<dyn MessageSender<M>>>()
-            .map(|b| {
-                let sender = (*b).clone();
-                RecepientOf::new(sender)
-            })
+        // For local actors - try direct downcasting
+        if !self.path.is_remote() {
+            if let Some(sender) = self.endpoint_sender
+                .downcast_ref::<Box<dyn MessageSender<M>>>()
+                .map(|b| (*b).clone())
+            {
+                return Some(RecepientOf::new(sender));
+            }
+        }
+        
+        // For remote actors, we just return None for now until we have a better design
+        // In the future, we'll need to implement a more robust system for remote actor
+        // communication that can handle type erasure and the RemoteMessageType trait
+        
+        // Comment explaining future direction:
+        // To handle remote actors properly, we'd need to:
+        // 1. Get a proxy channel from the actor registry
+        // 2. Verify that M implements RemoteMessageType 
+        // 3. Create a TypedRemoteEndpointSender<M>
+        // 4. Return it wrapped in RecepientOf
+        
+        None
     }
 }
 
