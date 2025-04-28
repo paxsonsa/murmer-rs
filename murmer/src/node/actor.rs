@@ -888,6 +888,7 @@ impl RemoteProxy {
             remote_addr.host().to_string(),
             remote_addr.port(),
             actor_key.receptionist_key().to_string(),
+            actor_key.group_id().to_string(),
             instance_id.clone(),
         );
         

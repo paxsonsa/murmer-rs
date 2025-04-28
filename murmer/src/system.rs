@@ -435,7 +435,7 @@ where
 {
     pub fn new(actor: A) -> Self {
         let id = Id::new();
-        let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
+        let path = Arc::new(ActorPath::local_default(std::any::type_name::<A>().to_string(), id));
         let (runtime, sender) = SupervisorRuntime::construct(path.clone(), actor);
         let cancellation = tokio_util::sync::CancellationToken::new();
 
@@ -547,7 +547,7 @@ where
 {
     fn construct(actor: A) -> Supervisor<A, Uninitialized<A>> {
         let id = Id::new();
-        let path = Arc::new(ActorPath::local(std::any::type_name::<A>().to_string(), id));
+        let path = Arc::new(ActorPath::local_default(std::any::type_name::<A>().to_string(), id));
 
         let (runtime, mailbox_sender) = SupervisorRuntime::construct(path.clone(), actor);
         Supervisor {

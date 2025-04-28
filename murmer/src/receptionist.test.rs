@@ -30,7 +30,7 @@ impl Actor for FakeActor {}
 
 /// Helper function to create a simple endpoint for a FakeActor
 fn create_endpoint(name: &str) -> Endpoint<FakeActor> {
-    let path = Arc::new(ActorPath::local(name.to_string(), Id::new()));
+    let path = Arc::new(ActorPath::local_default(name.to_string(), Id::new()));
     let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let sender = EndpointSender::<FakeActor>::from_channel(tx);
     Endpoint::new(sender, path)
@@ -38,7 +38,7 @@ fn create_endpoint(name: &str) -> Endpoint<FakeActor> {
 
 /// Helper function to create a direct endpoint for a FakeActor
 fn create_direct_endpoint(name: &str) -> Endpoint<FakeActor> {
-    let path = Arc::new(ActorPath::local(name.to_string(), Id::new()));
+    let path = Arc::new(ActorPath::local_default(name.to_string(), Id::new()));
     let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let sender = EndpointSender::<FakeActor>::from_channel(tx);
     let endpoint = Endpoint::new(sender, path.clone());
@@ -50,7 +50,7 @@ fn create_direct_endpoint(name: &str) -> Endpoint<FakeActor> {
 
 /// Helper function to create a receptionist context
 fn create_receptionist_context() -> Context<ReceptionistActor> {
-    let path = Arc::new(ActorPath::local("receptionist".to_string(), Id::new()));
+    let path = Arc::new(ActorPath::local_default("receptionist".to_string(), Id::new()));
     let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let sender = EndpointSender::from_channel(tx);
     let endpoint = Endpoint::new(sender, path);
