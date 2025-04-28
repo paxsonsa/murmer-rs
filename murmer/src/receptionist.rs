@@ -406,6 +406,27 @@ impl std::fmt::Debug for RegisterRemote {
     }
 }
 
+/// Message to deregister a remote actor from the receptionist
+pub struct DeregisterRemote {
+    /// The key under which the actor is registered
+    pub key: RawKey,
+    /// The path to the remote actor
+    pub actor_path: ActorPath,
+}
+
+impl Message for DeregisterRemote {
+    type Result = bool;
+}
+
+impl std::fmt::Debug for DeregisterRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeregisterRemote")
+            .field("key", &self.key)
+            .field("path", &self.actor_path)
+            .finish()
+    }
+}
+
 #[async_trait::async_trait]
 impl<T: RegisteredActor> Handler<Register<T>> for ReceptionistActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: Register<T>) -> bool {
@@ -489,6 +510,75 @@ impl Handler<RegisterRemote> for ReceptionistActor {
         }
         
         registered
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<DeregisterRemote> for ReceptionistActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: DeregisterRemote) -> bool {
+        let key = msg.key.receptionist_key().to_string();
+        let group_id = msg.key.group_id().to_string();
+        
+        tracing::debug!(
+            ?key, ?group_id, path=?msg.actor_path,
+            "Deregistering remote actor"
+        );
+        
+        // Find registrations for this key/group
+        let removed = if let Some(groups) = self.registrations.get_mut(&key) {
+            if let Some(registrations) = groups.get_mut(&group_id) {
+                // Remove registrations with a matching actor path
+                
+                // Since Registration isn't cloneable (AnyEndpoint isn't), we need to take a different approach
+                // for removing elements from a HashSet based on a predicate
+                
+                // Get the count before removal
+                let prev_count = registrations.len();
+                
+                // Create a new HashSet to hold the registrations we want to keep
+                let mut new_registrations = HashSet::new();
+                
+                // Only retain registrations that don't match the path we're looking for
+                for reg in registrations.drain() {
+                    let registry_path = format!("{:?}", reg);
+                    if !registry_path.contains(&format!("{:?}", msg.actor_path)) {
+                        new_registrations.insert(reg);
+                    }
+                }
+                
+                // Replace the old set with our filtered set
+                *registrations = new_registrations;
+                
+                // Return true if we removed any registrations
+                prev_count > registrations.len()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        
+        if removed {
+            tracing::info!(
+                key=%key, group_id=%group_id, path=?msg.actor_path,
+                "Successfully deregistered remote actor"
+            );
+            
+            // Notify subscribers about the removal
+            if let Some(subs) = self.subscriptions.get(&key) {
+                if let Some(_subscribers) = subs.get(&group_id) {
+                    // We would normally notify of the removal, but we don't have that functionality yet
+                    tracing::debug!("Remote actor deregistered but subscribers not notified");
+                }
+            }
+        } else {
+            tracing::warn!(
+                key=%key, group_id=%group_id, path=?msg.actor_path,
+                "No matching remote actor found to deregister"
+            );
+        }
+        
+        removed
     }
 }
 
@@ -777,6 +867,21 @@ impl Receptionist {
                 key,
                 actor_path,
                 actor_type,
+            })
+            .await
+    }
+    
+    /// Deregister a remote actor from the receptionist
+    pub async fn deregister_remote(
+        &self,
+        key: RawKey,
+        actor_path: ActorPath,
+    ) -> Result<bool, SendError> {
+        // Send information to identify and deregister the remote actor
+        self.inner_endpoint
+            .send(DeregisterRemote {
+                key,
+                actor_path,
             })
             .await
     }

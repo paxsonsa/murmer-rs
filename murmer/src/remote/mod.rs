@@ -28,6 +28,8 @@ pub enum RemoteProxyMessage {
         /// Response channel
         response_tx: tokio::sync::oneshot::Sender<Result<crate::message::RemoteMessage, crate::message::RemoteMessageError>>,
     },
+    /// Signal the RemoteProxy to shut down
+    Shutdown,
 }
 
 /// Registration for actor types in the inventory system
