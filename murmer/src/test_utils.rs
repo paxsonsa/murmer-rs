@@ -84,6 +84,10 @@ impl<A: Actor> ActorTestHandle<A> {
         self.supervisor.actor_ref()
     }
 
+    pub fn actor_ref_mut(&mut self) -> &mut A {
+        self.supervisor.actor_ref_mut()
+    }
+
     /// Start the actor
     pub async fn start(&mut self) {
         self.supervisor.started().await;

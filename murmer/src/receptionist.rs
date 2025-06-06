@@ -1,23 +1,15 @@
-use futures::Stream;
-use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    fmt,
-    marker::PhantomData,
-    pin::Pin,
-    sync::Arc,
-    task::Poll,
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
 };
-
-use tokio::sync::mpsc;
 
 use crate::message::{Message, SendError};
 use crate::{
-    actor::{Actor, Handler, Registered as RegisteredActor},
+    actor::{Actor, Handler},
     context::Context,
 };
 use crate::{
-    message::RecepientOf,
     path::ActorPath,
     system::{AnyEndpoint, Endpoint},
 };
@@ -26,788 +18,262 @@ use crate::{
 #[path = "receptionist.test.rs"]
 mod tests;
 
-/// A raw key used for registering and looking up actors when you
-/// cannot utilize a type-safe key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawKey {
-    /// The string identifier for this key
-    receptionist_key: String,
-    /// The unique identifier for this group of actors
-    group_id: String,
+/// Factory trait for creating endpoints on demand
+pub trait EndpointFactory: Send + Sync + 'static {
+    fn create(&self) -> AnyEndpoint;
+    fn clone_factory(&self) -> Box<dyn EndpointFactory>;
 }
 
-impl RawKey {
-    /// Creates a new raw key with the given type ID and group identifier
-    pub fn new(receptionist_id: String) -> Self {
+/// A lazy endpoint that can create the actual endpoint on demand
+#[derive(Clone)]
+struct LazyEndpoint {
+    /// Cached endpoint, created on first access
+    endpoint: Arc<Mutex<Option<AnyEndpoint>>>,
+    /// Factory function to create the endpoint when needed
+    endpoint_factory: Box<dyn EndpointFactory>,
+}
+
+impl LazyEndpoint {
+    /// Create a new lazy endpoint with an existing endpoint (for local actors)
+    fn from_endpoint(endpoint: AnyEndpoint) -> Self {
         Self {
-            receptionist_key: receptionist_id,
-            group_id: "default".to_string(),
+            endpoint: Arc::new(Mutex::new(Some(endpoint))),
+            endpoint_factory: Box::new(NoOpFactory),
         }
     }
 
-    pub fn new_with_id(key: String, group_id: String) -> Self {
+    /// Create a new lazy endpoint with a factory (for remote actors)
+    fn from_factory(factory: Box<dyn EndpointFactory>) -> Self {
         Self {
-            receptionist_key: key,
-            group_id,
-        }
-    }
-    
-    /// Gets the receptionist key (type identifier)
-    pub fn receptionist_key(&self) -> &str {
-        &self.receptionist_key
-    }
-    
-    /// Gets the group identifier
-    pub fn group_id(&self) -> &str {
-        &self.group_id
-    }
-}
-
-impl<T: RegisteredActor> From<&Key<T>> for RawKey {
-    fn from(key: &Key<T>) -> Self {
-        Self {
-            receptionist_key: T::RECEPTIONIST_KEY.to_string(),
-            group_id: key.group_id.to_string(),
-        }
-    }
-}
-/// A static type-safe key used for registering and looking up actors
-///
-/// Keys are used to identify groups of actors of the same type registered
-/// with the receptionist.
-pub struct StaticKey<T: RegisteredActor> {
-    /// The unique identifier for this key
-    group_id: &'static str,
-    /// Phantom data to maintain type information
-    _phantom: PhantomData<T>,
-}
-
-impl<T: RegisteredActor> StaticKey<T> {
-    /// Creates a new key with the given static string identifier
-    pub const fn new(group_id: &'static str) -> Self {
-        Self {
-            group_id,
-            _phantom: PhantomData,
+            endpoint: Arc::new(Mutex::new(None)),
+            endpoint_factory: factory,
         }
     }
 
-    /// Creates a new key with some identifier
-    pub const fn default() -> Self {
-        Self {
-            group_id: "default",
-            _phantom: PhantomData,
+    /// Get the endpoint, creating it if necessary
+    fn get_endpoint(&self) -> AnyEndpoint {
+        let mut endpoint_guard = self.endpoint.lock().unwrap();
+        if endpoint_guard.is_none() {
+            *endpoint_guard = Some(self.endpoint_factory.create());
         }
+        endpoint_guard.as_ref().unwrap().clone()
     }
 }
 
-impl<T: RegisteredActor> fmt::Debug for StaticKey<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StaticKey")
-            .field("family_id", &T::RECEPTIONIST_KEY)
-            .finish()
-    }
-}
-
-impl<T: RegisteredActor> Clone for StaticKey<T> {
+impl Clone for Box<dyn EndpointFactory> {
     fn clone(&self) -> Self {
-        Self {
-            group_id: self.group_id,
-            _phantom: PhantomData,
-        }
+        self.clone_factory()
     }
 }
 
-impl<T: RegisteredActor> From<StaticKey<T>> for RawKey {
-    fn from(val: StaticKey<T>) -> Self {
-        RawKey::new_with_id(T::RECEPTIONIST_KEY.to_string(), val.group_id.to_string())
+/// No-op factory for endpoints that are already created
+struct NoOpFactory;
+
+impl EndpointFactory for NoOpFactory {
+    fn create(&self) -> AnyEndpoint {
+        panic!("NoOpFactory should never be called - endpoint should already exist")
+    }
+
+    fn clone_factory(&self) -> Box<dyn EndpointFactory> {
+        Box::new(NoOpFactory)
     }
 }
 
-/// A type-safe key used for registering and looking up actors
-///
-/// Keys are used to identify groups of actors of the same type registered
-/// with the receptionist.
-pub struct Key<T: RegisteredActor> {
-    /// The unique identifier for this key
-    group_id: String,
-    /// Phantom data to maintain type information
-    _phantom: PhantomData<T>,
+/// Placeholder factory for backward compatibility
+struct PlaceholderFactory {
+    path: ActorPath,
 }
 
-impl<T: RegisteredActor> Key<T> {
-    /// Creates a new key with the given static string identifier
-    pub fn new<S: Into<String>>(group_id: S) -> Self {
-        Self {
-            group_id: group_id.into(),
-            _phantom: PhantomData,
-        }
+impl EndpointFactory for PlaceholderFactory {
+    fn create(&self) -> AnyEndpoint {
+        panic!(
+            "PlaceholderFactory for path {:?} was called - this should be replaced with a proper remote endpoint factory",
+            self.path
+        )
     }
 
-    /// Creates a new key with some identifier
-    pub fn default() -> Self {
-        Self {
-            group_id: "default".into(),
-            _phantom: PhantomData,
-        }
+    fn clone_factory(&self) -> Box<dyn EndpointFactory> {
+        Box::new(PlaceholderFactory {
+            path: self.path.clone(),
+        })
     }
 }
 
-impl<T: RegisteredActor> fmt::Debug for Key<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Key")
-            .field("family_id", &T::RECEPTIONIST_KEY)
-            .finish()
-    }
-}
-
-impl<T: RegisteredActor> Clone for Key<T> {
-    fn clone(&self) -> Self {
-        Self {
-            group_id: self.group_id.clone(),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T: RegisteredActor> From<Key<T>> for RawKey {
-    fn from(val: Key<T>) -> Self {
-        RawKey::new_with_id(T::RECEPTIONIST_KEY.to_string(), val.group_id)
-    }
-}
-
-impl<T: RegisteredActor> From<StaticKey<T>> for Key<T> {
-    fn from(key: StaticKey<T>) -> Self {
-        Self {
-            group_id: key.group_id.to_string(),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-/// Updates sent to subscribers when actors are registered or deregistered
-pub enum ListingUpdate<T: RegisteredActor> {
-    /// Indicates a new actor has been registered
-    Registered(Endpoint<T>),
-    /// Indicates an actor has been deregistered
-    Deregistered(Endpoint<T>),
-}
-
-/// Type-erased version of ListingUpdate used internally
-enum AnyListingUpdate {
-    /// A new registration with type-erased endpoint
-    Registered(AnyEndpoint),
-    /// A deregistration with type-erased endpoint
-    Deregistered(AnyEndpoint),
-}
-
-impl AnyListingUpdate {
-    /// Attempts to convert a type-erased update into a typed update
-    /// Returns None if the type conversion fails
-    fn into_typed<T: RegisteredActor>(self) -> Option<ListingUpdate<T>> {
-        match self {
-            Self::Registered(endpoint) => endpoint.into_downcast().map(ListingUpdate::Registered),
-            Self::Deregistered(endpoint) => {
-                endpoint.into_downcast().map(ListingUpdate::Deregistered)
-            }
-        }
-    }
-}
-
-/// Internal representation of an actor registration.
-/// Stores the type-erased endpoint along with its key and type information.
-#[derive(Debug)]
-struct Registration {
-    /// The type-erased endpoint of the registered actor
-    endpoint: AnyEndpoint,
-    /// The string key under which this actor is registered
-    key: String,
-    /// The group id for this actor instance
-    group_id: String,
-}
-
-impl PartialEq for Registration {
+impl PartialEq for LazyEndpoint {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        // For equality, we compare the actual endpoints if available
+        // This is a simplified comparison - in practice you might want to compare paths
+        std::ptr::eq(self.endpoint.as_ref(), other.endpoint.as_ref())
     }
 }
 
-impl Eq for Registration {}
+impl Eq for LazyEndpoint {}
 
-impl std::hash::Hash for Registration {
+impl std::hash::Hash for LazyEndpoint {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.key.hash(state);
-        self.endpoint.path().hash(state);
+        // Hash based on the pointer to the Arc - this is a simplified approach
+        std::ptr::hash(self.endpoint.as_ref(), state);
     }
 }
 
-/// Message to subscribe to registration updates for a specific key
-pub struct Subscribe<T: RegisteredActor> {
-    /// The key to subscribe to
-    pub key: RawKey,
-
-    /// The type of the actor to subscribe to
-    pub _phantom: PhantomData<T>,
-}
-
-impl<T: RegisteredActor> Message for Subscribe<T> {
-    type Result = Option<ListingSubscription<T>>;
-}
-
-impl<T> std::fmt::Debug for Subscribe<T>
-where
-    T: RegisteredActor,
-{
+impl std::fmt::Debug for LazyEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subscribe").field("key", &self.key).finish()
+        f.debug_struct("LazyEndpoint")
+            .field("has_endpoint", &self.endpoint.lock().unwrap().is_some())
+            .finish()
     }
 }
 
-/// Internal type representing a subscription to registration updates
-struct Subscriber {
-    /// Thread-safe callback function to handle registration updates
-    notify: Arc<Box<dyn Fn(AnyListingUpdate) + Send + Sync>>,
+/// Entry representing a registered actor
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Entry {
+    actor_path: ActorPath,
+    endpoint: LazyEndpoint,
 }
 
-impl Subscriber {
-    /// Creates a new subscriber with a channel for receiving typed updates
-    fn new<T: RegisteredActor>() -> (Self, mpsc::Receiver<ListingUpdate<T>>) {
-        let (tx, rx) = mpsc::channel(32);
-        let notify: Arc<Box<dyn Fn(AnyListingUpdate) + Send + Sync>> =
-            Arc::new(Box::new(move |update: AnyListingUpdate| {
-                if let Some(typed_update) = update.into_typed() {
-                    let _ = tx.try_send(typed_update);
-                }
-            }));
-
-        (Self { notify }, rx)
-    }
-
-    /// Notifies the subscriber of a new registration update
-    fn notify(&self, update: AnyListingUpdate) {
-        (self.notify)(update)
-    }
-}
-
-/// A stream of listing updates for a specific key.
-/// A subscription to registration updates for a specific key
-///
-/// Provides a stream of updates about actor registrations and deregistrations.
-/// Initially yields all existing registrations before streaming live updates.
-pub struct ListingSubscription<T: RegisteredActor> {
-    /// Queue of initial endpoints to yield as Registered events
-    initial: VecDeque<Endpoint<T>>,
-
-    /// The key this subscription is monitoring
-    key: RawKey,
-
-    /// Channel for receiving ongoing subscription updates
-    receiver: mpsc::Receiver<ListingUpdate<T>>,
-}
-
-impl<T: RegisteredActor> ListingSubscription<T> {
-    /// Returns the key this subscription is monitoring
-    pub fn key(&self) -> Key<T> {
-        Key::new(self.key.group_id.clone())
-    }
-
-    /// Attempts to get the next update without blocking
-    /// Returns None if no update is available
-    pub fn some_next(&mut self) -> Option<ListingUpdate<T>> {
-        if let Some(endpoint) = self.initial.pop_front() {
-            return Some(ListingUpdate::Registered(endpoint));
-        }
-        self.receiver.try_recv().ok()
-    }
-}
-
-impl<T: RegisteredActor> Stream for ListingSubscription<T> {
-    type Item = ListingUpdate<T>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        if let Some(endpoint) = self.initial.pop_front() {
-            return Poll::Ready(Some(ListingUpdate::Registered(endpoint)));
-        }
-
-        Pin::new(&mut self.receiver).poll_recv(cx)
-    }
-}
-
-/// The core actor that manages service discovery and registration
-#[derive(Default)]
 pub struct ReceptionistActor {
-    /// Nested map of receptionist ID -> group_key -> set of registrations
-    registrations: HashMap<String, HashMap<String, HashSet<Registration>>>,
-    /// Nested map of receptionist ID -> group_key -> list of subscribers
-    subscriptions: HashMap<String, HashMap<String, Vec<Subscriber>>>,
+    /// Map of the actors registered with the receptionist.
+    /// This stores the actors under their actor type key.
+    registered_actors: HashMap<String, HashSet<Entry>>,
 }
 
-impl ReceptionistActor {}
+impl Default for ReceptionistActor {
+    fn default() -> Self {
+        Self {
+            registered_actors: HashMap::new(),
+        }
+    }
+}
 
-// Actor Implementation for Receptionist
-
-impl Actor for ReceptionistActor {}
-
-/// Message indicating successful registration of an actor
-pub struct Registered<T: RegisteredActor> {
-    /// The endpoint of the registered actor
-    pub actor: Endpoint<T>,
-    /// The key under which the actor was registered
-    pub key: RawKey,
+impl Actor for ReceptionistActor {
+    const ACTOR_TYPE_KEY: &'static str = "system.receptionist";
 }
 
 /// Message to register an actor with the receptionist
-pub struct Register<T: RegisteredActor> {
-    /// The endpoint of the actor to register
-    pub endpoint: Endpoint<T>,
-    /// The key under which to register the actor
-    pub key: RawKey,
+pub struct RegisterMessage {
+    /// The actor path of the actor to register
+    pub path: ActorPath,
+    /// Optional endpoint for local actors, None for remote actors that will be created lazily
+    pub endpoint: Option<AnyEndpoint>,
+    /// Optional factory for creating remote endpoints
+    pub endpoint_factory: Option<Box<dyn EndpointFactory>>,
 }
 
-impl<T: RegisteredActor> Message for Register<T> {
-    type Result = bool;
-}
-
-impl<T> std::fmt::Debug for Register<T>
-where
-    T: RegisteredActor,
-{
+impl std::fmt::Debug for RegisterMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Register")
-            .field("key", &self.key)
-            .field("endpoint", &self.endpoint)
+        f.debug_struct("RegisterMessage")
+            .field("path", &self.path)
+            .field("has_endpoint", &self.endpoint.is_some())
+            .field("has_factory", &self.endpoint_factory.is_some())
             .finish()
     }
 }
 
-/// Message to register a remote actor with the receptionist
-pub struct RegisterRemote {
-    /// The key under which to register the actor
-    pub key: RawKey,
-    /// The path to the remote actor
-    pub actor_path: ActorPath,
-    /// The actor type identifier for looking up in the registry
-    pub actor_type: String,
-}
+impl RegisterMessage {
+    /// Create a registration message for a local actor with an existing endpoint
+    pub fn local(path: ActorPath, endpoint: AnyEndpoint) -> Self {
+        Self {
+            path,
+            endpoint: Some(endpoint),
+            endpoint_factory: None,
+        }
+    }
 
-impl Message for RegisterRemote {
-    type Result = bool;
-}
-
-impl std::fmt::Debug for RegisterRemote {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegisterRemote")
-            .field("key", &self.key)
-            .field("path", &self.actor_path)
-            .field("type", &self.actor_type)
-            .finish()
+    /// Create a registration message for a remote actor with a factory
+    pub fn remote(path: ActorPath, factory: Box<dyn EndpointFactory>) -> Self {
+        Self {
+            path,
+            endpoint: None,
+            endpoint_factory: Some(factory),
+        }
     }
 }
 
-/// Message to deregister a remote actor from the receptionist
-pub struct DeregisterRemote {
-    /// The key under which the actor is registered
-    pub key: RawKey,
-    /// The path to the remote actor
-    pub actor_path: ActorPath,
-}
-
-impl Message for DeregisterRemote {
+impl Message for RegisterMessage {
     type Result = bool;
 }
 
-impl std::fmt::Debug for DeregisterRemote {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeregisterRemote")
-            .field("key", &self.key)
-            .field("path", &self.actor_path)
-            .finish()
-    }
-}
+#[async_trait]
+impl Handler<RegisterMessage> for ReceptionistActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: RegisterMessage) -> bool {
+        let actor_path = msg.path.clone();
+        let key = msg.path.type_id.to_string();
 
-#[async_trait::async_trait]
-impl<T: RegisteredActor> Handler<Register<T>> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: Register<T>) -> bool {
-        let key = T::RECEPTIONIST_KEY.to_string();
-        let group_id = msg.key.group_id;
-        let registration = Registration {
-            endpoint: msg.endpoint.clone().into(),
-            key: key.clone(),
-            group_id: group_id.clone(),
+        let lazy_endpoint = if let Some(endpoint) = msg.endpoint {
+            LazyEndpoint::from_endpoint(endpoint)
+        } else if let Some(factory) = msg.endpoint_factory {
+            LazyEndpoint::from_factory(factory)
+        } else {
+            tracing::error!("RegisterMessage must have either endpoint or endpoint_factory");
+            return false;
         };
 
-        self.registrations
-            .entry(key.clone())
-            .or_default()
-            .entry(group_id.clone())
-            .or_default()
-            .insert(registration);
+        let entry = Entry {
+            actor_path,
+            endpoint: lazy_endpoint,
+        };
 
-        // Notify subscribers
-        if let Some(subs) = self.subscriptions.get(&key) {
-            if let Some(subscribers) = subs.get(&group_id) {
-                for subscriber in subscribers {
-                    subscriber.notify(AnyListingUpdate::Registered(msg.endpoint.clone().into()));
-                }
-            }
-        }
+        self.registered_actors
+            .entry(key)
+            .or_insert_with(HashSet::new)
+            .insert(entry);
 
         true
     }
 }
 
-#[async_trait::async_trait]
-impl Handler<RegisterRemote> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: RegisterRemote) -> bool {
-        let key = msg.key.receptionist_key().to_string();
-        let group_id = msg.key.group_id().to_string();
-        
-        // Find the actor type registration in the inventory
-        let mut registered = false;
-        
-        for registration in inventory::iter::<crate::remote::ActorTypeRegistration>() {
-            if registration.key == msg.actor_type {
-                // Create a dummy channel for testing purposes
-                // In a real implementation, this would be a channel to the RemoteProxy
-                let (proxy_tx, _) = tokio::sync::mpsc::channel(32);
-                
-                // Create the AnyEndpoint using the factory function
-                let endpoint = (registration.create_endpoint)(msg.actor_path, proxy_tx);
-                
-                // Register the endpoint
-                let registration = Registration {
-                    endpoint,
-                    key: key.clone(),
-                    group_id: group_id.clone(),
-                };
-                
-                self.registrations
-                    .entry(key.clone())
-                    .or_default()
-                    .entry(group_id.clone())
-                    .or_default()
-                    .insert(registration);
-                
-                registered = true;
-                break;
-            }
-        }
-        
-        // Notify subscribers if we successfully registered
-        if registered {
-            if let Some(subs) = self.subscriptions.get(&key) {
-                if let Some(_subscribers) = subs.get(&group_id) {
-                    // We would normally notify with the new endpoint, but we don't have it here
-                    // Instead, we'll skip notification for now
-                    // This is a limitation of our approach
-                    tracing::debug!("Remote actor registered but subscribers not notified");
-                }
-            }
-        } else {
-            tracing::error!("Failed to register remote actor: type not found in registry");
-        }
-        
-        registered
-    }
+/// Message to deregister an actor from the receptionist
+#[derive(Debug)]
+pub struct DeregisterMessage {
+    /// The actor path of the actor to deregister
+    pub path: ActorPath,
 }
 
-#[async_trait::async_trait]
-impl Handler<DeregisterRemote> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: DeregisterRemote) -> bool {
-        let key = msg.key.receptionist_key().to_string();
-        let group_id = msg.key.group_id().to_string();
-        
-        tracing::debug!(
-            ?key, ?group_id, path=?msg.actor_path,
-            "Deregistering remote actor"
-        );
-        
-        // Find registrations for this key/group
-        let removed = if let Some(groups) = self.registrations.get_mut(&key) {
-            if let Some(registrations) = groups.get_mut(&group_id) {
-                // Remove registrations with a matching actor path
-                
-                // Since Registration isn't cloneable (AnyEndpoint isn't), we need to take a different approach
-                // for removing elements from a HashSet based on a predicate
-                
-                // Get the count before removal
-                let prev_count = registrations.len();
-                
-                // Create a new HashSet to hold the registrations we want to keep
-                let mut new_registrations = HashSet::new();
-                
-                // Only retain registrations that don't match the path we're looking for
-                for reg in registrations.drain() {
-                    let registry_path = format!("{:?}", reg);
-                    if !registry_path.contains(&format!("{:?}", msg.actor_path)) {
-                        new_registrations.insert(reg);
-                    }
-                }
-                
-                // Replace the old set with our filtered set
-                *registrations = new_registrations;
-                
-                // Return true if we removed any registrations
-                prev_count > registrations.len()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        
-        if removed {
-            tracing::info!(
-                key=%key, group_id=%group_id, path=?msg.actor_path,
-                "Successfully deregistered remote actor"
-            );
-            
-            // Notify subscribers about the removal
-            if let Some(subs) = self.subscriptions.get(&key) {
-                if let Some(_subscribers) = subs.get(&group_id) {
-                    // We would normally notify of the removal, but we don't have that functionality yet
-                    tracing::debug!("Remote actor deregistered but subscribers not notified");
-                }
-            }
-        } else {
-            tracing::warn!(
-                key=%key, group_id=%group_id, path=?msg.actor_path,
-                "No matching remote actor found to deregister"
-            );
-        }
-        
-        removed
-    }
-}
-
-pub struct Deregister<T: RegisteredActor> {
-    pub endpoint: Endpoint<T>,
-    pub key: RawKey,
-}
-
-impl<T: RegisteredActor> Message for Deregister<T> {
+impl Message for DeregisterMessage {
     type Result = bool;
 }
 
-impl<T> std::fmt::Debug for Deregister<T>
-where
-    T: RegisteredActor,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Deregister")
-            .field("key", &self.key)
-            .field("endpoint", &self.endpoint)
-            .finish()
+#[async_trait]
+impl Handler<DeregisterMessage> for ReceptionistActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: DeregisterMessage) -> bool {
+        let key = msg.path.type_id.to_string();
+
+        if let Some(entries) = self.registered_actors.get_mut(&key) {
+            let original_len = entries.len();
+            entries.retain(|entry| entry.actor_path != msg.path);
+            entries.len() < original_len
+        } else {
+            false
+        }
     }
 }
 
-#[async_trait::async_trait]
-impl<T: RegisteredActor> Handler<Deregister<T>> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: Deregister<T>) -> bool {
-        let key = T::RECEPTIONIST_KEY.to_string();
-        let group_id = msg.key.group_id;
-
-        let registration = Registration {
-            endpoint: msg.endpoint.clone().into(),
-            key: key.to_string(),
-            group_id: group_id.clone(),
-        };
-
-        // Deregister the given endpoint for the given key
-        self.registrations
-            .get_mut(&key)
-            .and_then(|regs| regs.get_mut(&group_id))
-            .and_then(|set| set.remove(&registration).then_some(()))
-            .map(|_| {
-                // Notify subscribers
-                if let Some(subs) = self.subscriptions.get(&key) {
-                    if let Some(subscribers) = subs.get(&group_id) {
-                        for subscriber in subscribers {
-                            subscriber.notify(AnyListingUpdate::Deregistered(
-                                msg.endpoint.clone().into(),
-                            ));
-                        }
-                    }
-                }
-                ()
-            })
-            // Return whether the endpoint was deregistered
-            .is_some()
-    }
-}
-
-/// Contains the result of a lookup operation, including all registered endpoints for a key
+/// Message to lookup actors by type key
 #[derive(Debug)]
-pub struct Listing<T: RegisteredActor> {
-    /// Vector of all registered endpoints for the given key and type
-    pub endpoints: Vec<Endpoint<T>>,
-    /// The key used for the lookup
-    pub key: RawKey,
+pub struct LookupMessage {
+    /// The actor type key to lookup
+    pub actor_type_key: String,
 }
 
-/// Message to look up all actors registered under a specific key
-pub struct Lookup<T: RegisteredActor> {
-    /// The key to look up
-    pub key: RawKey,
-    /// The type of the actor to look up
-    pub _phantom: PhantomData<T>,
+impl Message for LookupMessage {
+    type Result = Vec<AnyEndpoint>;
 }
 
-impl<T: RegisteredActor> Message for Lookup<T> {
-    type Result = Option<Listing<T>>;
-}
-
-impl<T> std::fmt::Debug for Lookup<T>
-where
-    T: RegisteredActor,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Lookup").field("key", &self.key).finish()
-    }
-}
-
-#[async_trait::async_trait]
-impl<T: RegisteredActor> Handler<Lookup<T>> for ReceptionistActor {
-    async fn handle(&mut self, _: &mut Context<Self>, msg: Lookup<T>) -> Option<Listing<T>> {
-        let key = T::RECEPTIONIST_KEY.to_string();
-
-        tracing::debug!(
-            "Looking up actors for family '{}' with key '{}'",
-            key,
-            msg.key.group_id
-        );
-
-        let actors = self
-            .registrations
-            .get(&key)
-            .and_then(|reg| reg.get(&msg.key.group_id))
-            .map(|set| {
-                let endpoints: Vec<_> = set
+#[async_trait]
+impl Handler<LookupMessage> for ReceptionistActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: LookupMessage) -> Vec<AnyEndpoint> {
+        self.registered_actors
+            .get(&msg.actor_type_key)
+            .map(|entries| {
+                entries
                     .iter()
-                    .filter_map(|reg| reg.endpoint.downcast())
-                    .collect();
-                tracing::debug!(
-                    "Found {} endpoints for type '{}' with key '{}'",
-                    endpoints.len(),
-                    key,
-                    msg.key.group_id
-                );
-                endpoints
-            })?;
-
-        Some(Listing {
-            endpoints: actors,
-            key: msg.key,
-        })
-    }
-}
-/// Contains the result of a lookup operation, including all registered endpoints for a key
-#[derive(Debug)]
-pub struct RecepientListing<M: Message> {
-    /// Vector of all registered endpoints for the given key and type
-    pub recepients: Vec<RecepientOf<M>>,
-    /// The key used for the lookup
-    pub key: RawKey,
-}
-
-/// Message to look up all actors registered under a specific key
-#[derive(Debug)]
-pub struct RecepientLookup<M: Message> {
-    /// The key to look up
-    pub key: RawKey,
-    /// The message type for the recepient
-    pub _phantom: PhantomData<M>,
-}
-
-impl<M: Message> Message for RecepientLookup<M> {
-    type Result = Option<RecepientListing<M>>;
-}
-
-#[async_trait::async_trait]
-impl<M: Message> Handler<RecepientLookup<M>> for ReceptionistActor {
-    async fn handle(
-        &mut self,
-        _: &mut Context<Self>,
-        msg: RecepientLookup<M>,
-    ) -> Option<RecepientListing<M>> {
-        let key = msg.key.receptionist_key.clone();
-        let group_id = msg.key.group_id.clone();
-
-        tracing::debug!(
-            "Looking up actors for family '{}' with key '{}'",
-            key,
-            group_id
-        );
-
-        let recepients = self
-            .registrations
-            .get(&key)
-            .and_then(|reg| reg.get(&group_id))
-            .map(|set| {
-                let endpoints: Vec<_> = set
-                    .iter()
-                    .filter_map(|reg| reg.endpoint.as_recepient_of())
-                    .collect();
-                tracing::debug!(
-                    "Found {} endpoints for type '{}' with key '{}'",
-                    endpoints.len(),
-                    key,
-                    group_id
-                );
-                endpoints
-            })?;
-
-        Some(RecepientListing {
-            recepients,
-            key: msg.key,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl<T: RegisteredActor> Handler<Subscribe<T>> for ReceptionistActor {
-    async fn handle(
-        &mut self,
-        _: &mut Context<Self>,
-        msg: Subscribe<T>,
-    ) -> Option<ListingSubscription<T>> {
-        let registration_key = T::RECEPTIONIST_KEY.to_string();
-        let key = msg.key.clone();
-
-        // Create new subscriber and get its receiver
-        let (subscriber, receiver) = Subscriber::new::<T>();
-
-        // Get initial set of endpoints
-        let initial: VecDeque<_> = self
-            .registrations
-            .get(&registration_key)
-            .and_then(|reg| reg.get(&key.group_id))
-            .map(|set| {
-                set.iter()
-                    .filter_map(|reg| reg.endpoint.downcast())
+                    .map(|entry| entry.endpoint.get_endpoint())
                     .collect()
             })
-            .unwrap_or_default();
-
-        // Store the subscriber
-        self.subscriptions
-            .entry(registration_key)
-            .or_default()
-            .entry(key.group_id.clone())
-            .or_default()
-            .push(subscriber);
-
-        Some(ListingSubscription {
-            initial,
-            key,
-            receiver,
-        })
+            .unwrap_or_default()
     }
 }
 
-/// Lookup a single actor by key, if more than one is registered, an error is returned.
 /// Errors that can occur during actor lookup operations
 #[derive(Debug, thiserror::Error)]
 pub enum LookupError {
@@ -840,109 +306,54 @@ impl Receptionist {
         }
     }
 
-    pub async fn register<T: RegisteredActor>(
-        &self,
-        key: Key<T>,
-        endpoint: &Endpoint<T>,
-    ) -> Result<bool, SendError> {
+    /// Register an actor with just the path (for backward compatibility)
+    /// This creates a placeholder registration that will be resolved later
+    pub async fn register(&self, path: ActorPath) -> Result<bool, SendError> {
+        // For now, create a placeholder factory that will panic if used
+        // In a real implementation, this might create a lazy remote endpoint factory
+        let factory = Box::new(PlaceholderFactory { path: path.clone() });
         self.inner_endpoint
-            .send(Register {
-                key: key.into(),
-                endpoint: endpoint.clone(),
-            })
+            .send(RegisterMessage::remote(path, factory))
             .await
     }
-    
-    /// Register a remote actor with the receptionist using actor path and type information
+
+    /// Register a local actor with an existing endpoint
+    pub async fn register_local(
+        &self,
+        path: ActorPath,
+        endpoint: AnyEndpoint,
+    ) -> Result<bool, SendError> {
+        self.inner_endpoint
+            .send(RegisterMessage::local(path, endpoint))
+            .await
+    }
+
+    /// Register a remote actor with a factory for lazy endpoint creation
     pub async fn register_remote(
         &self,
-        key: RawKey,
-        actor_path: ActorPath, 
-        actor_type: String,
+        path: ActorPath,
+        factory: Box<dyn EndpointFactory>,
     ) -> Result<bool, SendError> {
-        // Rather than sending the AnyEndpoint itself (which isn't Clone),
-        // we send the information needed to create one
         self.inner_endpoint
-            .send(RegisterRemote {
-                key,
-                actor_path,
-                actor_type,
-            })
-            .await
-    }
-    
-    /// Deregister a remote actor from the receptionist
-    pub async fn deregister_remote(
-        &self,
-        key: RawKey,
-        actor_path: ActorPath,
-    ) -> Result<bool, SendError> {
-        // Send information to identify and deregister the remote actor
-        self.inner_endpoint
-            .send(DeregisterRemote {
-                key,
-                actor_path,
-            })
+            .send(RegisterMessage::remote(path, factory))
             .await
     }
 
-    pub async fn deregister<T: RegisteredActor>(
-        &self,
-        key: Key<T>,
-        endpoint: &Endpoint<T>,
-    ) -> Result<bool, SendError> {
+    /// Deregister an actor from the receptionist
+    pub async fn deregister(&self, path: ActorPath) -> Result<bool, SendError> {
+        self.inner_endpoint.send(DeregisterMessage { path }).await
+    }
+
+    /// Lookup all actors registered under a specific actor type key
+    pub async fn lookup(&self, actor_type_key: String) -> Result<Vec<AnyEndpoint>, SendError> {
         self.inner_endpoint
-            .send(Deregister {
-                key: key.into(),
-                endpoint: endpoint.clone(),
-            })
+            .send(LookupMessage { actor_type_key })
             .await
     }
 
-    pub async fn lookup_one_recepient_of<M: Message>(
-        &self,
-        key: RawKey,
-    ) -> Result<RecepientOf<M>, LookupError> {
-        let recepients = self
-            .lookup_recepients_of(key)
-            .await
-            .ok_or(LookupError::NotFound)?
-            .recepients;
-        match recepients.len() {
-            0 => Err(LookupError::NotFound),
-            1 => Ok(recepients.into_iter().next().unwrap()),
-            _ => Err(LookupError::MultipleFound),
-        }
-    }
-    pub async fn lookup_recepients_of<M: Message>(
-        &self,
-        key: RawKey,
-    ) -> Option<RecepientListing<M>> {
-        match self
-            .inner_endpoint
-            .send(RecepientLookup {
-                key: key.clone(),
-                _phantom: PhantomData,
-            })
-            .await
-        {
-            Ok(listing) => listing,
-            Err(_) => {
-                tracing::error!("Failed to lookup actors for key: {:?}", &key);
-                None
-            }
-        }
-    }
-
-    pub async fn lookup_one<T: RegisteredActor>(
-        &self,
-        key: Key<T>,
-    ) -> Result<Endpoint<T>, LookupError> {
-        let endpoints = self
-            .lookup(key)
-            .await
-            .ok_or(LookupError::NotFound)?
-            .endpoints;
+    /// Lookup a single actor by type key, returns error if none or multiple found
+    pub async fn lookup_one(&self, actor_type_key: String) -> Result<AnyEndpoint, LookupError> {
+        let endpoints = self.lookup(actor_type_key).await?;
         match endpoints.len() {
             0 => Err(LookupError::NotFound),
             1 => Ok(endpoints.into_iter().next().unwrap()),
@@ -950,33 +361,36 @@ impl Receptionist {
         }
     }
 
-    pub async fn lookup<T: RegisteredActor>(&self, key: Key<T>) -> Option<Listing<T>> {
-        match self
-            .inner_endpoint
-            .send(Lookup {
-                key: key.clone().into(),
-                _phantom: PhantomData,
-            })
-            .await
-        {
-            Ok(listing) => listing,
-            Err(_) => {
-                tracing::error!("Failed to lookup actors for key: {:?}", &key);
-                None
-            }
-        }
+    /// Lookup actors with type safety - converts AnyEndpoint to typed Endpoint<T>
+    pub async fn lookup_typed<T>(
+        &self,
+        actor_type_key: String,
+    ) -> Result<Vec<Endpoint<T>>, LookupError>
+    where
+        T: Actor + 'static,
+    {
+        let any_endpoints = self.lookup(actor_type_key).await?;
+        let typed_endpoints: Vec<Endpoint<T>> = any_endpoints
+            .into_iter()
+            .filter_map(|any_endpoint| any_endpoint.downcast())
+            .collect();
+
+        Ok(typed_endpoints)
     }
 
-    pub async fn subscribe<T: RegisteredActor>(
+    /// Lookup a single typed actor
+    pub async fn lookup_one_typed<T>(
         &self,
-        key: Key<T>,
-    ) -> Option<ListingSubscription<T>> {
-        self.inner_endpoint
-            .send(Subscribe {
-                key: key.clone().into(),
-                _phantom: PhantomData,
-            })
-            .await
-            .expect("failed to reach receptionist")
+        actor_type_key: String,
+    ) -> Result<Endpoint<T>, LookupError>
+    where
+        T: Actor + 'static,
+    {
+        let endpoints = self.lookup_typed::<T>(actor_type_key).await?;
+        match endpoints.len() {
+            0 => Err(LookupError::NotFound),
+            1 => Ok(endpoints.into_iter().next().unwrap()),
+            _ => Err(LookupError::MultipleFound),
+        }
     }
 }

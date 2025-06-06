@@ -1,4 +1,3 @@
-use crate::actor::Registered;
 use crate::message::RemoteMessageError;
 use crate::net::{NetworkAddr, NetworkAddrRef, QuicConnectionDriver};
 use std::collections::{HashMap, HashSet};
@@ -78,7 +77,7 @@ pub struct Config {
 
 pub struct NodeStatus {
     pub node: Node,
-    pub status: Status,
+    pub status: MembershipStatus,
     pub reachability: Reachability,
     pub is_configured: bool,
     pub last_updated: chrono::DateTime<chrono::Utc>,
@@ -151,12 +150,10 @@ impl ClusterActor {
     }
 }
 
-impl Registered for ClusterActor {
-    const RECEPTIONIST_KEY: &'static str = "cluster";
-}
-
 #[async_trait::async_trait]
 impl Actor for ClusterActor {
+    const ACTOR_TYPE_KEY: &'static str = "system.cluster";
+
     async fn started(&mut self, ctx: &mut Context<Self>) {
         tracing::info!(node_id=%self.config.cluster_id.name, "Cluster started");
         self.state = State::Starting;
@@ -191,7 +188,7 @@ impl Actor for ClusterActor {
             // Initialize node status
             let node_status = NodeStatus {
                 node: member.clone(),
-                status: Status::Pending,
+                status: MembershipStatus::Pending,
                 reachability: Reachability::Pending,
                 is_configured: true,
                 last_updated: chrono::Utc::now(),
@@ -204,11 +201,10 @@ impl Actor for ClusterActor {
         self.state = State::Running;
 
         // Register with the receptionist so nodes can find us
-        let key = crate::receptionist::Key::<ClusterActor>::default();
         if let Err(e) = ctx
             .system()
             .receptionist_ref()
-            .register(key, &ctx.endpoint())
+            .register(ctx.endpoint().path().clone())
             .await
         {
             tracing::error!(error=?e, "Failed to register cluster actor with receptionist");
@@ -217,7 +213,7 @@ impl Actor for ClusterActor {
         }
 
         // Schedule a periodic cleanup task to remove unreachable non-configured nodes
-        ctx.interval(std::time::Duration::from_secs(30), move || {
+        ctx.interval(std::time::Duration::from_secs(30), move |_| {
             CleanupUnreachableNodes {}
         });
     }
@@ -269,7 +265,7 @@ impl Handler<NewIncomingConnection> for ClusterActor {
         };
         let node_status = NodeStatus {
             node: node.clone(),
-            status: Status::Pending,
+            status: MembershipStatus::Pending,
             reachability: Reachability::Pending,
             is_configured: true,
             last_updated: chrono::Utc::now(),
@@ -298,8 +294,10 @@ impl Handler<NodeStatusUpdate> for ClusterActor {
             node_status.last_updated = msg.timestamp;
 
             // If the node is Down or Failed and not a configured node, consider cleaning it up
-            if matches!(node_status.status, Status::Down | Status::Failed)
-                && !node_status.is_configured
+            if matches!(
+                node_status.status,
+                MembershipStatus::Down | MembershipStatus::Failed
+            ) && !node_status.is_configured
                 && matches!(node_status.reachability, Reachability::Unreachable { .. })
             {
                 tracing::info!(node_id=%msg.id, "Non-configured node is unreachable, marked for cleanup");
@@ -347,7 +345,10 @@ impl Handler<CleanupUnreachableNodes> for ClusterActor {
             .iter()
             .filter(|(_, status)| {
                 !status.is_configured
-                    && matches!(status.status, Status::Down | Status::Failed)
+                    && matches!(
+                        status.status,
+                        MembershipStatus::Down | MembershipStatus::Failed
+                    )
                     && matches!(status.reachability, Reachability::Unreachable { .. })
             })
             .map(|(id, _)| *id)
@@ -406,7 +407,7 @@ async fn accept_connection(
 #[derive(Debug, Clone)]
 pub struct NodeStatusUpdate {
     pub id: Id,
-    pub status: Status,
+    pub status: MembershipStatus,
     pub reachability: Reachability,
     pub is_configured: bool, // Whether this node was in the initial configuration
     pub timestamp: chrono::DateTime<chrono::Utc>,

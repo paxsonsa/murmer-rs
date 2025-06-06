@@ -244,6 +244,21 @@ impl System {
         Ok(supervisor.into())
     }
 
+    pub async fn spawn_registered_with<A: Actor>(
+        &self,
+        actor: A,
+    ) -> Result<Endpoint<A>, SystemError> {
+        let endpoint = self.spawn_with(actor)?;
+        self.receptionist_ref()
+            .register(endpoint.path().clone())
+            .await
+            .map_err(|_| {
+                tracing::error!("Failed to register actor with receptionist");
+                SystemError::SpawnError
+            })?;
+        Ok(endpoint)
+    }
+
     pub async fn shutdown(&mut self) {
         match self {
             Self::Local {
@@ -353,6 +368,10 @@ where
         &self.actor
     }
 
+    fn actor_ref_mut(&mut self) -> &mut A {
+        &mut self.actor
+    }
+
     #[tracing::instrument(level = "trace", skip(ctx))]
     async fn handle_command(&mut self, ctx: &mut Context<A>, cmd: SupervisorCommand<A>) -> bool {
         match cmd {
@@ -435,7 +454,7 @@ where
 {
     pub fn new(actor: A) -> Self {
         let id = Id::new();
-        let path = Arc::new(ActorPath::local_default(std::any::type_name::<A>().to_string(), id));
+        let path = Arc::new(ActorPath::local_default(A::ACTOR_TYPE_KEY.to_string(), id));
         let (runtime, sender) = SupervisorRuntime::construct(path.clone(), actor);
         let cancellation = tokio_util::sync::CancellationToken::new();
 
@@ -453,6 +472,10 @@ where
 
     pub fn actor_ref(&self) -> &A {
         self.runtime.actor_ref()
+    }
+
+    pub fn actor_ref_mut(&mut self) -> &mut A {
+        self.runtime.actor_ref_mut()
     }
 
     pub async fn started(&mut self) {
@@ -547,7 +570,8 @@ where
 {
     fn construct(actor: A) -> Supervisor<A, Uninitialized<A>> {
         let id = Id::new();
-        let path = Arc::new(ActorPath::local_default(std::any::type_name::<A>().to_string(), id));
+        // TODO: make it so every actor has a identifier string.
+        let path = Arc::new(ActorPath::local_default(A::ACTOR_TYPE_KEY.to_string(), id));
 
         let (runtime, mailbox_sender) = SupervisorRuntime::construct(path.clone(), actor);
         Supervisor {
@@ -686,10 +710,43 @@ impl<A: Actor> Debug for Endpoint<A> {
     }
 }
 
+/// Trait for message senders that can be cloned
+pub trait CloneableSender: Send + Sync + 'static {
+    fn clone_box(&self) -> Box<dyn CloneableSender>;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+impl Clone for Box<dyn CloneableSender> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
+impl<A: Actor> CloneableSender for EndpointSender<A> {
+    fn clone_box(&self) -> Box<dyn CloneableSender> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
 /// Type-erased version of an Endpoint that can hold any actor type
+#[derive(Clone)]
 pub struct AnyEndpoint {
-    // Box containing the type-erased endpoint sender
-    pub endpoint_sender: Box<dyn Any + Send + Sync>,
+    // Box containing the type-erased endpoint sender with clone capability
+    pub sender: Box<dyn CloneableSender>,
     // Type ID for runtime type checking during downcasting
     pub type_id: TypeId,
     // Type name for better debugging and error messages
@@ -703,32 +760,11 @@ pub struct AnyEndpoint {
 impl<A: Actor> From<Endpoint<A>> for AnyEndpoint {
     fn from(endpoint: Endpoint<A>) -> Self {
         Self {
-            endpoint_sender: Box::new(endpoint.sender.clone()),
+            sender: Box::new(endpoint.sender.clone()),
             type_id: TypeId::of::<A>(),
-            type_name: std::any::type_name::<A>(),
+            type_name: A::ACTOR_TYPE_KEY,
             path: endpoint.path.clone(),
             actor_type_string: None,
-        }
-    }
-}
-
-impl AnyEndpoint {
-    /// Creates a new AnyEndpoint from a remote actor
-    pub fn from_remote<A: Actor>(path: ActorPath, proxy: Box<dyn Any + Send + Sync>) -> Self {
-        let type_string = match path.is_remote() {
-            true => {
-                // For remote actors, use the type_id field from ActorPath
-                Some(path.type_id.to_string())
-            }
-            false => None,
-        };
-
-        Self {
-            endpoint_sender: proxy,
-            type_id: TypeId::of::<A>(),
-            type_name: std::any::type_name::<A>(),
-            path: Arc::new(path),
-            actor_type_string: type_string,
         }
     }
 }
@@ -744,15 +780,22 @@ impl Debug for AnyEndpoint {
 }
 
 impl AnyEndpoint {
+    /// Checks if this AnyEndpoint contains an Endpoint of type T
+    ///
+    /// This method allows checking if the AnyEndpoint can be downcast to a specific actor type.
+    /// It compares the stored TypeId with the TypeId of the requested actor type.
+    /// This is useful for generic type checking before attempting to downcast.
+    pub fn is<T: 'static>(&self) -> bool {
+        self.type_id == TypeId::of::<T>()
+    }
+
     /// Private method to downcast only by TypeId, without attempting remote resolution
     fn direct_downcast<A: Actor + 'static>(&self) -> Option<Endpoint<A>> {
         if self.type_id == TypeId::of::<A>() {
-            return self.endpoint_sender
-                .downcast_ref::<EndpointSender<A>>()
-                .map(|b| {
-                    let sender = b.clone();
-                    Endpoint::new(sender, self.path.clone())
-                });
+            if let Some(sender) = self.sender.as_any().downcast_ref::<EndpointSender<A>>() {
+                let sender_clone = sender.clone();
+                return Some(Endpoint::new(sender_clone, self.path.clone()));
+            }
         }
         None
     }
@@ -763,14 +806,14 @@ impl AnyEndpoint {
         if self.path.is_local() {
             return self.direct_downcast::<A>();
         }
-        
+
         // For remote actors - use the actor_type_string with inventory lookup
         if self.path.is_remote() {
             // First try direct downcast in case the types match
             if let Some(endpoint) = self.direct_downcast::<A>() {
                 return Some(endpoint);
             }
-            
+
             // Check if A implements RegisteredActor first
             if let Some(receptionist_key) = self.actor_type_string.as_ref() {
                 // Search the inventory for a matching registration
@@ -779,30 +822,34 @@ impl AnyEndpoint {
                         // For testing purposes, we'll create a dummy channel
                         // In a real implementation, this would come from somewhere else
                         let (proxy_tx, _) = tokio::sync::mpsc::channel(32);
-                        
+
                         // Found matching registration, create typed endpoint using the proxy channel
-                        let any_endpoint = (registration.create_endpoint)((*self.path).clone(), proxy_tx);
-                        
+                        let any_endpoint =
+                            (registration.create_endpoint)((*self.path).clone(), proxy_tx);
+
                         // Use direct downcast to prevent infinite recursion
                         return any_endpoint.direct_downcast::<A>();
                     }
                 }
             }
         }
-        
+
         None
     }
 
     /// Private method to downcast only by TypeId, without attempting remote resolution
     fn direct_into_downcast<A: Actor + 'static>(self) -> Option<Endpoint<A>> {
         if self.type_id == TypeId::of::<A>() {
-            return self.endpoint_sender
-                .downcast::<EndpointSender<A>>()
-                .ok()
-                .map(|b| {
-                    let sender = *b;
-                    Endpoint::new(sender, self.path.clone())
-                });
+            let boxed_sender = self.sender;
+            let any_box = boxed_sender.into_any();
+
+            match any_box.downcast::<EndpointSender<A>>() {
+                Ok(sender_box) => {
+                    let sender = *sender_box;
+                    return Some(Endpoint::new(sender, self.path));
+                }
+                Err(_) => return None,
+            }
         }
         None
     }
@@ -813,18 +860,18 @@ impl AnyEndpoint {
         if self.path.is_local() {
             return self.direct_into_downcast::<A>();
         }
-        
+
         // For remote actors - use the actor_type_string with inventory lookup
         if self.path.is_remote() {
             // First try direct downcast in case the types match
             if self.type_id == TypeId::of::<A>() {
                 return self.direct_into_downcast::<A>();
             }
-            
+
             // Extract necessary information before moving self
             let actor_path = self.path.clone();
             let actor_type_string = self.actor_type_string;
-            
+
             // Check if A implements RegisteredActor first
             if let Some(receptionist_key) = actor_type_string {
                 // Search the inventory for a matching registration
@@ -832,14 +879,14 @@ impl AnyEndpoint {
                     if registration.key == receptionist_key {
                         // Clone path for each iteration
                         let path_clone = (*actor_path).clone();
-                        
+
                         // For testing purposes, we'll create a dummy channel
                         // In a real implementation, this would come from somewhere else
                         let (proxy_tx, _) = tokio::sync::mpsc::channel(32);
-                        
+
                         // Found matching registration, create typed endpoint
                         let any_endpoint = (registration.create_endpoint)(path_clone, proxy_tx);
-                        
+
                         // Use direct downcast to prevent infinite recursion
                         let endpoint_result = any_endpoint.direct_downcast::<A>();
                         if let Some(endpoint) = endpoint_result {
@@ -849,7 +896,7 @@ impl AnyEndpoint {
                 }
             }
         }
-        
+
         None
     }
 
@@ -863,25 +910,27 @@ impl AnyEndpoint {
     {
         // For local actors - try direct downcasting
         if !self.path.is_remote() {
-            if let Some(sender) = self.endpoint_sender
+            // First try to downcast to EndpointSender<A> where A: Handler<M>
+            if let Some(sender) = self
+                .sender
+                .as_any()
                 .downcast_ref::<Box<dyn MessageSender<M>>>()
-                .map(|b| (*b).clone())
             {
-                return Some(RecepientOf::new(sender));
+                return Some(RecepientOf::new(sender.clone()));
             }
         }
-        
+
         // For remote actors, we just return None for now until we have a better design
         // In the future, we'll need to implement a more robust system for remote actor
         // communication that can handle type erasure and the RemoteMessageType trait
-        
+
         // Comment explaining future direction:
         // To handle remote actors properly, we'd need to:
         // 1. Get a proxy channel from the actor registry
-        // 2. Verify that M implements RemoteMessageType 
+        // 2. Verify that M implements RemoteMessageType
         // 3. Create a TypedRemoteEndpointSender<M>
         // 4. Return it wrapped in RecepientOf
-        
+
         None
     }
 }
@@ -978,6 +1027,47 @@ impl<A: Actor> EndpointSender<A> {
         }
 
         rx.await.map_err(|_| SendError::ResponseDropped)
+    }
+}
+
+/// Trait for message senders that can handle specific message types
+#[async_trait::async_trait]
+pub trait ErasedEndpointSender: Send + Sync + 'static {
+    /// Returns the TypeId of the sender for runtime type checking
+    fn type_id(&self) -> TypeId;
+
+    /// Clones the sender into a new boxed trait object
+    fn clone_box(&self) -> Box<dyn ErasedEndpointSender>;
+
+    /// Converts the sender to a trait object that can be downcast
+    fn as_any(&self) -> &dyn Any;
+
+    /// Converts the sender to a mutable trait object that can be downcast
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Consumes the boxed sender and converts it to a boxed Any
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+impl<A: Actor> ErasedEndpointSender for EndpointSender<A> {
+    fn type_id(&self) -> TypeId {
+        TypeId::of::<EndpointSender<A>>()
+    }
+
+    fn clone_box(&self) -> Box<dyn ErasedEndpointSender> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
     }
 }
 

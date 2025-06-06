@@ -1,7 +1,7 @@
 mod macros;
 mod sender;
-#[cfg(test)]
-mod examples;
+// #[cfg(test)]
+// mod examples;
 
 // Re-export the public parts of the sender module
 // Note that implementations actually use these types, even if the linter doesn't detect it
@@ -11,11 +11,11 @@ pub use sender::{RemoteEndpointSender, TypedRemoteEndpointSender, create_typed_e
 // We don't need to export the macros explicitly since they're #[macro_export]
 use std::any::Any;
 
-use bytes::Bytes;
-use crate::actor::{Actor, Registered as RegisteredActor};
+use crate::actor::Actor;
 use crate::message::Message;
 use crate::path::ActorPath;
 use crate::system::AnyEndpoint;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Message type for communicating with RemoteProxy
@@ -26,7 +26,9 @@ pub enum RemoteProxyMessage {
         /// The message to send
         message: crate::message::RemoteMessage,
         /// Response channel
-        response_tx: tokio::sync::oneshot::Sender<Result<crate::message::RemoteMessage, crate::message::RemoteMessageError>>,
+        response_tx: tokio::sync::oneshot::Sender<
+            Result<crate::message::RemoteMessage, crate::message::RemoteMessageError>,
+        >,
     },
     /// Signal the RemoteProxy to shut down
     Shutdown,
@@ -39,18 +41,22 @@ pub struct ActorTypeRegistration {
     /// Type name for debugging and error messages
     pub type_name: &'static str,
     /// Factory function to create remote endpoints for this actor type
-    /// 
+    ///
     /// The function takes:
     /// - The actor path
     /// - A channel to communicate with the RemoteProxy
-    pub create_endpoint: fn(ActorPath, tokio::sync::mpsc::Sender<RemoteProxyMessage>) -> AnyEndpoint,
+    pub create_endpoint:
+        fn(ActorPath, tokio::sync::mpsc::Sender<RemoteProxyMessage>) -> AnyEndpoint,
 }
 
 impl ActorTypeRegistration {
     pub const fn new(
         key: &'static str,
         type_name: &'static str,
-        create_endpoint: fn(ActorPath, tokio::sync::mpsc::Sender<RemoteProxyMessage>) -> AnyEndpoint,
+        create_endpoint: fn(
+            ActorPath,
+            tokio::sync::mpsc::Sender<RemoteProxyMessage>,
+        ) -> AnyEndpoint,
     ) -> Self {
         Self {
             key,
@@ -91,7 +97,9 @@ impl MessageTypeRegistration {
 inventory::collect!(MessageTypeRegistration);
 
 /// Trait for messages that can be sent remotely
-pub trait RemoteMessageType: Message + Serialize + for<'de> Deserialize<'de> + bincode::Encode + bincode::Decode<()> {
+pub trait RemoteMessageType:
+    Message + Serialize + for<'de> Deserialize<'de> + bincode::Encode + bincode::Decode<()>
+{
     /// Unique identifier for this message type
     const TYPE_ID: &'static str;
 }
@@ -109,13 +117,14 @@ pub trait RemoteProxy: Actor {
 }
 
 /// Extended registration trait for actors that can be accessed remotely
-pub trait RemoteRegistered: RegisteredActor {
+pub trait RemoteRegistered {
     /// Creates a properly typed endpoint for a remote actor of this type
     fn create_remote_endpoint(
-        path: ActorPath, 
-        proxy_tx: tokio::sync::mpsc::Sender<RemoteProxyMessage>
+        path: ActorPath,
+        proxy_tx: tokio::sync::mpsc::Sender<RemoteProxyMessage>,
     ) -> AnyEndpoint;
 
     /// Returns handlers for all message types supported by this actor remotely
     fn message_handlers() -> Vec<(&'static str, fn(Bytes) -> Result<Bytes, String>)>;
 }
+

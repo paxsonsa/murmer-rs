@@ -16,7 +16,7 @@ pub struct ActorPath {
     /// The scheme (local, remote, etc)
     pub scheme: AddressScheme,
     /// The actor type path (e.g., "User", "Receptionist")
-    pub type_id: Arc<str>,
+    pub type_id: Arc<str>, // TODO: Rename to type_key
     /// The group identifier (typically "default" or a custom group)
     pub group_id: Arc<str>,
     /// The unique instance identifier
@@ -53,7 +53,13 @@ impl ActorPath {
     }
 
     /// Creates a remote actor path with the given host, port, type, group, and instance ID
-    pub fn remote(host: String, port: u16, type_path: String, group_id: String, instance_id: Id) -> Self {
+    pub fn remote(
+        host: String,
+        port: u16,
+        type_path: String,
+        group_id: String,
+        instance_id: Id,
+    ) -> Self {
         Self {
             scheme: AddressScheme::Remote { host, port },
             type_id: type_path.into(),
@@ -61,7 +67,7 @@ impl ActorPath {
             instance_id: instance_id.into(),
         }
     }
-    
+
     /// Creates a remote actor path with default group
     pub fn remote_default(host: String, port: u16, type_path: String, instance_id: Id) -> Self {
         Self::remote(host, port, type_path, "default".to_string(), instance_id)
@@ -160,27 +166,35 @@ impl FromStr for ActorPath {
 
         // Split the address part (after "murmur://")
         let address_parts: Vec<&str> = parts[1].split('/').collect();
-        
+
         // First part is either "local" or "host:port"
-        let first_part = address_parts.get(0).ok_or(ActorPathError::MissingComponents)?;
-        
+        let first_part = address_parts
+            .get(0)
+            .ok_or(ActorPathError::MissingComponents)?;
+
         if *first_part == AddressScheme::LOCAL_SCHEME {
             // Local actor path: murmur://local/type/group/instance_id
             if address_parts.len() < 4 {
                 return Err(ActorPathError::MissingComponents);
             }
 
-            let type_path = address_parts.get(1)
+            let type_path = address_parts
+                .get(1)
                 .ok_or(ActorPathError::MissingComponents)?
                 .to_string();
-                
-            let group_id = address_parts.get(2)
+
+            let group_id = address_parts
+                .get(2)
                 .ok_or(ActorPathError::MissingComponents)?
                 .to_string();
-                
-            let instance_id = Uuid::parse_str(address_parts.get(3).ok_or(ActorPathError::MissingComponents)?)
-                .map_err(|_| ActorPathError::InvalidUuid)?
-                .into();
+
+            let instance_id = Uuid::parse_str(
+                address_parts
+                    .get(3)
+                    .ok_or(ActorPathError::MissingComponents)?,
+            )
+            .map_err(|_| ActorPathError::InvalidUuid)?
+            .into();
 
             Ok(ActorPath::local(type_path, group_id, instance_id))
         } else {
@@ -200,19 +214,31 @@ impl FromStr for ActorPath {
                 .parse()
                 .map_err(|_| ActorPathError::InvalidFormat)?;
 
-            let type_path = address_parts.get(1)
+            let type_path = address_parts
+                .get(1)
                 .ok_or(ActorPathError::MissingComponents)?
                 .to_string();
-                
-            let group_id = address_parts.get(2)
-                .ok_or(ActorPathError::MissingComponents)?
-                .to_string();
-                
-            let instance_id = Uuid::parse_str(address_parts.get(3).ok_or(ActorPathError::MissingComponents)?)
-                .map_err(|_| ActorPathError::InvalidUuid)?
-                .into();
 
-            Ok(ActorPath::remote(host, port, type_path, group_id, instance_id))
+            let group_id = address_parts
+                .get(2)
+                .ok_or(ActorPathError::MissingComponents)?
+                .to_string();
+
+            let instance_id = Uuid::parse_str(
+                address_parts
+                    .get(3)
+                    .ok_or(ActorPathError::MissingComponents)?,
+            )
+            .map_err(|_| ActorPathError::InvalidUuid)?
+            .into();
+
+            Ok(ActorPath::remote(
+                host,
+                port,
+                type_path,
+                group_id,
+                instance_id,
+            ))
         }
     }
 }
@@ -229,7 +255,7 @@ mod tests {
         let parsed = ActorPath::from_str(&path_str).unwrap();
         assert_eq!(path, parsed);
         assert!(parsed.is_local());
-        assert_eq!(*parsed.group_id, "default");
+        assert_eq!(parsed.group_id.as_ref(), "default");
     }
 
     #[test]
@@ -240,7 +266,7 @@ mod tests {
         let parsed = ActorPath::from_str(&path_str).unwrap();
         assert_eq!(path, parsed);
         assert!(parsed.is_local());
-        assert_eq!(*parsed.group_id, "custom");
+        assert_eq!(parsed.group_id.as_ref(), "custom");
     }
 
     #[test]
@@ -251,18 +277,24 @@ mod tests {
         let parsed = ActorPath::from_str(&path_str).unwrap();
         assert_eq!(path, parsed);
         assert!(parsed.is_remote());
-        assert_eq!(*parsed.group_id, "default");
+        assert_eq!(parsed.group_id.as_ref(), "default");
     }
 
     #[test]
     fn test_remote_actor_path_custom_group() {
         let id = Id::new();
-        let path = ActorPath::remote("127.0.0.1".to_string(), 4000, "user".to_string(), "region1".to_string(), id);
+        let path = ActorPath::remote(
+            "127.0.0.1".to_string(),
+            4000,
+            "user".to_string(),
+            "region1".to_string(),
+            id,
+        );
         let path_str = path.to_string();
         let parsed = ActorPath::from_str(&path_str).unwrap();
         assert_eq!(path, parsed);
         assert!(parsed.is_remote());
-        assert_eq!(*parsed.group_id, "region1");
+        assert_eq!(parsed.group_id.as_ref(), "region1");
     }
 
     #[test]
@@ -271,8 +303,14 @@ mod tests {
         let path = ActorPath::local("user".to_string(), "custom".to_string(), id);
         let path_str = path.to_string();
         assert!(path_str.starts_with("murmur://local/user/custom/"));
-        
-        let remote_path = ActorPath::remote("127.0.0.1".to_string(), 4000, "counter".to_string(), "region1".to_string(), id);
+
+        let remote_path = ActorPath::remote(
+            "127.0.0.1".to_string(),
+            4000,
+            "counter".to_string(),
+            "region1".to_string(),
+            id,
+        );
         let remote_str = remote_path.to_string();
         assert!(remote_str.starts_with("murmur://127.0.0.1:4000/counter/region1/"));
     }

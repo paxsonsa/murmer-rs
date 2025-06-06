@@ -13,7 +13,6 @@ use crate::id::Id;
 use crate::message::{RemoteMessage, RemoteMessageError};
 use crate::node::NodeInfo;
 use crate::path::ActorPath;
-use crate::receptionist::RawKey;
 use crate::tls::TlsConfig;
 use crate::tls::TlsConfigError;
 
@@ -114,7 +113,7 @@ impl NetworkAddrRef {
             NetworkAddr::Socket(addr) => "127.0.0.1", // Default host for socket addresses
         }
     }
-    
+
     /// Gets the port number, or a default port if not specified
     pub fn port(&self) -> u16 {
         match &*self.0 {
@@ -218,45 +217,10 @@ impl Header {
     }
 }
 
-/// System messages for node-to-node communication
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum NodeMessage {
-    Init {
-        protocol_version: u16,
-        host_id: Id,
-    },
-    InitAck {
-        node_id: Id,
-    },
-    Join {
-        name: String,
-        capabilities: Vec<String>,
-    },
-    JoinAck {
-        accepted: bool,
-        reason: Option<String>,
-    },
-    Heartbeat {
-        timestamp: i64,
-    },
-    Disconnect {
-        reason: String,
-    },
-    ActorAdd {
-        key: RawKey,
-        instance_id: Id,
-    },
-    ActorRemove {
-        key: RawKey,
-        actor_path: ActorPath,
-        instance_id: Id,
-    },
-}
-
 /// Actor messages with addressing information
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ActorMessage {
-    Init(RawKey),
+    Init(ActorPath),
     Request(RemoteMessage),
     Response(Result<RemoteMessage, RemoteMessageError>),
 }
@@ -299,57 +263,57 @@ pub enum ClusterMessage {
 
 /// Enum for payload result with success or failure
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Payload<T> {
+pub enum FrameBody<T> {
     /// Successfully decoded payload
     Ok(T),
     /// An unhandled failure occurred.
     UnhandledFailure(String),
 }
 
-impl<T> Payload<T> {
+impl<T> FrameBody<T> {
     /// Returns true if the payload is Ok
     pub fn is_ok(&self) -> bool {
-        matches!(self, Payload::Ok(_))
+        matches!(self, FrameBody::Ok(_))
     }
 
     /// Returns true if the payload is an UnknownFailure
     pub fn is_failure(&self) -> bool {
-        matches!(self, Payload::UnhandledFailure(_))
+        matches!(self, FrameBody::UnhandledFailure(_))
     }
 
     /// Returns the inner value if Ok, or None if failure
     pub fn ok(self) -> Option<T> {
         match self {
-            Payload::Ok(value) => Some(value),
-            Payload::UnhandledFailure(_) => None,
+            FrameBody::Ok(value) => Some(value),
+            FrameBody::UnhandledFailure(_) => None,
         }
     }
 
     /// Returns a reference to the inner value if Ok, or None if failure
     pub fn as_ok(&self) -> Option<&T> {
         match self {
-            Payload::Ok(value) => Some(value),
-            Payload::UnhandledFailure(_) => None,
+            FrameBody::Ok(value) => Some(value),
+            FrameBody::UnhandledFailure(_) => None,
         }
     }
 
     /// Returns the failure reason if UnknownFailure, or None if Ok
     pub fn failure_reason(&self) -> Option<&String> {
         match self {
-            Payload::Ok(_) => None,
-            Payload::UnhandledFailure(reason) => Some(reason),
+            FrameBody::Ok(_) => None,
+            FrameBody::UnhandledFailure(reason) => Some(reason),
         }
     }
 
     /// Maps the inner value using the provided function if Ok
-    pub fn map<U, F>(self, f: F) -> Payload<U>
+    pub fn map<U, F>(self, f: F) -> FrameBody<U>
     where
         U: Serialize + for<'de> Deserialize<'de>,
         F: FnOnce(T) -> U,
     {
         match self {
-            Payload::Ok(value) => Payload::Ok(f(value)),
-            Payload::UnhandledFailure(reason) => Payload::UnhandledFailure(reason),
+            FrameBody::Ok(value) => FrameBody::Ok(f(value)),
+            FrameBody::UnhandledFailure(reason) => FrameBody::UnhandledFailure(reason),
         }
     }
 }
@@ -359,7 +323,7 @@ impl<T> Payload<T> {
 pub struct Frame<T> {
     pub header: Header,
     /// Typed payload
-    pub payload: Payload<T>,
+    pub body: FrameBody<T>,
 }
 
 impl<T> Frame<T>
@@ -370,7 +334,7 @@ where
     pub fn failure(sender_id: Id, target_id: Option<Id>, reason: String) -> Self {
         Frame {
             header: Header::new(sender_id, target_id),
-            payload: Payload::UnhandledFailure(reason),
+            body: FrameBody::UnhandledFailure(reason),
         }
     }
 
@@ -378,18 +342,18 @@ where
     pub fn ok(sender_id: Id, target_id: Option<Id>, value: T) -> Self {
         Frame {
             header: Header::new(sender_id, target_id),
-            payload: Payload::Ok(value),
+            body: FrameBody::Ok(value),
         }
     }
 
     /// Returns true if the payload is Ok
     pub fn is_ok(&self) -> bool {
-        self.payload.is_ok()
+        self.body.is_ok()
     }
 
     /// Returns true if the payload is an UnknownFailure
     pub fn is_failure(&self) -> bool {
-        self.payload.is_failure()
+        self.body.is_failure()
     }
 
     /// Maps the payload using the provided function
@@ -400,7 +364,7 @@ where
     {
         Frame {
             header: self.header,
-            payload: self.payload.map(f),
+            body: self.body.map(f),
         }
     }
 
@@ -606,6 +570,15 @@ where
         }
     }
 
+    /// Send a frame into the stream
+    pub async fn send(&mut self, payload: T) -> Result<(), NetError> {
+        // Create a new frame with the payload
+        let frame = Frame::ok(Id::new(), None, payload);
+
+        // Write the frame to the stream
+        self.write_frame(&frame).await
+    }
+
     /// Write a frame to the stream
     pub async fn write_frame(&mut self, frame: &Frame<T>) -> Result<(), NetError> {
         let encoded = frame.encode()?;
@@ -622,21 +595,21 @@ where
 }
 
 /// A type-erased stream that can be used to read and write raw bytes
-pub struct RawStream {
+pub struct Stream {
     reader: Box<dyn AsyncRead + Send + Unpin>,
     writer: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
-impl RawStream {
+impl Stream {
     pub fn new(
         reader: Box<dyn AsyncRead + Send + Unpin>,
         writer: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> Self {
-        RawStream { reader, writer }
+        Stream { reader, writer }
     }
 
     /// Convert this raw stream into a typed frame stream
-    pub fn into_frame_stream<T>(self) -> (FrameWriter<T>, FrameReader<T>)
+    pub fn split_into<T>(self) -> (FrameWriter<T>, FrameReader<T>)
     where
         T: Serialize + DeserializeOwned,
     {
@@ -655,13 +628,13 @@ impl RawStream {
 pub struct AcceptStream {
     accept_fn: Box<
         dyn FnMut() -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<RawStream, ConnectionError>> + Send>,
+                Box<dyn std::future::Future<Output = Result<Stream, ConnectionError>> + Send>,
             > + Send,
     >,
     // The current future being polled, if any
     current_future: Option<
         std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<RawStream, ConnectionError>> + Send>,
+            Box<dyn std::future::Future<Output = Result<Stream, ConnectionError>> + Send>,
         >,
     >,
 }
@@ -671,7 +644,7 @@ impl AcceptStream {
     pub fn new<F, Fut>(mut accept_fn: F) -> Self
     where
         F: FnMut() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<RawStream, ConnectionError>> + Send + 'static,
+        Fut: std::future::Future<Output = Result<Stream, ConnectionError>> + Send + 'static,
     {
         AcceptStream {
             accept_fn: Box::new(move || Box::pin(accept_fn())),
@@ -680,7 +653,7 @@ impl AcceptStream {
     }
 
     /// Accept the next connection
-    pub async fn accept(&mut self) -> Result<RawStream, ConnectionError> {
+    pub async fn accept(&mut self) -> Result<Stream, ConnectionError> {
         // Create a future that polls the next connection
         AcceptFuture { stream: self }.await
     }
@@ -692,7 +665,7 @@ struct AcceptFuture<'a> {
 }
 
 impl std::future::Future for AcceptFuture<'_> {
-    type Output = Result<RawStream, ConnectionError>;
+    type Output = Result<Stream, ConnectionError>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -726,19 +699,11 @@ impl std::future::Future for AcceptFuture<'_> {
 
 /// Network driver trait for establishing connections and opening streams
 #[async_trait::async_trait]
-pub trait NetworkDriver: Send {
-    /// Is this driver already connected
-    fn connected(&self) -> bool;
+pub trait ConnectionDriver: Send {}
 
-    /// Connect to a remote node
-    async fn connect(&mut self) -> Result<(), ConnectionError>;
-
-    /// Open a new bidirectional stream for communication
-    /// Returns a type-erased stream that can be converted to a typed stream
-    async fn open_stream(&mut self) -> Result<RawStream, ConnectionError>;
-
-    /// Accept a new bidirectional stream for communication
-    /// Returns an AcceptStream future that will resolve to a RawStream when awaited
+#[async_trait::async_trait]
+pub trait Connection: Send + Sync {
+    async fn open_stream(&mut self) -> Result<Stream, ConnectionError>;
     async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError>;
 }
 
@@ -778,132 +743,126 @@ impl QuicConnectionDriver {
 }
 
 #[async_trait::async_trait]
-impl NetworkDriver for QuicConnectionDriver {
-    fn connected(&self) -> bool {
-        match &self.state {
-            QuicConnectionState::Connected { .. } => true,
-            _ => false,
-        }
-    }
-    async fn connect(&mut self) -> Result<(), ConnectionError> {
-        let Some(socket) = &self.socket else {
-            return Err(ConnectionError::ConnectionFailed(
-                "Socket is not available".to_string(),
-            ));
-        };
-        match &self.state {
-            QuicConnectionState::NotReady | QuicConnectionState::Disconnected { .. } => {
-                let tls = self.tls.clone();
-                let addr = self.node_info.addr.clone();
-                let socket = socket.clone();
+impl ConnectionDriver for QuicConnectionDriver {
+    // async fn connect(&mut self) -> Result<(), ConnectionError> {
+    //     let Some(socket) = &self.socket else {
+    //         return Err(ConnectionError::ConnectionFailed(
+    //             "Socket is not available".to_string(),
+    //         ));
+    //     };
+    //     match &self.state {
+    //         QuicConnectionState::NotReady | QuicConnectionState::Disconnected { .. } => {
+    //             let tls = self.tls.clone();
+    //             let addr = self.node_info.addr.clone();
+    //             let socket = socket.clone();
+    //
+    //             let crypto = tls.into_client_config()?;
+    //             let sock_addr = addr.to_sock_addrs()?;
+    //
+    //             let Ok(client_config) = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+    //             else {
+    //                 return Err(ConnectionError::FailedToConnect(
+    //                     "Failed to create TLS QUIC client config".to_string(),
+    //                 ));
+    //             };
+    //             let client_config = quinn::ClientConfig::new(Arc::new(client_config));
+    //             let connection = match socket
+    //                 .connect_with(client_config, sock_addr, &addr.host())
+    //                 .map_err(|err| match err {
+    //                     quinn::ConnectError::EndpointStopping => ConnectionError::ConnectionClosed(
+    //                         "internal endpoint is stopping, cannot create new connections"
+    //                             .to_string(),
+    //                     ),
+    //                     quinn::ConnectError::CidsExhausted => ConnectionError::FailedToConnect(
+    //                         "CID space are exhausted, cannot create new connections".to_string(),
+    //                     ),
+    //                     quinn::ConnectError::InvalidServerName(name) => {
+    //                         ConnectionError::FailedToConnect(format!(
+    //                             "Invalid server name: {}",
+    //                             name
+    //                         ))
+    //                     }
+    //                     quinn::ConnectError::InvalidRemoteAddress(socket_addr) => {
+    //                         ConnectionError::FailedToConnect(format!(
+    //                             "Invalid remote address: {}",
+    //                             socket_addr
+    //                         ))
+    //                     }
+    //                     quinn::ConnectError::NoDefaultClientConfig => {
+    //                         ConnectionError::InvalidConfiguration
+    //                     }
+    //                     quinn::ConnectError::UnsupportedVersion => {
+    //                         ConnectionError::FailedToConnect(
+    //                             "Peer does not support the required QUIC version".to_string(),
+    //                         )
+    //                     }
+    //                 }) {
+    //                 Ok(connection) => connection,
+    //                 Err(e) => {
+    //                     self.state = QuicConnectionState::Disconnected {
+    //                         reason: ConnectionError::ConnectionFailed(
+    //                             "Failed to open initial connection to node.".to_string(),
+    //                         ),
+    //                     };
+    //                     return Err(e);
+    //                 }
+    //             }
+    //             .await?;
+    //
+    //             self.state = QuicConnectionState::Connected { connection };
+    //             Ok(())
+    //         }
+    //         _ => Ok(()),
+    //     }
+    // }
 
-                let crypto = tls.into_client_config()?;
-                let sock_addr = addr.to_sock_addrs()?;
-
-                let Ok(client_config) = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-                else {
-                    return Err(ConnectionError::FailedToConnect(
-                        "Failed to create TLS QUIC client config".to_string(),
-                    ));
-                };
-                let client_config = quinn::ClientConfig::new(Arc::new(client_config));
-                let connection = match socket
-                    .connect_with(client_config, sock_addr, &addr.host())
-                    .map_err(|err| match err {
-                        quinn::ConnectError::EndpointStopping => ConnectionError::ConnectionClosed(
-                            "internal endpoint is stopping, cannot create new connections"
-                                .to_string(),
-                        ),
-                        quinn::ConnectError::CidsExhausted => ConnectionError::FailedToConnect(
-                            "CID space are exhausted, cannot create new connections".to_string(),
-                        ),
-                        quinn::ConnectError::InvalidServerName(name) => {
-                            ConnectionError::FailedToConnect(format!(
-                                "Invalid server name: {}",
-                                name
-                            ))
-                        }
-                        quinn::ConnectError::InvalidRemoteAddress(socket_addr) => {
-                            ConnectionError::FailedToConnect(format!(
-                                "Invalid remote address: {}",
-                                socket_addr
-                            ))
-                        }
-                        quinn::ConnectError::NoDefaultClientConfig => {
-                            ConnectionError::InvalidConfiguration
-                        }
-                        quinn::ConnectError::UnsupportedVersion => {
-                            ConnectionError::FailedToConnect(
-                                "Peer does not support the required QUIC version".to_string(),
-                            )
-                        }
-                    }) {
-                    Ok(connection) => connection,
-                    Err(e) => {
-                        self.state = QuicConnectionState::Disconnected {
-                            reason: ConnectionError::ConnectionFailed(
-                                "Failed to open initial connection to node.".to_string(),
-                            ),
-                        };
-                        return Err(e);
-                    }
-                }
-                .await?;
-
-                self.state = QuicConnectionState::Connected { connection };
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    async fn open_stream(&mut self) -> Result<RawStream, ConnectionError> {
-        match &self.state {
-            QuicConnectionState::Connected { connection } => {
-                // Open a bidirectional stream
-                let (send, recv) = connection.open_bi().await.map_err(|e| {
-                    ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
-                })?;
-
-                // Create the raw stream
-                Ok(RawStream::new(Box::new(recv), Box::new(send)))
-            }
-            QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
-            QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
-                format!("Connection is disconnected: {}", reason),
-            )),
-        }
-    }
-
-    async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError> {
-        match &self.state {
-            QuicConnectionState::Connected { connection } => {
-                // Clone the connection to move it into the AcceptStream future
-                let connection_clone = connection.clone();
-
-                // Return an AcceptStream future that will resolve to a RawStream when awaited
-                Ok(AcceptStream::new(move || {
-                    let connection = connection_clone.clone();
-                    async move {
-                        // Accept a bidirectional stream
-                        let (send, recv) = connection.accept_bi().await.map_err(|e| {
-                            ConnectionError::ConnectionFailed(format!(
-                                "Failed to accept stream: {}",
-                                e
-                            ))
-                        })?;
-
-                        // Create the raw stream
-                        Ok(RawStream::new(Box::new(recv), Box::new(send)))
-                    }
-                }))
-            }
-            QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
-            QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
-                format!("Connection is disconnected: {}", reason),
-            )),
-        }
-    }
+    // async fn open_stream(&mut self) -> Result<Stream, ConnectionError> {
+    //     match &self.state {
+    //         QuicConnectionState::Connected { connection } => {
+    //             // Open a bidirectional stream
+    //             let (send, recv) = connection.open_bi().await.map_err(|e| {
+    //                 ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
+    //             })?;
+    //
+    //             // Create the raw stream
+    //             Ok(Stream::new(Box::new(recv), Box::new(send)))
+    //         }
+    //         QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
+    //         QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+    //             format!("Connection is disconnected: {}", reason),
+    //         )),
+    //     }
+    // }
+    //
+    // async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError> {
+    //     match &self.state {
+    //         QuicConnectionState::Connected { connection } => {
+    //             // Clone the connection to move it into the AcceptStream future
+    //             let connection_clone = connection.clone();
+    //
+    //             // Return an AcceptStream future that will resolve to a RawStream when awaited
+    //             Ok(AcceptStream::new(move || {
+    //                 let connection = connection_clone.clone();
+    //                 async move {
+    //                     // Accept a bidirectional stream
+    //                     let (send, recv) = connection.accept_bi().await.map_err(|e| {
+    //                         ConnectionError::ConnectionFailed(format!(
+    //                             "Failed to accept stream: {}",
+    //                             e
+    //                         ))
+    //                     })?;
+    //
+    //                     // Create the raw stream
+    //                     Ok(Stream::new(Box::new(recv), Box::new(send)))
+    //                 }
+    //             }))
+    //         }
+    //         QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
+    //         QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+    //             format!("Connection is disconnected: {}", reason),
+    //         )),
+    //     }
+    // }
 }
 
 #[derive(thiserror::Error, Debug)]

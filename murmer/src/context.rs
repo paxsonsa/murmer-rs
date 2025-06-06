@@ -64,6 +64,11 @@ where
         System::current()
     }
 
+    /// Cancel the actor's execution.
+    pub(crate) fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
     /// Return a cancellation token for this actor.
     pub(crate) fn inner_cancellation(&self) -> tokio_util::sync::CancellationToken {
         self.cancellation.clone()
@@ -90,13 +95,14 @@ where
     /// ```
     pub fn interval<F, M>(&self, interval: std::time::Duration, message_factory: F)
     where
-        F: Fn() -> M + Send + 'static,
+        F: Fn(&CancellationToken) -> M + Send + 'static,
         M: Message + Send + 'static,
         A: Handler<M>,
         M::Result: Send,
     {
         let endpoint = self.endpoint();
         let cancellation = self.cancellation.child_token();
+        let cancellation_clone = cancellation.clone();
 
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
@@ -104,7 +110,7 @@ where
             loop {
                 tokio::select! {
                     _ = interval_timer.tick() => {
-                        let msg = message_factory();
+                        let msg = message_factory(&cancellation_clone);
                         if let Err(err) = endpoint.send(msg).await {
                             tracing::error!(error=%err, "Failed to send interval message");
                             break;

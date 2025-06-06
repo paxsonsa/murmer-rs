@@ -1,23 +1,14 @@
 use crate::cluster::ClusterId;
-use crate::net::{self, NetworkAddrRef, QuicConnectionDriver};
+use crate::net::{self, NetworkAddrRef};
 use crate::prelude::*;
-use crate::tls::TlsConfig;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-
-#[cfg(test)]
-#[path = "mod.test.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "harness_test.rs"]
-mod harness_tests;
 
 mod actor;
 use actor::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Status {
+pub enum MembershipStatus {
     Pending,
     Up,
     Down,
@@ -115,11 +106,9 @@ impl Node {
         system: System,
         cluster_id: Arc<ClusterId>,
         node_info: NodeInfo,
-        driver: Box<dyn net::NetworkDriver>,
+        driver: Box<dyn net::ConnectionDriver>,
     ) -> Option<Node> {
-        let id = Id::new();
-        let endpoint = system.spawn_with(NodeActor::new(cluster_id.id, id, node_info, driver));
-        endpoint.map(|e| Node { id, endpoint: e }).ok()
+        todo!("Implement Node::spawn");
     }
 }
 

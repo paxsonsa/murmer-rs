@@ -13,6 +13,9 @@ pub use async_trait::async_trait;
 /// - Have a lifecycle managed by the system
 #[async_trait]
 pub trait Actor: Unpin + Sized + Send + 'static {
+    /// A unique key for identifying the actor across the system.
+    const ACTOR_TYPE_KEY: &'static str;
+
     /// Called when the actor is started but before it begins processing messages.
     /// Use this to perform any initialization.
     async fn started(&mut self, _ctx: &mut Context<Self>) {}
@@ -24,13 +27,6 @@ pub trait Actor: Unpin + Sized + Send + 'static {
     /// Called after the actor has been shut down and finished processing messages.
     /// Use this for final cleanup.
     async fn stopped(&mut self, _ctx: &mut Context<Self>) {}
-}
-
-pub trait Registered
-where
-    Self: Actor + Handler<RemoteMessage>,
-{
-    const RECEPTIONIST_KEY: &'static str;
 }
 
 /// A trait for handling specific message types.

@@ -19,7 +19,9 @@ struct CounterActor {
     on_increment: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-impl Actor for CounterActor {}
+impl Actor for CounterActor {
+    const ACTOR_TYPE_KEY: &'static str = "CounterActor";
+}
 
 impl CounterActor {
     /// Create a new counter actor

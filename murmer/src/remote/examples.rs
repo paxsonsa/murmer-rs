@@ -4,8 +4,8 @@ use crate::message::{Message, RemoteMessage};
 use crate::path::ActorPath;
 use crate::prelude::*;
 use crate::register_remote_actor;
-use crate::remote_message;
 use crate::remote::RemoteRegistered;
+use crate::remote_message;
 use crate::system::AnyEndpoint;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,9 @@ pub struct UserActor {
     user_id: String,
 }
 
-impl Actor for UserActor {}
+impl Actor for UserActor {
+    const ACTOR_TYPE_KEY: &'static str = "user-actor";
+}
 
 impl Registered for UserActor {
     const RECEPTIONIST_KEY: &'static str = "user-actor";
@@ -27,20 +29,16 @@ impl Registered for UserActor {
 impl RemoteRegistered for UserActor {
     fn create_remote_endpoint(
         path: ActorPath,
-        proxy_tx: tokio::sync::mpsc::Sender<crate::remote::RemoteProxyMessage>
+        proxy_tx: tokio::sync::mpsc::Sender<crate::remote::RemoteProxyMessage>,
     ) -> AnyEndpoint {
         use crate::remote::{RemoteEndpointSender, TypedRemoteEndpointSender};
-        
+
         // Create the RemoteEndpointSender that communicates with the RemoteProxy
-        let sender = RemoteEndpointSender::new(
-            proxy_tx,
-            path.clone(),
-            "user-actor".to_string()
-        );
-        
+        let sender = RemoteEndpointSender::new(proxy_tx, path.clone(), "user-actor".to_string());
+
         // Create a TypedRemoteEndpointSender for GetUserProfile messages
         let get_profile_sender = TypedRemoteEndpointSender::<GetUserProfile>::new(sender.clone());
-        
+
         // Create and return the AnyEndpoint with the properly typed sender
         AnyEndpoint {
             endpoint_sender: Box::new(get_profile_sender),
@@ -50,7 +48,7 @@ impl RemoteRegistered for UserActor {
             actor_type_string: Some("user-actor".to_string()),
         }
     }
-    
+
     fn message_handlers() -> Vec<(&'static str, fn(Bytes) -> Result<Bytes, String>)> {
         vec![
             // Handler for GetUserProfile messages
@@ -61,20 +59,20 @@ impl RemoteRegistered for UserActor {
                     Ok((msg, _)) => msg,
                     Err(e) => return Err(format!("Deserialization error: {}", e)),
                 };
-                
+
                 // Create a response (in a real implementation, this would call the actual handler)
                 let response: Result<UserProfile, UserError> = Ok(UserProfile {
                     user_id: msg.user_id,
                     name: "Example User".to_string(),
                     email: None,
                 });
-                
+
                 // Serialize the response
                 match bincode::encode_to_vec(&response, config) {
                     Ok(r) => Ok(Bytes::from(r)),
                     Err(e) => Err(format!("Serialization error: {}", e)),
                 }
-            })
+            }),
         ]
     }
 }
@@ -153,7 +151,7 @@ impl Handler<RemoteMessage> for UserActor {
 fn test_actor_registration() {
     // Just verify that we can iterate and find our registration
     let mut found = false;
-    
+
     // Iterate through all registered actor types
     for registration in inventory::iter::<crate::remote::ActorTypeRegistration>() {
         if registration.key == "user-actor" {
@@ -161,7 +159,7 @@ fn test_actor_registration() {
             assert_eq!(registration.type_name, "UserActor");
         }
     }
-    
+
     assert!(found, "Actor registration was not found in inventory");
 }
 
@@ -169,14 +167,16 @@ fn test_actor_registration() {
 fn test_message_registration() {
     // Just verify that we can iterate and find our message registration
     let mut found = false;
-    
+
     // Iterate through all registered message types
     for registration in inventory::iter::<crate::remote::MessageTypeRegistration>() {
-        if registration.actor_type == "user-actor" && registration.message_type == "get-user-profile" {
+        if registration.actor_type == "user-actor"
+            && registration.message_type == "get-user-profile"
+        {
             found = true;
         }
     }
-    
+
     assert!(found, "Message registration was not found in inventory");
 }
 
@@ -184,16 +184,16 @@ fn test_message_registration() {
 fn test_registration_and_lookup() {
     // This test verifies that we can find our actor type in the inventory system
     // through string-based lookup using the registration key
-    
+
     let mut found = false;
     for registration in inventory::iter::<crate::remote::ActorTypeRegistration>() {
         if registration.key == "user-actor" {
             // Found the right registration, mark it as found
             found = true;
-            
+
             // Verify basic properties
             assert_eq!(registration.type_name, "UserActor");
-            
+
             // Create a dummy ActorPath and channel
             let path = crate::path::ActorPath::remote(
                 "127.0.0.1".to_string(),
@@ -201,13 +201,14 @@ fn test_registration_and_lookup() {
                 "user-actor".to_string(),
                 crate::id::Id::new(),
             );
-            
+
             let (tx, _) = tokio::sync::mpsc::channel(32);
-            
+
             // Verify we can call the factory function without errors
             let _endpoint = (registration.create_endpoint)(path, tx);
         }
     }
-    
+
     assert!(found, "Could not find UserActor registration in inventory");
 }
+

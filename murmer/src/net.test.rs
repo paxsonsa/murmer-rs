@@ -28,8 +28,8 @@ fn test_wire_frame_encode_decode() {
     let decoded = Frame::<TestMessage>::decode(body_bytes).unwrap();
 
     // Verify the decoded frame
-    match &decoded.payload {
-        Payload::Ok(msg) => assert_eq!(msg.value, "test"),
+    match &decoded.body {
+        FrameBody::Ok(msg) => assert_eq!(msg.value, "test"),
         _ => panic!("Decoded wrong message type"),
     }
 }
@@ -84,15 +84,15 @@ fn test_frame_reader() {
     assert!(reader.parse().unwrap().is_none());
 
     // Verify the parsed frames
-    match &parsed1.payload {
-        Payload::Ok(msg) => {
+    match &parsed1.body {
+        FrameBody::Ok(msg) => {
             assert_eq!(msg.value, "test1");
         }
         _ => panic!("Parsed wrong message type for frame 1"),
     }
 
-    match &parsed2.payload {
-        Payload::Ok(msg) => {
+    match &parsed2.body {
+        FrameBody::Ok(msg) => {
             assert_eq!(msg.value, "test2");
         }
         _ => panic!("Parsed wrong message type for frame 2"),
