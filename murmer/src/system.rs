@@ -509,6 +509,14 @@ where
             .await
             .is_ok()
     }
+
+    pub async fn stopping(&mut self) {
+        self.runtime.actor.stopping(&mut self.ctx).await;
+    }
+
+    pub async fn stopped(&mut self) {
+        self.runtime.actor.stopped(&mut self.ctx).await;
+    }
 }
 
 trait State {}

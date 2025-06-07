@@ -157,6 +157,12 @@ impl<A: Actor> ActorTestHandle<A> {
 
         Err("Timed out waiting for condition")
     }
+
+    /// Stop the actor by calling the stopping and stopped lifecycle methods
+    pub async fn stop(&mut self) {
+        self.supervisor.stopping().await;
+        self.supervisor.stopped().await;
+    }
 }
 
 // Re-export necessary types for easier imports

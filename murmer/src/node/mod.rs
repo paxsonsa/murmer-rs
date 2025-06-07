@@ -1,3 +1,101 @@
+//! # Node Module
+//! 
+//! The node module provides distributed actor communication capabilities through the NodeActor.
+//! 
+//! ## Purpose & Role
+//! 
+//! The NodeActor represents a **connection to a remote node** in a distributed actor cluster. 
+//! It's responsible for maintaining the network connection, managing the cluster membership 
+//! lifecycle, and facilitating communication between local and remote actors.
+//! 
+//! ## Core Architecture
+//! 
+//! ### State Management
+//! 
+//! The NodeActor tracks multiple state dimensions:
+//! - **NodeState**: Lifecycle (Initiating → Accepting → Running → Stopped/Failed)
+//! - **MembershipStatus**: Cluster membership (Joining → Up → Down) 
+//! - **ReachabilityStatus**: Health monitoring (Pending → Reachable ⇄ Unreachable)
+//! - **ConnectionState**: Network layer (Pending → Established → Disconnected)
+//! 
+//! ### Connection Establishment Flow
+//! 
+//! **Connector (initiating) side:**
+//! ```text
+//! 1. Send Initialize message
+//! 2. Receive Join message (with remote node ID)
+//! 3. Send JoinAck 
+//! 4. Start heartbeats → Running state
+//! ```
+//! 
+//! **Acceptor (receiving) side:**
+//! ```text
+//! 1. Receive Initialize message  
+//! 2. Send Join message (with own node ID)
+//! 3. Receive JoinAck
+//! 4. Start heartbeats → Running state
+//! ```
+//! 
+//! ### Message Processing Pipeline
+//! 
+//! The actor runs a continuous loop that:
+//! 1. **Reads frames** from the network connection
+//! 2. **Deserializes** them into Payload types
+//! 3. **Dispatches** to appropriate handlers:
+//!    - `Initialize` → connection setup
+//!    - `Join/JoinAck` → membership negotiation  
+//!    - `Heartbeat` → health monitoring
+//!    - `Leave` → graceful shutdown
+//!    - `Info` → metadata exchange (stub)
+//!    - `ActorAdd/Remove` → distributed registry sync (stubs)
+//! 
+//! ### Heartbeat System
+//! 
+//! Two concurrent processes maintain connection health:
+//! 
+//! **SendHeartbeat task** (every 3s):
+//! - Sends Heartbeat messages to remote node
+//! - Cancels itself if connection fails
+//! 
+//! **CheckHeartbeat task** (every 3s):  
+//! - Monitors if heartbeats were received since last check
+//! - Tracks missed heartbeats (>3 = Unreachable)
+//! - Tracks successful heartbeats (>3 = Reachable again)
+//! 
+//! ### Lifecycle Management
+//! 
+//! **Actor startup (`started()`):**
+//! - Transitions connection from Pending → Established
+//! - Spawns network reading task 
+//! - Begins message processing
+//! 
+//! **Actor shutdown (`stopping()`):**
+//! - Sends Leave message for graceful disconnect
+//! - Allows remote node to clean up
+//! 
+//! ## Key Design Patterns
+//! 
+//! ### Bidirectional Communication
+//! Both nodes can initiate messages and both maintain heartbeats, creating a symmetric relationship.
+//! 
+//! ### Fault Tolerance
+//! - Heartbeat timeouts detect network partitions
+//! - State machines handle reconnection scenarios
+//! - Graceful Leave messages prevent resource leaks
+//! 
+//! ### Distributed Actor Registry
+//! The ActorAdd/Remove messages (when implemented) will synchronize which actors are available 
+//! on each node, enabling the receptionist pattern for distributed actor discovery.
+//! 
+//! ## Data Flow
+//! ```text
+//! Local Actor → System → Receptionist → NodeActor → Network → Remote NodeActor → Remote Receptionist → Remote Actor
+//! ```
+//! 
+//! The NodeActor essentially acts as a **network proxy** that bridges the local actor system 
+//! with remote actor systems, handling all the distributed systems concerns (connection management, 
+//! health monitoring, membership) while presenting a clean interface to the actor layer above.
+
 use crate::cluster::ClusterId;
 use crate::net::{self, NetworkAddrRef};
 use crate::prelude::*;

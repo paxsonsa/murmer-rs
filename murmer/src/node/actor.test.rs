@@ -571,3 +571,201 @@ async fn test_node_reachability() {
         }
     }
 }
+
+/// Test that the node properly handles Leave messages
+#[test_log::test(tokio::test)]
+async fn test_node_leave_handling() {
+    let remote_id = Id::new();
+    let (stream, _write_record) = MockStream::with_recorder();
+    let connection: Box<dyn Connection> = Box::new(MockConnection {
+        stream: stream.clone(),
+    });
+
+    let harness = ActorTestHarness::new();
+    let node = NodeActor::connect("127.0.0.1:7788".into(), connection)
+        .await
+        .expect("Failed to connect");
+
+    let mut handler = harness.spawn(node);
+    handler.start().await;
+
+    // Set up node as running
+    handler.actor_ref_mut().info.remote_id = Some(remote_id);
+    handler.actor_ref_mut().membership_status = MembershipStatus::Up;
+    handler.actor_ref_mut().state = NodeState::Running;
+    handler.actor_ref_mut().reachability = ReachabilityStatus::Reachable {
+        last_seen: chrono::Utc::now(),
+        missed_heartbeats: 0,
+    };
+
+    // Send Leave message
+    handler
+        .send(RecvFrame {
+            frame: net::Frame::ok(remote_id, None, Payload::Leave),
+        })
+        .await
+        .expect("Failed to send Leave message");
+
+    // Verify state changes
+    assert_matches!(handler.actor_ref().state, NodeState::Stopped);
+    assert_matches!(handler.actor_ref().membership_status, MembershipStatus::Down);
+    assert_matches!(
+        handler.actor_ref().reachability,
+        ReachabilityStatus::Unreachable { .. }
+    );
+}
+
+/// Test that the node sends Leave message during shutdown
+#[test_log::test(tokio::test)]
+async fn test_node_leave_on_shutdown() {
+    let remote_id = Id::new();
+    let (stream, _write_record) = MockStream::with_recorder();
+    let connection: Box<dyn Connection> = Box::new(MockConnection {
+        stream: stream.clone(),
+    });
+
+    let harness = ActorTestHarness::new();
+    let node = NodeActor::connect("127.0.0.1:7788".into(), connection)
+        .await
+        .expect("Failed to connect");
+
+    let mut handler = harness.spawn(node);
+    handler.start().await;
+
+    // Set up established connection
+    handler.actor_ref_mut().info.remote_id = Some(remote_id);
+    handler.actor_ref_mut().membership_status = MembershipStatus::Up;
+    handler.actor_ref_mut().state = NodeState::Running;
+
+    // Trigger shutdown
+    handler.stop().await;
+
+    // Verify Leave message was sent
+    handler
+        .process_until_frame::<Payload, _>(
+            &stream,
+            1000,
+            Some(move |frame: &net::Frame<Payload>| {
+                let body = &frame.body;
+                matches!(body, net::FrameBody::Ok(Payload::Leave))
+            }),
+        )
+        .await
+        .expect("Failed to receive Leave frame during shutdown");
+}
+
+/// Test that the node properly handles Initialize messages (acceptor flow)
+#[test_log::test(tokio::test)]
+async fn test_node_initialize_handling() {
+    let remote_id = Id::new();
+    let (stream, _write_record) = MockStream::with_recorder();
+    let connection: Box<dyn Connection> = Box::new(MockConnection {
+        stream: stream.clone(),
+    });
+
+    let harness = ActorTestHarness::new();
+    let node = NodeActor::accept("127.0.0.1:7788".into(), connection)
+        .await
+        .expect("Failed to accept connection");
+
+    let mut handler = harness.spawn(node);
+    handler.start().await;
+
+    // Verify initial state
+    assert_matches!(handler.actor_ref().info.remote_id, None);
+    assert_matches!(handler.actor_ref().state, NodeState::Accepting);
+
+    // Send Initialize message from remote node
+    handler
+        .send(RecvFrame {
+            frame: net::Frame::ok(remote_id, None, Payload::Initialize),
+        })
+        .await
+        .expect("Failed to send Initialize message");
+
+    // Verify that remote_id was set and state updated
+    assert_matches!(
+        handler.actor_ref().info.remote_id,
+        Some(id) if id == remote_id
+    );
+    assert_matches!(handler.actor_ref().state, NodeState::Running);
+    assert_matches!(handler.actor_ref().membership_status, MembershipStatus::Joining);
+
+    // Verify Join response was sent
+    handler
+        .process_until_frame::<Payload, _>(
+            &stream,
+            1000,
+            Some(move |frame: &net::Frame<Payload>| {
+                let body = &frame.body;
+                matches!(body, net::FrameBody::Ok(Payload::Join))
+            }),
+        )
+        .await
+        .expect("Failed to receive Join response frame");
+}
+
+/// Test that the connector flow properly starts heartbeats after sending JoinAck
+#[test_log::test(tokio::test)]
+async fn test_connector_heartbeat_setup() {
+    let remote_id = Id::new();
+    let (stream, _write_record) = MockStream::with_recorder();
+    let connection: Box<dyn Connection> = Box::new(MockConnection {
+        stream: stream.clone(),
+    });
+
+    let harness = ActorTestHarness::new();
+    let node = NodeActor::connect("127.0.0.1:7788".into(), connection)
+        .await
+        .expect("Failed to connect");
+
+    let mut handler = harness.spawn(node);
+    handler.start().await;
+
+    // Verify initial state
+    assert_matches!(handler.actor_ref().info.remote_id, None);
+    assert_matches!(handler.actor_ref().state, NodeState::Initiating);
+
+    // Connector should have sent Initialize during construction, 
+    // now we simulate receiving Join from acceptor
+    handler
+        .send(RecvFrame {
+            frame: net::Frame::ok(remote_id, None, Payload::Join),
+        })
+        .await
+        .expect("Failed to send Join message");
+
+    // Verify that connector side is fully set up
+    assert_matches!(
+        handler.actor_ref().info.remote_id,
+        Some(id) if id == remote_id
+    );
+    assert_matches!(handler.actor_ref().state, NodeState::Running);
+    assert_matches!(handler.actor_ref().membership_status, MembershipStatus::Up);
+
+    // Verify JoinAck response was sent
+    handler
+        .process_until_frame::<Payload, _>(
+            &stream,
+            1000,
+            Some(move |frame: &net::Frame<Payload>| {
+                let body = &frame.body;
+                matches!(body, net::FrameBody::Ok(Payload::JoinAck))
+            }),
+        )
+        .await
+        .expect("Failed to receive JoinAck response frame");
+
+    // Wait a bit and verify heartbeat was sent (indicating heartbeat tasks started)
+    handler
+        .process_until_frame::<Payload, _>(
+            &stream,
+            4000, // Give time for heartbeat interval (3s)
+            Some(move |frame: &net::Frame<Payload>| {
+                let body = &frame.body;
+                matches!(body, net::FrameBody::Ok(Payload::Heartbeat))
+            }),
+        )
+        .await
+        .expect("Failed to receive heartbeat frame after connector handshake");
+}
