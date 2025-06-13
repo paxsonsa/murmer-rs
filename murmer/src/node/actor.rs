@@ -14,6 +14,7 @@ use crate::{
     net::{
         Connection, ConnectionError, Frame, FrameBody, FrameReader, FrameWriter, NetworkAddrRef,
     },
+    receptionist::{RegistryEvent, SubscriptionFilter},
 };
 
 use super::MembershipStatus;
@@ -561,6 +562,93 @@ impl NodeActor {
             cancellation: cancellation.clone(),
         });
     }
+
+    /// Subscribe to receptionist events and start broadcasting local actor changes to remote nodes
+    async fn start_receptionist_subscription(&mut self, ctx: &mut Context<Self>) {
+        // Subscribe to all local actor events
+        let filter = SubscriptionFilter {
+            actor_type: "*".to_string(), // Subscribe to all actor types
+            group_pattern: None,         // No group filtering
+        };
+
+        match self.receptionist.subscribe(filter).await {
+            Ok(mut subscription) => {
+                tracing::info!(
+                    "NodeActor {} subscribed to receptionist events",
+                    self.info.network_address
+                );
+
+                // Start a task to handle registry events
+                let endpoint = ctx.endpoint();
+                ctx.spawn(async move {
+                    while let Some(event) = subscription.next().await {
+                        tracing::debug!("NodeActor received registry event: {:?}", event);
+
+                        // Send the event back to the NodeActor for processing
+                        let handle_event_msg = HandleRegistryEvent { event };
+                        
+                        if let Err(err) = endpoint.send(handle_event_msg).await {
+                            tracing::error!(
+                                "Failed to send registry event to NodeActor: {}",
+                                err
+                            );
+                            break;
+                        }
+                    }
+                    tracing::info!("NodeActor registry event subscription ended");
+                });
+            }
+            Err(err) => {
+                tracing::error!(
+                    "Failed to subscribe to receptionist events for NodeActor {}: {}",
+                    self.info.network_address,
+                    err
+                );
+            }
+        }
+    }
+
+    /// Broadcast an ActorAdd message to the remote node
+    async fn broadcast_actor_add(&mut self, actor_path: crate::path::ActorPath) {
+        if let ConnectionState::Established { send_stream, .. } = &mut self.connection {
+            let payload = Payload::ActorAdd(actor_path.clone());
+            if let Err(err) = send_stream.send(payload).await {
+                tracing::error!(
+                    "Failed to broadcast ActorAdd for {:?} to remote node {:?}: {}",
+                    actor_path,
+                    self.info.remote_id,
+                    err
+                );
+            } else {
+                tracing::debug!(
+                    "Successfully broadcast ActorAdd for {:?} to remote node {:?}",
+                    actor_path,
+                    self.info.remote_id
+                );
+            }
+        }
+    }
+
+    /// Broadcast an ActorRemove message to the remote node
+    async fn broadcast_actor_remove(&mut self, actor_path: crate::path::ActorPath) {
+        if let ConnectionState::Established { send_stream, .. } = &mut self.connection {
+            let payload = Payload::ActorRemove(actor_path.clone());
+            if let Err(err) = send_stream.send(payload).await {
+                tracing::error!(
+                    "Failed to broadcast ActorRemove for {:?} to remote node {:?}: {}",
+                    actor_path,
+                    self.info.remote_id,
+                    err
+                );
+            } else {
+                tracing::debug!(
+                    "Successfully broadcast ActorRemove for {:?} to remote node {:?}",
+                    actor_path,
+                    self.info.remote_id
+                );
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -577,6 +665,9 @@ impl Actor for NodeActor {
         };
         self.connection = state;
         self.membership_status = MembershipStatus::Joining;
+
+        // Subscribe to receptionist events to broadcast local actor changes
+        self.start_receptionist_subscription(ctx).await;
 
         // Start the read stream for the node connection.
         let endpoint = ctx.endpoint();
@@ -673,6 +764,51 @@ impl Handler<RecvFrame> for NodeActor {
             Payload::Info => self.handle_info(ctx).await,
             Payload::ActorAdd(actor_path) => self.handle_actor_add(actor_path, ctx).await,
             Payload::ActorRemove(actor_path) => self.handle_actor_remove(actor_path, ctx).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HandleRegistryEvent {
+    event: RegistryEvent,
+}
+
+impl Message for HandleRegistryEvent {
+    type Result = ();
+}
+
+#[async_trait::async_trait]
+impl Handler<HandleRegistryEvent> for NodeActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: HandleRegistryEvent) -> () {
+        // Only broadcast events for established connections
+        if !matches!(self.connection, ConnectionState::Established { .. }) {
+            tracing::debug!("Connection not established, skipping registry event broadcast");
+            return;
+        }
+
+        match msg.event {
+            RegistryEvent::Added(actor_path, _endpoint) => {
+                // Only broadcast local actors (don't re-broadcast remote actors)
+                if actor_path.is_local() {
+                    tracing::debug!(
+                        "Broadcasting ActorAdd for local actor {:?} to remote node {:?}",
+                        actor_path,
+                        self.info.remote_id
+                    );
+                    self.broadcast_actor_add(actor_path).await;
+                }
+            }
+            RegistryEvent::Removed(actor_path) => {
+                // Only broadcast local actors (don't re-broadcast remote actors)
+                if actor_path.is_local() {
+                    tracing::debug!(
+                        "Broadcasting ActorRemove for local actor {:?} to remote node {:?}",
+                        actor_path,
+                        self.info.remote_id
+                    );
+                    self.broadcast_actor_remove(actor_path).await;
+                }
+            }
         }
     }
 }
