@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
+use tokio::sync::mpsc;
 
 use crate::message::{Message, SendError};
 use crate::{
@@ -17,6 +18,68 @@ use crate::{
 #[cfg(test)]
 #[path = "receptionist.test.rs"]
 mod tests;
+
+/// Events emitted by the receptionist when actors are registered or deregistered
+#[derive(Debug, Clone)]
+pub enum RegistryEvent {
+    /// An actor was added to the registry
+    Added(ActorPath, AnyEndpoint),
+    /// An actor was removed from the registry
+    Removed(ActorPath),
+}
+
+/// Filter configuration for registry event subscriptions
+#[derive(Debug, Clone)]
+pub struct SubscriptionFilter {
+    /// Exact actor type to subscribe to (required - no wildcards allowed)
+    pub actor_type: String,
+    /// Optional glob pattern for group matching (e.g., "region*", "default")
+    pub group_pattern: Option<String>,
+}
+
+impl Default for SubscriptionFilter {
+    fn default() -> Self {
+        Self {
+            actor_type: "*".to_string(), // Match all types by default (for backward compatibility)
+            group_pattern: None,         // No group filtering by default
+        }
+    }
+}
+
+/// A subscription to registry events
+pub struct Subscription {
+    /// Channel receiver for registry events
+    receiver: mpsc::UnboundedReceiver<RegistryEvent>,
+}
+
+impl Subscription {
+    /// Create a new subscription with the given receiver
+    fn new(receiver: mpsc::UnboundedReceiver<RegistryEvent>) -> Self {
+        Self { receiver }
+    }
+
+    /// Get the next registry event
+    pub async fn next(&mut self) -> Option<RegistryEvent> {
+        self.receiver.recv().await
+    }
+}
+
+/// Internal subscription tracking
+#[derive(Debug)]
+struct SubscriberInfo {
+    /// Channel sender for this subscription
+    sender: mpsc::UnboundedSender<RegistryEvent>,
+    /// Filter configuration
+    filter: SubscriptionFilter,
+}
+
+/// Errors that can occur during subscription operations
+#[derive(Debug, thiserror::Error)]
+pub enum SubscriptionError {
+    /// Failed to send message to receptionist
+    #[error("Failed to communicate with receptionist: {0}")]
+    CommunicationError(#[from] SendError),
+}
 
 /// Factory trait for creating endpoints on demand
 pub trait EndpointFactory: Send + Sync + 'static {
@@ -79,25 +142,6 @@ impl EndpointFactory for NoOpFactory {
     }
 }
 
-/// Placeholder factory for backward compatibility
-struct PlaceholderFactory {
-    path: ActorPath,
-}
-
-impl EndpointFactory for PlaceholderFactory {
-    fn create(&self) -> AnyEndpoint {
-        panic!(
-            "PlaceholderFactory for path {:?} was called - this should be replaced with a proper remote endpoint factory",
-            self.path
-        )
-    }
-
-    fn clone_factory(&self) -> Box<dyn EndpointFactory> {
-        Box::new(PlaceholderFactory {
-            path: self.path.clone(),
-        })
-    }
-}
 
 impl PartialEq for LazyEndpoint {
     fn eq(&self, other: &Self) -> bool {
@@ -131,18 +175,15 @@ struct Entry {
     endpoint: LazyEndpoint,
 }
 
+#[derive(Default)]
 pub struct ReceptionistActor {
     /// Map of the actors registered with the receptionist.
     /// This stores the actors under their actor type key.
     registered_actors: HashMap<String, HashSet<Entry>>,
-}
-
-impl Default for ReceptionistActor {
-    fn default() -> Self {
-        Self {
-            registered_actors: HashMap::new(),
-        }
-    }
+    /// Active subscriptions to registry events
+    subscribers: Vec<SubscriberInfo>,
+    /// Next subscription ID for tracking
+    next_subscription_id: usize,
 }
 
 impl Actor for ReceptionistActor {
@@ -208,15 +249,18 @@ impl Handler<RegisterMessage> for ReceptionistActor {
             return false;
         };
 
+        let event = RegistryEvent::Added(actor_path.clone(), lazy_endpoint.get_endpoint());
         let entry = Entry {
             actor_path,
             endpoint: lazy_endpoint,
         };
-
         self.registered_actors
             .entry(key)
             .or_insert_with(HashSet::new)
             .insert(entry);
+
+        // Broadcast the registration event to subscribers
+        self.broadcast_event(event);
 
         true
     }
@@ -241,7 +285,14 @@ impl Handler<DeregisterMessage> for ReceptionistActor {
         if let Some(entries) = self.registered_actors.get_mut(&key) {
             let original_len = entries.len();
             entries.retain(|entry| entry.actor_path != msg.path);
-            entries.len() < original_len
+            let was_removed = entries.len() < original_len;
+
+            if was_removed {
+                let event = RegistryEvent::Removed(msg.path);
+                self.broadcast_event(event);
+            }
+
+            was_removed
         } else {
             false
         }
@@ -255,8 +306,21 @@ pub struct LookupMessage {
     pub actor_type_key: String,
 }
 
+/// Message to subscribe to registry events
+#[derive(Debug)]
+pub struct SubscribeMessage {
+    /// Filter for subscription events
+    pub filter: SubscriptionFilter,
+    /// Channel sender for delivering events
+    pub sender: mpsc::UnboundedSender<RegistryEvent>,
+}
+
 impl Message for LookupMessage {
     type Result = Vec<AnyEndpoint>;
+}
+
+impl Message for SubscribeMessage {
+    type Result = ();
 }
 
 #[async_trait]
@@ -271,6 +335,72 @@ impl Handler<LookupMessage> for ReceptionistActor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl Handler<SubscribeMessage> for ReceptionistActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: SubscribeMessage) -> () {
+        let subscriber_info = SubscriberInfo {
+            sender: msg.sender,
+            filter: msg.filter,
+        };
+
+        self.subscribers.push(subscriber_info);
+
+        tracing::debug!(
+            "Added new subscription, total subscribers: {}",
+            self.subscribers.len()
+        );
+    }
+}
+
+impl ReceptionistActor {
+    /// Broadcast a registry event to all matching subscribers
+    fn broadcast_event(&mut self, event: RegistryEvent) {
+        let mut to_remove = Vec::new();
+
+        for (index, subscriber) in self.subscribers.iter().enumerate() {
+            if self.should_send_event(&event, &subscriber.filter) {
+                if let Err(_) = subscriber.sender.send(event.clone()) {
+                    // Subscriber channel is closed, mark for removal
+                    tracing::debug!("Removing disconnected subscriber");
+                    to_remove.push(index);
+                }
+            }
+        }
+
+        // Remove disconnected subscribers in reverse order to maintain indices
+        for &index in to_remove.iter().rev() {
+            self.subscribers.remove(index);
+        }
+    }
+
+    /// Check if an event should be sent to a subscriber based on their filter
+    fn should_send_event(&self, event: &RegistryEvent, filter: &SubscriptionFilter) -> bool {
+        let path = match event {
+            RegistryEvent::Added(path, _) => path,
+            RegistryEvent::Removed(path) => path,
+        };
+
+        // Check actor type match (exact match required, unless "*" for all types)
+        if filter.actor_type != "*" && path.type_id.as_ref() != filter.actor_type {
+            return false;
+        }
+
+        // Check group pattern if specified
+        if let Some(group_pattern) = &filter.group_pattern {
+            match glob::Pattern::new(group_pattern) {
+                Ok(pattern) => pattern.matches(path.group_id.as_ref()),
+                Err(_) => {
+                    tracing::warn!("Invalid glob pattern: {}", group_pattern);
+                    false
+                }
+            }
+        } else {
+            // No group filtering, type matched, so send event
+            true
+        }
     }
 }
 
@@ -306,16 +436,6 @@ impl Receptionist {
         }
     }
 
-    /// Register an actor with just the path (for backward compatibility)
-    /// This creates a placeholder registration that will be resolved later
-    pub async fn register(&self, path: ActorPath) -> Result<bool, SendError> {
-        // For now, create a placeholder factory that will panic if used
-        // In a real implementation, this might create a lazy remote endpoint factory
-        let factory = Box::new(PlaceholderFactory { path: path.clone() });
-        self.inner_endpoint
-            .send(RegisterMessage::remote(path, factory))
-            .await
-    }
 
     /// Register a local actor with an existing endpoint
     pub async fn register_local(
@@ -392,5 +512,21 @@ impl Receptionist {
             1 => Ok(endpoints.into_iter().next().unwrap()),
             _ => Err(LookupError::MultipleFound),
         }
+    }
+
+    /// Subscribe to registry events with optional filtering
+    pub async fn subscribe(
+        &self,
+        filter: SubscriptionFilter,
+    ) -> Result<Subscription, SubscriptionError> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+
+        // Send subscribe message to the receptionist actor
+        self.inner_endpoint
+            .send(SubscribeMessage { filter, sender })
+            .await?;
+
+        // Return the subscription handle
+        Ok(Subscription::new(receiver))
     }
 }

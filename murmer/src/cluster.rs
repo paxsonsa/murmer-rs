@@ -204,7 +204,7 @@ impl Actor for ClusterActor {
         if let Err(e) = ctx
             .system()
             .receptionist_ref()
-            .register(ctx.endpoint().path().clone())
+            .register_local(ctx.endpoint().path().clone(), ctx.endpoint().clone().into())
             .await
         {
             tracing::error!(error=?e, "Failed to register cluster actor with receptionist");

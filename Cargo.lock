@@ -952,6 +952,7 @@ dependencies = [
  "directories-next",
  "dyn-clone",
  "futures",
+ "glob",
  "hostname",
  "inventory",
  "parking_lot",

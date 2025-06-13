@@ -13,6 +13,13 @@ use std::io::{self};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
+
+// Helper function to create a mock receptionist for tests
+fn create_mock_receptionist() -> crate::receptionist::Receptionist {
+    let actor = crate::receptionist::ReceptionistActor::default();
+    let supervisor = crate::system::Supervisor::construct(actor);
+    crate::receptionist::Receptionist::new(supervisor.endpoint())
+}
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Clone)]
@@ -334,7 +341,7 @@ async fn test_node_initiation() {
         stream: stream.clone(),
     });
 
-    let node = NodeActor::connect("127.0.0.1:7788".into(), connection)
+    let node = NodeActor::connect("127.0.0.1:7788".into(), connection, create_mock_receptionist())
         .await
         .expect("Failed to connect");
 
@@ -415,7 +422,7 @@ async fn test_node_heartbeat() {
     });
 
     let harness = ActorTestHarness::new();
-    let node = NodeActor::connect("127.0.1:7788".into(), connection)
+    let node = NodeActor::connect("127.0.1:7788".into(), connection, create_mock_receptionist())
         .await
         .expect("Failed to connect");
 
@@ -457,7 +464,7 @@ async fn test_node_reachability() {
     });
 
     let harness = ActorTestHarness::new();
-    let node = NodeActor::connect("127.0.1:7788".into(), connection)
+    let node = NodeActor::connect("127.0.1:7788".into(), connection, create_mock_receptionist())
         .await
         .expect("Failed to connect");
 
@@ -582,7 +589,7 @@ async fn test_node_leave_handling() {
     });
 
     let harness = ActorTestHarness::new();
-    let node = NodeActor::connect("127.0.0.1:7788".into(), connection)
+    let node = NodeActor::connect("127.0.0.1:7788".into(), connection, create_mock_receptionist())
         .await
         .expect("Failed to connect");
 
@@ -625,7 +632,7 @@ async fn test_node_leave_on_shutdown() {
     });
 
     let harness = ActorTestHarness::new();
-    let node = NodeActor::connect("127.0.0.1:7788".into(), connection)
+    let node = NodeActor::connect("127.0.0.1:7788".into(), connection, create_mock_receptionist())
         .await
         .expect("Failed to connect");
 
@@ -664,7 +671,7 @@ async fn test_node_initialize_handling() {
     });
 
     let harness = ActorTestHarness::new();
-    let node = NodeActor::accept("127.0.0.1:7788".into(), connection)
+    let node = NodeActor::accept("127.0.0.1:7788".into(), connection, create_mock_receptionist())
         .await
         .expect("Failed to accept connection");
 
@@ -715,7 +722,7 @@ async fn test_connector_heartbeat_setup() {
     });
 
     let harness = ActorTestHarness::new();
-    let node = NodeActor::connect("127.0.0.1:7788".into(), connection)
+    let node = NodeActor::connect("127.0.0.1:7788".into(), connection, create_mock_receptionist())
         .await
         .expect("Failed to connect");
 

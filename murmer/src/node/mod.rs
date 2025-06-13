@@ -196,7 +196,7 @@ impl From<NetworkAddrRef> for NodeInfo {
 #[derive(Clone)]
 pub struct Node {
     pub id: Id,
-    pub endpoint: Endpoint<NodeActor>,
+    pub endpoint: crate::system::LocalEndpoint<NodeActor>,
 }
 
 impl Node {
@@ -207,6 +207,23 @@ impl Node {
         driver: Box<dyn net::ConnectionDriver>,
     ) -> Option<Node> {
         todo!("Implement Node::spawn");
+    }
+
+    /// Create a remote proxy endpoint for a given actor path
+    /// This method creates an endpoint that will communicate with a remote actor
+    /// through this node's connection
+    pub fn create_remote_proxy<A: crate::actor::Actor>(
+        &self,
+        path: crate::path::ActorPath,
+    ) -> Result<crate::system::Endpoint<A>, NodeError> {
+        // Create a RemoteProxy for network communication
+        let proxy = crate::system::RemoteProxy::new(self.clone(), path.clone());
+        
+        // Create an EndpointSender using the remote proxy
+        let sender = crate::system::EndpointSender::from_remote_proxy(proxy);
+        
+        // Create and return the typed endpoint
+        Ok(crate::system::Endpoint::new(sender, std::sync::Arc::new(path)))
     }
 }
 

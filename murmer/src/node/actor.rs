@@ -1,14 +1,7 @@
-// TODO: Handle the actor lifecycle properly, including starting, stopping, and error handling.
-// ✅ DONE: Handle Leave - implemented in handle_leave() and stopping() lifecycle
-// ✅ DONE: Handle Info - stub implemented in handle_info()
-// ✅ DONE: Handle ActorAdd/ActorRemove - stubs implemented
-// ✅ DONE: Handle Initialize - implemented acceptor flow in handle_initialize()
 // TODO: ActorAdd: Create a new remote endpoint for the actor and add it the receptionist
 // TODO: ActorRemove: Remove the remote endpoint for the actor and remove it from the receptionist
 // TODO: Send ActorAdd/ActorRemove messages to the remote node when actors are added or removed to
 // the receptionist.
-// TODO: Consider having a receptionist public status?
-// Actor <- -> Node <- -> Node <- -> Actor
 use std::{fmt::Debug, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -135,8 +128,10 @@ pub(super) enum Payload {
     Heartbeat,
     Leave,
     Info,
-    ActorAdd,
-    ActorRemove,
+    /// Represents a message to add an actor to the remote node's registry
+    ActorAdd(crate::path::ActorPath),
+    /// Represents a message to remove an actor from the remote node's registry
+    ActorRemove(crate::path::ActorPath),
 }
 
 pub(super) enum ConnectionState {
@@ -228,12 +223,14 @@ pub struct NodeActor {
     pub(super) membership_status: MembershipStatus,
     pub(super) reachability: ReachabilityStatus,
     pub(super) connection: ConnectionState,
+    pub(super) receptionist: crate::receptionist::Receptionist,
 }
 
 impl NodeActor {
     pub async fn connect(
         network_address: NetworkAddrRef,
         mut connection: Box<dyn Connection>,
+        receptionist: crate::receptionist::Receptionist,
     ) -> Result<Self, NodeError> {
         // Connection is established without error, attempt to open a new stream
         // as the main pipe for communication with the remote node.
@@ -262,12 +259,14 @@ impl NodeActor {
                 read_stream: Some(receiver),
                 send_stream: Some(sender),
             },
+            receptionist,
         })
     }
 
     pub async fn accept(
         network_address: NetworkAddrRef,
         mut connection: Box<dyn Connection>,
+        receptionist: crate::receptionist::Receptionist,
     ) -> Result<Self, NodeError> {
         // Connection is established without error, attempt to open a new stream
         // as the main pipe for communication with the remote node.
@@ -292,6 +291,7 @@ impl NodeActor {
                 read_stream: Some(receiver),
                 send_stream: Some(sender),
             },
+            receptionist,
         };
         Ok(node)
     }
@@ -323,7 +323,7 @@ impl NodeActor {
         }
         self.membership_status = MembershipStatus::Up;
         self.state = NodeState::Running;
-        
+
         // Start heartbeat tasks for the connector side (we sent JoinAck, so handshake is complete)
         self.start_heartbeat_tasks(ctx).await;
     }
@@ -380,7 +380,7 @@ impl NodeActor {
         // Update the membership status to Down and state to Stopped for graceful shutdown
         self.membership_status = MembershipStatus::Down;
         self.state = NodeState::Stopped;
-        
+
         // Mark the node as unreachable since it's leaving
         self.reachability = ReachabilityStatus::Unreachable {
             last_seen: chrono::Utc::now(),
@@ -403,28 +403,113 @@ impl NodeActor {
         // This could include exchanging node capabilities, metadata, or status information
     }
 
-    async fn handle_actor_add(&mut self, _ctx: &mut Context<Self>) {
+    async fn handle_actor_add(&mut self, remote_path: crate::path::ActorPath, ctx: &mut Context<Self>) {
         // Handle the ActorAdd message from the remote node.
         tracing::info!(
-            "Node {} received ActorAdd message from remote node {:?}",
+            "Node {} received ActorAdd message for actor {:?} from remote node {:?}",
             self.info.network_address,
+            remote_path,
             self.info.remote_id
         );
 
-        // TODO: Create a new remote endpoint for the actor and add it to the receptionist
-        // This will enable remote actor discovery and communication
+        // FIXME: AI Generated Please Review
+        let Some(remote_id) = self.info.remote_id else {
+            tracing::error!(
+                "Cannot handle ActorAdd - remote node ID not set for connection {}",
+                self.info.network_address
+            );
+            return;
+        };
+
+        // Transform the path to reflect the actual remote location
+        let transformed_path = self.transform_remote_path(remote_path);
+        
+        // Create a Node from this NodeActor's endpoint
+        let node_endpoint = ctx.endpoint();
+        let local_endpoint = crate::system::LocalEndpoint::from_endpoint(node_endpoint);
+        let node = crate::node::Node {
+            id: remote_id,
+            endpoint: local_endpoint,
+        };
+        
+        // Create a RemoteEndpointFactory for lazy proxy creation
+        let factory = Box::new(crate::system::RemoteEndpointFactory::new(
+            node,
+            transformed_path.clone(),
+        ));
+        
+        // Register the remote actor with the local receptionist
+        if let Err(err) = self.receptionist.register_remote(transformed_path.clone(), factory).await {
+            tracing::error!(
+                "Failed to register remote actor {:?} from node {:?}: {}",
+                transformed_path,
+                remote_id,
+                err
+            );
+        } else {
+            tracing::debug!(
+                "Successfully registered remote actor {:?} from node {:?}",
+                transformed_path,
+                remote_id
+            );
+        }
+    }
+    
+    /// Transform a remote actor path to reflect its actual remote location
+    fn transform_remote_path(&self, remote_path: crate::path::ActorPath) -> crate::path::ActorPath {
+        let _remote_id = self.info.remote_id.expect("Remote ID must be set");
+        
+        // For now, we'll create a remote scheme based on the network address
+        // TODO: Extract actual host/port from network address
+        let scheme = crate::path::AddressScheme::Remote {
+            host: "127.0.0.1".to_string(), // TODO: Extract from network_address
+            port: 4000, // TODO: Extract from network_address
+        };
+        
+        crate::path::ActorPath {
+            scheme,
+            type_id: remote_path.type_id,
+            group_id: remote_path.group_id,
+            instance_id: remote_path.instance_id,
+        }
     }
 
-    async fn handle_actor_remove(&mut self, _ctx: &mut Context<Self>) {
+    async fn handle_actor_remove(&mut self, remote_path: crate::path::ActorPath, _ctx: &mut Context<Self>) {
         // Handle the ActorRemove message from the remote node.
         tracing::info!(
-            "Node {} received ActorRemove message from remote node {:?}",
+            "Node {} received ActorRemove message for actor {:?} from remote node {:?}",
             self.info.network_address,
+            remote_path,
             self.info.remote_id
         );
 
-        // TODO: Remove the remote endpoint for the actor and remove it from the receptionist
-        // This will clean up remote actor references
+        // FIXME: AI Generated Please Review
+        let Some(remote_id) = self.info.remote_id else {
+            tracing::error!(
+                "Cannot handle ActorRemove - remote node ID not set for connection {}",
+                self.info.network_address
+            );
+            return;
+        };
+
+        // Transform the path to reflect the actual remote location
+        let transformed_path = self.transform_remote_path(remote_path);
+        
+        // Deregister the remote actor from the local receptionist
+        if let Err(err) = self.receptionist.deregister(transformed_path.clone()).await {
+            tracing::error!(
+                "Failed to deregister remote actor {:?} from node {:?}: {}",
+                transformed_path,
+                remote_id,
+                err
+            );
+        } else {
+            tracing::debug!(
+                "Successfully deregistered remote actor {:?} from node {:?}",
+                transformed_path,
+                remote_id
+            );
+        }
     }
 
     async fn handle_initialize(&mut self, remote_id: Id, _ctx: &mut Context<Self>) {
@@ -534,13 +619,13 @@ impl Actor for NodeActor {
             let payload = Payload::Leave;
             if let Err(err) = send_stream.send(payload).await {
                 tracing::error!(
-                    "Failed to send Leave message during shutdown to remote node {:?}: {}", 
-                    self.info.remote_id, 
+                    "Failed to send Leave message during shutdown to remote node {:?}: {}",
+                    self.info.remote_id,
                     err
                 );
             } else {
                 tracing::info!(
-                    "Sent Leave message to remote node {:?} during shutdown", 
+                    "Sent Leave message to remote node {:?} during shutdown",
                     self.info.remote_id
                 );
             }
@@ -586,8 +671,8 @@ impl Handler<RecvFrame> for NodeActor {
             Payload::Heartbeat => self.handle_heartbeat().await,
             Payload::Leave => self.handle_leave().await,
             Payload::Info => self.handle_info(ctx).await,
-            Payload::ActorAdd => self.handle_actor_add(ctx).await,
-            Payload::ActorRemove => self.handle_actor_remove(ctx).await,
+            Payload::ActorAdd(actor_path) => self.handle_actor_add(actor_path, ctx).await,
+            Payload::ActorRemove(actor_path) => self.handle_actor_remove(actor_path, ctx).await,
         }
     }
 }
