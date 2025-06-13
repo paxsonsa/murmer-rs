@@ -1,9 +1,15 @@
 use crate::net::{
-    AcceptStream, Connection, ConnectionDriver, ConnectionError, NetworkAddrRef, Stream,
+    AcceptStream, Connection, ConnectionError, Stream,
 };
 use crate::test_utils::prelude::*;
+use crate::prelude::{Actor, Id};
 
-use super::*;
+use super::{
+    actor::NodeActor,
+    messages::{Payload, RecvFrame, CheckHeartbeat},
+    status::{NodeState, ReachabilityStatus, MembershipStatus},
+    connection::ConnectionState,
+};
 use crate::net;
 
 use assert_matches::assert_matches;
@@ -92,6 +98,11 @@ struct MockConnection {
 
 #[async_trait::async_trait]
 impl Connection for MockConnection {
+    async fn connect(&mut self) -> Result<(), ConnectionError> {
+        // Mock connect - always succeeds
+        Ok(())
+    }
+
     async fn open_stream(&mut self) -> Result<Stream, ConnectionError> {
         // Create mock read/write streams
         let read_data = self.stream.read_stream.clone();
@@ -125,18 +136,6 @@ impl Connection for MockConnection {
     }
 }
 
-struct MockConnectionDriver {
-    stream: MockStream,
-}
-
-impl MockConnectionDriver {
-    fn new(stream: MockStream) -> Self {
-        MockConnectionDriver { stream }
-    }
-}
-
-#[async_trait::async_trait]
-impl ConnectionDriver for MockConnectionDriver {}
 
 // Improved mock reader that reads from the TestingDriver's read_stream
 struct MockStreamReader {

@@ -1,223 +1,21 @@
-// TODO: ActorAdd: Create a new remote endpoint for the actor and add it the receptionist
-// TODO: ActorRemove: Remove the remote endpoint for the actor and remove it from the receptionist
-// TODO: Send ActorAdd/ActorRemove messages to the remote node when actors are added or removed to
-// the receptionist.
-use std::{fmt::Debug, time::Duration};
-
-use serde::{Deserialize, Serialize};
+//! Core NodeActor implementation for distributed node communication
 
 use crate::{
     actor::{Actor, Handler},
     context::Context,
-    id::Id,
-    message::Message,
-    net::{
-        Connection, ConnectionError, Frame, FrameBody, FrameReader, FrameWriter, NetworkAddrRef,
-    },
-    receptionist::{RegistryEvent, SubscriptionFilter},
+    net::{Connection, FrameBody, NetworkAddrRef},
+};
+use super::{
+    connection::ConnectionState,
+    errors::NodeError,
+    messages::{NodeInfo, Payload, RecvFrame},
+    status::{NodeState, ReachabilityStatus, MembershipStatus},
 };
 
-use super::MembershipStatus;
+// Include trait implementations from submodules
+use std::time::Duration;
 
-pub struct NodeInfo {
-    /// Unique identifier for the node.
-    pub remote_id: Option<Id>,
-    /// Network address of the node.
-    pub network_address: NetworkAddrRef,
-}
-
-#[cfg(test)]
-#[path = "actor.test.rs"]
-mod tests;
-
-/// Represents the reachability status of a node in the cluster.
-/// Indicates whether the node is reachable or unreachable based on heartbeat checks.
-/// The reachability status is used to determine if the node is healthy enough to communicate with.
-///
-#[derive(Debug)]
-pub enum ReachabilityStatus {
-    /// The node's reachability is currently unknown or not yet determined.
-    Pending,
-    /// The node is reachable and has been successfully communicating.
-    Reachable {
-        /// The node is reachable and can be communicated with.
-        last_seen: chrono::DateTime<chrono::Utc>,
-        /// The number of missed heartbeats since the last successful communication.
-        /// After a certain threshold, the node may be considered unreachable until it responds
-        /// again.
-        missed_heartbeats: u32,
-    },
-    Unreachable {
-        /// The node is unreachable and cannot be communicated with.
-        last_seen: chrono::DateTime<chrono::Utc>,
-        /// The number of successful heartbeats since the last missed heartbeat.
-        /// After a certain threshold, the node may be considered reachable again.
-        successful_heartbeat: u32,
-    },
-}
-
-impl ReachabilityStatus {
-    /// Get the last time the node was seen, if available
-    pub fn last_seen_time(&self) -> chrono::DateTime<chrono::Utc> {
-        match self {
-            ReachabilityStatus::Reachable { last_seen, .. } => *last_seen,
-            ReachabilityStatus::Unreachable { last_seen, .. } => *last_seen,
-            ReachabilityStatus::Pending => chrono::Utc::now(), // Default to now for pending nodes
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum NodeState {
-    Initiating,
-    Accepting,
-    Running,
-    Stopped,
-    Failed {
-        /// The reason for the failure, if available.
-        reason: String,
-    },
-}
-
-/// The message payloads used for communication between nodes in the cluster.
-///
-/// This enum defines the different types of messages that can be sent and received
-/// between nodes in the cluster.
-///
-/// In a connection there are is a sender and receiver which we will call the connector and
-/// acceptor. The connector is the node that initiates the connection, while the acceptor is the node that
-/// accepts the connection.
-///
-/// 1) The `Initialize` payload is sent by the connector to initiate the connection.
-/// 2) The `Join` payload is sent by the acceptor to join the cluster.
-/// 3) The `JoinAck` payload is sent by the connector to acknowledge the join request. At this
-///    point the link is considered established and the connector can start sending messages to the
-///    acceptor.
-///
-/// **Heartbeats**
-/// Both the connector and acceptor send heartbeats to each other to ensure that the connection is
-/// still alive. It is important that both nodes send heartbeats to each other, as this allows
-/// the nodes to detect if the other node is still reachable. The heartbeat controls the
-/// reachability status of the node, which is used to determine if the node is healthy enough to
-/// communicate with.
-///
-/// **Leave**
-/// The `Leave` payload can be sent by either the connector or acceptor to indicate that they are
-/// leaving the cluster. This payload is used to gracefully close the connection and inform the
-/// other node that it is no longer part of the cluster.
-///
-/// **Info**
-/// The `Info` payload can be used to send information about the node, such as its capabilities and
-/// certain metadata.
-///
-/// **ActorAdd/ActorRemove**
-/// These payloads are used to add or remove actors from the node. These payloads are used to
-/// exchange the current actor state between the nodes in the cluster and ensure that any
-/// publically accessible actors are available on both nodes. These should be exchanged by both
-/// sides of the connection.
-///
-///
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) enum Payload {
-    /// Represents the initialization payload sent when establishing a connection.
-    Initialize,
-    /// Represents a message sent to join the cluster.
-    Join,
-    /// Represents an acknowledgment of a join request.
-    JoinAck,
-    /// Represents a heartbeat message to check the health of the connection.
-    Heartbeat,
-    Leave,
-    Info,
-    /// Represents a message to add an actor to the remote node's registry
-    ActorAdd(crate::path::ActorPath),
-    /// Represents a message to remove an actor from the remote node's registry
-    ActorRemove(crate::path::ActorPath),
-}
-
-pub(super) enum ConnectionState {
-    /// Represents a connection that is currently being established.
-    Pending {
-        /// The handle to the connection driver used to establish the connection.
-        handle: Option<Box<dyn Connection>>,
-
-        /// The stream used for communication with the remote node, if available.
-        read_stream: Option<FrameReader<Payload>>,
-
-        /// The stream used for sending data to the remote node, if available.
-        send_stream: Option<FrameWriter<Payload>>,
-    },
-    Established {
-        handle: Option<Box<dyn Connection>>,
-        /// The stream used for communication with the remote node.
-        send_stream: FrameWriter<Payload>,
-    },
-    /// Represents a closed or disconnected connection.
-    Disconnected {
-        handle: Option<Box<dyn Connection>>,
-        /// The reason for the disconnection, if available.
-        reason: Option<ConnectionError>,
-    },
-}
-
-impl ConnectionState {
-    /// Checks if the connection is in a pending state.
-    pub fn is_pending(&self) -> bool {
-        matches!(self, ConnectionState::Pending { .. })
-    }
-
-    /// Checks if the connection is established.
-    pub fn is_established(&self) -> bool {
-        matches!(self, ConnectionState::Established { .. })
-    }
-
-    /// Checks if the connection is disconnected.
-    pub fn is_disconnected(&self) -> bool {
-        matches!(self, ConnectionState::Disconnected { .. })
-    }
-
-    pub fn to_established(&mut self) -> Option<(ConnectionState, FrameReader<Payload>)> {
-        // Transition from Pending to Established state and return the read stream.
-        if let ConnectionState::Pending {
-            handle,
-            read_stream,
-            send_stream,
-        } = self
-        {
-            let new_state = ConnectionState::Established {
-                handle: Some(handle.take().expect("Connection handle must be available")),
-                send_stream: send_stream.take().expect("Send stream must be available"),
-            };
-            let read_stream = read_stream.take().expect("Read stream must be available");
-            Some((new_state, read_stream))
-        } else {
-            None
-        }
-    }
-}
-
-impl Debug for ConnectionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionState::Pending { .. } => write!(f, "ConnectionState::Pending"),
-            ConnectionState::Established { .. } => write!(f, "ConnectionState::Established"),
-            ConnectionState::Disconnected { reason, .. } => {
-                write!(f, "ConnectionState::Disconnected({:?})", reason)
-            }
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum NodeError {
-    #[error("Failed while initiating connection: {0}")]
-    InitiationFailed(String),
-    #[error("Connection error: {0}")]
-    ConnectionError(#[from] ConnectionError),
-    #[error("Network error: {0}")]
-    NetworkError(#[from] crate::net::NetError),
-}
-
+/// The main NodeActor that handles distributed communication
 pub struct NodeActor {
     pub(super) info: NodeInfo,
     pub(super) state: NodeState,
@@ -228,6 +26,7 @@ pub struct NodeActor {
 }
 
 impl NodeActor {
+    /// Create a NodeActor for outgoing connections (we initiate)
     pub async fn connect(
         network_address: NetworkAddrRef,
         mut connection: Box<dyn Connection>,
@@ -264,6 +63,7 @@ impl NodeActor {
         })
     }
 
+    /// Create a NodeActor for incoming connections (they initiate)
     pub async fn accept(
         network_address: NetworkAddrRef,
         mut connection: Box<dyn Connection>,
@@ -297,7 +97,8 @@ impl NodeActor {
         Ok(node)
     }
 
-    async fn handle_join(&mut self, remote_id: Id, ctx: &mut Context<Self>) {
+    /// Handle Join message from remote node
+    async fn handle_join(&mut self, remote_id: crate::id::Id, ctx: &mut Context<Self>) {
         // Update the node's info with the remote ID.
         tracing::debug!(
             "Node {} is joining with remote ID: {}",
@@ -329,6 +130,7 @@ impl NodeActor {
         self.start_heartbeat_tasks(ctx).await;
     }
 
+    /// Handle JoinAck message from remote node
     async fn handle_join_ack(&mut self, ctx: &mut Context<Self>) {
         // Handle the JoinAck message from the remote node.
         tracing::debug!(
@@ -343,6 +145,7 @@ impl NodeActor {
         self.start_heartbeat_tasks(ctx).await;
     }
 
+    /// Handle heartbeat message from remote node
     async fn handle_heartbeat(&mut self) {
         // Handle the heartbeat message from the remote node.
         tracing::debug!(
@@ -370,6 +173,7 @@ impl NodeActor {
         }
     }
 
+    /// Handle leave message from remote node
     async fn handle_leave(&mut self) {
         // Handle the Leave message from the remote node.
         tracing::info!(
@@ -392,6 +196,7 @@ impl NodeActor {
         // For now, we just log the Leave message and update the state
     }
 
+    /// Handle info message from remote node
     async fn handle_info(&mut self, _ctx: &mut Context<Self>) {
         // Handle the Info message from the remote node.
         tracing::info!(
@@ -404,6 +209,7 @@ impl NodeActor {
         // This could include exchanging node capabilities, metadata, or status information
     }
 
+    /// Handle ActorAdd message from remote node
     async fn handle_actor_add(&mut self, remote_path: crate::path::ActorPath, ctx: &mut Context<Self>) {
         // Handle the ActorAdd message from the remote node.
         tracing::info!(
@@ -455,26 +261,8 @@ impl NodeActor {
             );
         }
     }
-    
-    /// Transform a remote actor path to reflect its actual remote location
-    fn transform_remote_path(&self, remote_path: crate::path::ActorPath) -> crate::path::ActorPath {
-        let _remote_id = self.info.remote_id.expect("Remote ID must be set");
-        
-        // For now, we'll create a remote scheme based on the network address
-        // TODO: Extract actual host/port from network address
-        let scheme = crate::path::AddressScheme::Remote {
-            host: "127.0.0.1".to_string(), // TODO: Extract from network_address
-            port: 4000, // TODO: Extract from network_address
-        };
-        
-        crate::path::ActorPath {
-            scheme,
-            type_id: remote_path.type_id,
-            group_id: remote_path.group_id,
-            instance_id: remote_path.instance_id,
-        }
-    }
 
+    /// Handle ActorRemove message from remote node
     async fn handle_actor_remove(&mut self, remote_path: crate::path::ActorPath, _ctx: &mut Context<Self>) {
         // Handle the ActorRemove message from the remote node.
         tracing::info!(
@@ -513,51 +301,15 @@ impl NodeActor {
         }
     }
 
-    async fn handle_initialize(&mut self, remote_id: Id, _ctx: &mut Context<Self>) {
-        // Handle the Initialize message from the remote node.
-        tracing::info!(
-            "Node {} received Initialize message from remote node {}",
-            self.info.network_address,
-            remote_id
-        );
-
-        // Set the remote node ID from the Initialize message
-        self.info.remote_id = Some(remote_id);
-
-        // Respond with a Join message to complete the acceptor handshake
-        if let ConnectionState::Established { send_stream, .. } = &mut self.connection {
-            let payload = Payload::Join;
-            if let Err(err) = send_stream.send(payload).await {
-                tracing::error!(
-                    "Failed to send Join response to Initialize from remote node {}: {}",
-                    remote_id,
-                    err
-                );
-                self.state = NodeState::Failed {
-                    reason: format!("Failed to send Join response: {}", err),
-                };
-                self.membership_status = MembershipStatus::Down;
-            } else {
-                tracing::info!(
-                    "Sent Join response to Initialize from remote node {}",
-                    remote_id
-                );
-                self.membership_status = MembershipStatus::Joining;
-                self.state = NodeState::Running;
-            }
-        } else {
-            tracing::error!(
-                "Connection not established, cannot send Join response to remote node {}",
-                remote_id
-            );
-        }
-    }
-
+    /// Start heartbeat monitoring tasks
     async fn start_heartbeat_tasks(&mut self, ctx: &mut Context<Self>) {
-        ctx.interval(Duration::from_secs(3), move |cancellation| SendHeartbeat {
+        // Send heartbeat every 3 seconds
+        ctx.interval(Duration::from_secs(3), move |cancellation| super::messages::SendHeartbeat {
             cancellation: cancellation.clone(),
         });
-        ctx.interval(Duration::from_secs(3), move |cancellation| CheckHeartbeat {
+        
+        // Check for missed heartbeats every 3 seconds
+        ctx.interval(Duration::from_secs(3), move |cancellation| super::messages::CheckHeartbeat {
             reference_time: chrono::Utc::now(),
             cancellation: cancellation.clone(),
         });
@@ -566,7 +318,7 @@ impl NodeActor {
     /// Subscribe to receptionist events and start broadcasting local actor changes to remote nodes
     async fn start_receptionist_subscription(&mut self, ctx: &mut Context<Self>) {
         // Subscribe to all local actor events
-        let filter = SubscriptionFilter {
+        let filter = crate::receptionist::SubscriptionFilter {
             actor_type: "*".to_string(), // Subscribe to all actor types
             group_pattern: None,         // No group filtering
         };
@@ -585,7 +337,7 @@ impl NodeActor {
                         tracing::debug!("NodeActor received registry event: {:?}", event);
 
                         // Send the event back to the NodeActor for processing
-                        let handle_event_msg = HandleRegistryEvent { event };
+                        let handle_event_msg = super::messages::HandleRegistryEvent { event };
                         
                         if let Err(err) = endpoint.send(handle_event_msg).await {
                             tracing::error!(
@@ -605,6 +357,25 @@ impl NodeActor {
                     err
                 );
             }
+        }
+    }
+
+    /// Transform a remote actor path to reflect its actual remote location
+    fn transform_remote_path(&self, remote_path: crate::path::ActorPath) -> crate::path::ActorPath {
+        let _remote_id = self.info.remote_id.expect("Remote ID must be set");
+        
+        // For now, we'll create a remote scheme based on the network address
+        // TODO: Extract actual host/port from network address
+        let scheme = crate::path::AddressScheme::Remote {
+            host: "127.0.0.1".to_string(), // TODO: Extract from network_address
+            port: 4000, // TODO: Extract from network_address
+        };
+        
+        crate::path::ActorPath {
+            scheme,
+            type_id: remote_path.type_id,
+            group_id: remote_path.group_id,
+            instance_id: remote_path.instance_id,
         }
     }
 
@@ -647,6 +418,47 @@ impl NodeActor {
                     self.info.remote_id
                 );
             }
+        }
+    }
+
+    /// Handle Initialize message from remote node
+    async fn handle_initialize(&mut self, remote_id: crate::id::Id, _ctx: &mut Context<Self>) {
+        // Handle the Initialize message from the remote node.
+        tracing::info!(
+            "Node {} received Initialize message from remote node {}",
+            self.info.network_address,
+            remote_id
+        );
+
+        // Set the remote node ID from the Initialize message
+        self.info.remote_id = Some(remote_id);
+
+        // Respond with a Join message to complete the acceptor handshake
+        if let ConnectionState::Established { send_stream, .. } = &mut self.connection {
+            let payload = Payload::Join;
+            if let Err(err) = send_stream.send(payload).await {
+                tracing::error!(
+                    "Failed to send Join response to Initialize from remote node {}: {}",
+                    remote_id,
+                    err
+                );
+                self.state = NodeState::Failed {
+                    reason: format!("Failed to send Join response: {}", err),
+                };
+                self.membership_status = MembershipStatus::Down;
+            } else {
+                tracing::info!(
+                    "Sent Join response to Initialize from remote node {}",
+                    remote_id
+                );
+                self.membership_status = MembershipStatus::Joining;
+                self.state = NodeState::Running;
+            }
+        } else {
+            tracing::error!(
+                "Connection not established, cannot send Join response to remote node {}",
+                remote_id
+            );
         }
     }
 }
@@ -730,21 +542,11 @@ impl Actor for NodeActor {
     async fn stopped(&mut self, _ctx: &mut Context<Self>) {}
 }
 
-#[derive(Debug)]
-struct RecvFrame {
-    frame: Frame<Payload>,
-}
-
-impl Message for RecvFrame {
-    type Result = ();
-}
-
 #[async_trait::async_trait]
 impl Handler<RecvFrame> for NodeActor {
     async fn handle(&mut self, ctx: &mut Context<Self>, msg: RecvFrame) -> () {
         // Handle the received frame message.
         tracing::info!("Handling received frame: {:?}", msg.frame);
-        // ctx.interval(Duration::from_secs(3), move || SendHeartbeat {});
         let header = msg.frame.header;
         let payload = match msg.frame.body {
             FrameBody::Ok(payload) => payload,
@@ -768,64 +570,11 @@ impl Handler<RecvFrame> for NodeActor {
     }
 }
 
-#[derive(Debug)]
-struct HandleRegistryEvent {
-    event: RegistryEvent,
-}
-
-impl Message for HandleRegistryEvent {
-    type Result = ();
-}
+// Handler implementations for message types
 
 #[async_trait::async_trait]
-impl Handler<HandleRegistryEvent> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: HandleRegistryEvent) -> () {
-        // Only broadcast events for established connections
-        if !matches!(self.connection, ConnectionState::Established { .. }) {
-            tracing::debug!("Connection not established, skipping registry event broadcast");
-            return;
-        }
-
-        match msg.event {
-            RegistryEvent::Added(actor_path, _endpoint) => {
-                // Only broadcast local actors (don't re-broadcast remote actors)
-                if actor_path.is_local() {
-                    tracing::debug!(
-                        "Broadcasting ActorAdd for local actor {:?} to remote node {:?}",
-                        actor_path,
-                        self.info.remote_id
-                    );
-                    self.broadcast_actor_add(actor_path).await;
-                }
-            }
-            RegistryEvent::Removed(actor_path) => {
-                // Only broadcast local actors (don't re-broadcast remote actors)
-                if actor_path.is_local() {
-                    tracing::debug!(
-                        "Broadcasting ActorRemove for local actor {:?} to remote node {:?}",
-                        actor_path,
-                        self.info.remote_id
-                    );
-                    self.broadcast_actor_remove(actor_path).await;
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SendHeartbeat {
-    /// Cancellation token for the heartbeat task.
-    pub cancellation: tokio_util::sync::CancellationToken,
-}
-
-impl Message for SendHeartbeat {
-    type Result = ();
-}
-
-#[async_trait::async_trait]
-impl Handler<SendHeartbeat> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: SendHeartbeat) -> () {
+impl Handler<super::messages::SendHeartbeat> for NodeActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: super::messages::SendHeartbeat) -> () {
         // Send a heartbeat message to the remote node.
         tracing::debug!(
             "Sending heartbeat to remote node: {:?}",
@@ -852,21 +601,9 @@ impl Handler<SendHeartbeat> for NodeActor {
     }
 }
 
-#[derive(Debug)]
-struct CheckHeartbeat {
-    /// Timestamp of the last heartbeat check.
-    pub reference_time: chrono::DateTime<chrono::Utc>,
-    /// Cancellation token for the heartbeat check task.
-    pub cancellation: tokio_util::sync::CancellationToken,
-}
-
-impl Message for CheckHeartbeat {
-    type Result = ();
-}
-
 #[async_trait::async_trait]
-impl Handler<CheckHeartbeat> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: CheckHeartbeat) -> () {
+impl Handler<super::messages::CheckHeartbeat> for NodeActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: super::messages::CheckHeartbeat) -> () {
         tracing::info!(
             "Checking heartbeat for remote node: {:?}",
             self.info.remote_id.expect("Remote ID must be set")
@@ -988,6 +725,42 @@ impl Handler<CheckHeartbeat> for NodeActor {
                         missed_heartbeats: 0,
                     };
                     self.membership_status = MembershipStatus::Up;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<super::messages::HandleRegistryEvent> for NodeActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: super::messages::HandleRegistryEvent) -> () {
+        // Only broadcast events for established connections
+        if !matches!(self.connection, ConnectionState::Established { .. }) {
+            tracing::debug!("Connection not established, skipping registry event broadcast");
+            return;
+        }
+
+        match msg.event {
+            crate::receptionist::RegistryEvent::Added(actor_path, _endpoint) => {
+                // Only broadcast local actors (don't re-broadcast remote actors)
+                if actor_path.is_local() {
+                    tracing::debug!(
+                        "Broadcasting ActorAdd for local actor {:?} to remote node {:?}",
+                        actor_path,
+                        self.info.remote_id
+                    );
+                    self.broadcast_actor_add(actor_path).await;
+                }
+            }
+            crate::receptionist::RegistryEvent::Removed(actor_path) => {
+                // Only broadcast local actors (don't re-broadcast remote actors)
+                if actor_path.is_local() {
+                    tracing::debug!(
+                        "Broadcasting ActorRemove for local actor {:?} to remote node {:?}",
+                        actor_path,
+                        self.info.remote_id
+                    );
+                    self.broadcast_actor_remove(actor_path).await;
                 }
             }
         }

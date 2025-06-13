@@ -3,7 +3,7 @@ use crate::net::{NetworkAddr, NetworkAddrRef, QuicConnectionDriver};
 use std::collections::{HashMap, HashSet};
 use std::{net::SocketAddr, sync::Arc};
 
-use super::node::*;
+use super::node::{MembershipStatus, Node, ReachabilityStatus}; 
 use super::prelude::*;
 use super::tls::TlsConfig;
 use super::tls::TlsConfigError;
@@ -11,6 +11,7 @@ use super::tls::TlsConfigError;
 #[cfg(test)]
 #[path = "cluster.test.rs"]
 mod test;
+
 
 #[derive(Clone)]
 pub struct Name(String);
@@ -78,7 +79,7 @@ pub struct Config {
 pub struct NodeStatus {
     pub node: Node,
     pub status: MembershipStatus,
-    pub reachability: Reachability,
+    pub reachability: ReachabilityStatus,
     pub is_configured: bool,
     pub last_updated: chrono::DateTime<chrono::Utc>,
 }
@@ -165,21 +166,29 @@ impl Actor for ClusterActor {
 
         // Connect to each peer defined in the initial configuration
         for peer in self.config.peers.iter() {
-            let node_info = NodeInfo::from(peer.clone());
-            let driver = Box::new(QuicConnectionDriver::unconnected(
-                node_info.clone(),
+            // Create NodeInfo from NetworkAddrRef for QuicConnectionDriver
+            let node_info = crate::node::NodeInfo {
+                remote_id: None,
+                network_address: peer.clone(),
+            };
+            
+            let connection = Box::new(QuicConnectionDriver::unconnected(
+                node_info,
                 self.socket.clone(),
                 self.config.tls.clone(),
-            ));
+            )) as Box<dyn crate::net::Connection>;
 
-            let Some(member) = Node::spawn(
+            let member = match Node::connect(
                 ctx.system(),
                 self.config.cluster_id.clone(),
-                node_info,
-                driver,
-            ) else {
-                tracing::error!("Failed to spawn member actor");
-                continue;
+                peer.clone(),
+                connection,
+            ).await {
+                Ok(node) => node,
+                Err(err) => {
+                    tracing::error!("Failed to connect to peer {}: {}", peer, err);
+                    continue;
+                }
             };
 
             // Add this node ID to the configured nodes set
@@ -189,7 +198,7 @@ impl Actor for ClusterActor {
             let node_status = NodeStatus {
                 node: member.clone(),
                 status: MembershipStatus::Pending,
-                reachability: Reachability::Pending,
+                reachability: ReachabilityStatus::Pending,
                 is_configured: true,
                 last_updated: chrono::Utc::now(),
             };
@@ -243,30 +252,39 @@ impl Handler<NewIncomingConnection> for ClusterActor {
         // For now, we'll just log it and accept it as a dynamic node
 
         // This is where we would:
-        // 1. Create a NodeInfo for the dynamic connection
-        // 2. Spawn a NodeActor for it
+        // 1. Create a connection for the dynamic connection
+        // 2. Accept a NodeActor for it
         // 3. Add it to our members list as a non-configured node
-        let node_info = NodeInfo::new(addr);
-        let connection = msg.connection;
-        let driver = Box::new(QuicConnectionDriver::connected(
-            node_info.clone(),
-            connection,
+        let quinn_connection = msg.connection;
+        
+        // Create NodeInfo from NetworkAddrRef for QuicConnectionDriver
+        let node_info = crate::node::NodeInfo {
+            remote_id: None,
+            network_address: addr.clone(),
+        };
+        
+        let connection = Box::new(QuicConnectionDriver::connected(
+            node_info,
+            quinn_connection,
             self.config.tls.clone(),
-        ));
+        )) as Box<dyn crate::net::Connection>;
 
-        let Some(node) = Node::spawn(
+        let node = match Node::accept(
             ctx.system(),
             self.config.cluster_id.clone(),
-            node_info,
-            driver,
-        ) else {
-            tracing::error!("Failed to spawn member actor");
-            return;
+            addr.clone(),
+            connection,
+        ).await {
+            Ok(node) => node,
+            Err(err) => {
+                tracing::error!("Failed to accept connection from {}: {}", addr, err);
+                return;
+            }
         };
         let node_status = NodeStatus {
             node: node.clone(),
             status: MembershipStatus::Pending,
-            reachability: Reachability::Pending,
+            reachability: ReachabilityStatus::Pending,
             is_configured: true,
             last_updated: chrono::Utc::now(),
         };
@@ -298,7 +316,7 @@ impl Handler<NodeStatusUpdate> for ClusterActor {
                 node_status.status,
                 MembershipStatus::Down | MembershipStatus::Failed
             ) && !node_status.is_configured
-                && matches!(node_status.reachability, Reachability::Unreachable { .. })
+                && matches!(node_status.reachability, ReachabilityStatus::Unreachable { .. })
             {
                 tracing::info!(node_id=%msg.id, "Non-configured node is unreachable, marked for cleanup");
                 // We'll let the cleanup interval task handle actual removal
@@ -349,7 +367,7 @@ impl Handler<CleanupUnreachableNodes> for ClusterActor {
                         status.status,
                         MembershipStatus::Down | MembershipStatus::Failed
                     )
-                    && matches!(status.reachability, Reachability::Unreachable { .. })
+                    && matches!(status.reachability, ReachabilityStatus::Unreachable { .. })
             })
             .map(|(id, _)| *id)
             .collect();
@@ -408,7 +426,7 @@ async fn accept_connection(
 pub struct NodeStatusUpdate {
     pub id: Id,
     pub status: MembershipStatus,
-    pub reachability: Reachability,
+    pub reachability: ReachabilityStatus,
     pub is_configured: bool, // Whether this node was in the initial configuration
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }

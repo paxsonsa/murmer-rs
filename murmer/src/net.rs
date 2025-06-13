@@ -37,6 +37,7 @@ pub enum NetworkAddrError {
     ToSocketAddrError(String),
 }
 
+#[derive(Debug)]
 pub enum NetworkAddr {
     Socket(SocketAddr),
     HostPort(String, u16),
@@ -102,7 +103,7 @@ impl std::fmt::Display for NetworkAddr {
 }
 
 // Newtype wrapper for Arc<NetworkAddr>
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NetworkAddrRef(pub Arc<NetworkAddr>);
 
 impl NetworkAddrRef {
@@ -697,12 +698,9 @@ impl std::future::Future for AcceptFuture<'_> {
     }
 }
 
-/// Network driver trait for establishing connections and opening streams
-#[async_trait::async_trait]
-pub trait ConnectionDriver: Send {}
-
 #[async_trait::async_trait]
 pub trait Connection: Send + Sync {
+    async fn connect(&mut self) -> Result<(), ConnectionError>;
     async fn open_stream(&mut self) -> Result<Stream, ConnectionError>;
     async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError>;
 }
@@ -743,127 +741,132 @@ impl QuicConnectionDriver {
 }
 
 #[async_trait::async_trait]
-impl ConnectionDriver for QuicConnectionDriver {
-    // async fn connect(&mut self) -> Result<(), ConnectionError> {
-    //     let Some(socket) = &self.socket else {
-    //         return Err(ConnectionError::ConnectionFailed(
-    //             "Socket is not available".to_string(),
-    //         ));
-    //     };
-    //     match &self.state {
-    //         QuicConnectionState::NotReady | QuicConnectionState::Disconnected { .. } => {
-    //             let tls = self.tls.clone();
-    //             let addr = self.node_info.addr.clone();
-    //             let socket = socket.clone();
-    //
-    //             let crypto = tls.into_client_config()?;
-    //             let sock_addr = addr.to_sock_addrs()?;
-    //
-    //             let Ok(client_config) = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-    //             else {
-    //                 return Err(ConnectionError::FailedToConnect(
-    //                     "Failed to create TLS QUIC client config".to_string(),
-    //                 ));
-    //             };
-    //             let client_config = quinn::ClientConfig::new(Arc::new(client_config));
-    //             let connection = match socket
-    //                 .connect_with(client_config, sock_addr, &addr.host())
-    //                 .map_err(|err| match err {
-    //                     quinn::ConnectError::EndpointStopping => ConnectionError::ConnectionClosed(
-    //                         "internal endpoint is stopping, cannot create new connections"
-    //                             .to_string(),
-    //                     ),
-    //                     quinn::ConnectError::CidsExhausted => ConnectionError::FailedToConnect(
-    //                         "CID space are exhausted, cannot create new connections".to_string(),
-    //                     ),
-    //                     quinn::ConnectError::InvalidServerName(name) => {
-    //                         ConnectionError::FailedToConnect(format!(
-    //                             "Invalid server name: {}",
-    //                             name
-    //                         ))
-    //                     }
-    //                     quinn::ConnectError::InvalidRemoteAddress(socket_addr) => {
-    //                         ConnectionError::FailedToConnect(format!(
-    //                             "Invalid remote address: {}",
-    //                             socket_addr
-    //                         ))
-    //                     }
-    //                     quinn::ConnectError::NoDefaultClientConfig => {
-    //                         ConnectionError::InvalidConfiguration
-    //                     }
-    //                     quinn::ConnectError::UnsupportedVersion => {
-    //                         ConnectionError::FailedToConnect(
-    //                             "Peer does not support the required QUIC version".to_string(),
-    //                         )
-    //                     }
-    //                 }) {
-    //                 Ok(connection) => connection,
-    //                 Err(e) => {
-    //                     self.state = QuicConnectionState::Disconnected {
-    //                         reason: ConnectionError::ConnectionFailed(
-    //                             "Failed to open initial connection to node.".to_string(),
-    //                         ),
-    //                     };
-    //                     return Err(e);
-    //                 }
-    //             }
-    //             .await?;
-    //
-    //             self.state = QuicConnectionState::Connected { connection };
-    //             Ok(())
-    //         }
-    //         _ => Ok(()),
-    //     }
-    // }
+impl Connection for QuicConnectionDriver {
+    async fn connect(&mut self) -> Result<(), ConnectionError> {
+        match &self.state {
+            QuicConnectionState::Connected { .. } => {
+                // Already connected, nothing to do
+                Ok(())
+            }
+            QuicConnectionState::NotReady | QuicConnectionState::Disconnected { .. } => {
+                let Some(socket) = &self.socket else {
+                    return Err(ConnectionError::ConnectionFailed(
+                        "Socket is not available".to_string(),
+                    ));
+                };
+                
+                let tls = self.tls.clone();
+                let addr = self.node_info.network_address.clone();
+                let socket = socket.clone();
 
-    // async fn open_stream(&mut self) -> Result<Stream, ConnectionError> {
-    //     match &self.state {
-    //         QuicConnectionState::Connected { connection } => {
-    //             // Open a bidirectional stream
-    //             let (send, recv) = connection.open_bi().await.map_err(|e| {
-    //                 ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
-    //             })?;
-    //
-    //             // Create the raw stream
-    //             Ok(Stream::new(Box::new(recv), Box::new(send)))
-    //         }
-    //         QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
-    //         QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
-    //             format!("Connection is disconnected: {}", reason),
-    //         )),
-    //     }
-    // }
-    //
-    // async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError> {
-    //     match &self.state {
-    //         QuicConnectionState::Connected { connection } => {
-    //             // Clone the connection to move it into the AcceptStream future
-    //             let connection_clone = connection.clone();
-    //
-    //             // Return an AcceptStream future that will resolve to a RawStream when awaited
-    //             Ok(AcceptStream::new(move || {
-    //                 let connection = connection_clone.clone();
-    //                 async move {
-    //                     // Accept a bidirectional stream
-    //                     let (send, recv) = connection.accept_bi().await.map_err(|e| {
-    //                         ConnectionError::ConnectionFailed(format!(
-    //                             "Failed to accept stream: {}",
-    //                             e
-    //                         ))
-    //                     })?;
-    //
-    //                     // Create the raw stream
-    //                     Ok(Stream::new(Box::new(recv), Box::new(send)))
-    //                 }
-    //             }))
-    //         }
-    //         QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
-    //         QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
-    //             format!("Connection is disconnected: {}", reason),
-    //         )),
-    //     }
-    // }
+                let crypto = tls.into_client_config()?;
+                let sock_addr = addr.to_sock_addrs()?;
+
+                let Ok(client_config) = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+                else {
+                    return Err(ConnectionError::FailedToConnect(
+                        "Failed to create TLS QUIC client config".to_string(),
+                    ));
+                };
+                let client_config = quinn::ClientConfig::new(std::sync::Arc::new(client_config));
+                let connection = match socket
+                    .connect_with(client_config, sock_addr, &addr.host())
+                    .map_err(|err| match err {
+                        quinn::ConnectError::EndpointStopping => ConnectionError::ConnectionClosed(
+                            "internal endpoint is stopping, cannot create new connections"
+                                .to_string(),
+                        ),
+                        quinn::ConnectError::CidsExhausted => ConnectionError::FailedToConnect(
+                            "CID space are exhausted, cannot create new connections".to_string(),
+                        ),
+                        quinn::ConnectError::InvalidServerName(name) => {
+                            ConnectionError::FailedToConnect(format!(
+                                "Invalid server name: {}",
+                                name
+                            ))
+                        }
+                        quinn::ConnectError::InvalidRemoteAddress(socket_addr) => {
+                            ConnectionError::FailedToConnect(format!(
+                                "Invalid remote address: {}",
+                                socket_addr
+                            ))
+                        }
+                        quinn::ConnectError::NoDefaultClientConfig => {
+                            ConnectionError::InvalidConfiguration
+                        }
+                        quinn::ConnectError::UnsupportedVersion => {
+                            ConnectionError::FailedToConnect(
+                                "Peer does not support the required QUIC version".to_string(),
+                            )
+                        }
+                    }) {
+                    Ok(connection) => connection,
+                    Err(e) => {
+                        self.state = QuicConnectionState::Disconnected {
+                            reason: ConnectionError::ConnectionFailed(
+                                "Failed to open initial connection to node.".to_string(),
+                            ),
+                        };
+                        return Err(e);
+                    }
+                }
+                .await?;
+
+                self.state = QuicConnectionState::Connected { connection };
+                Ok(())
+            }
+        }
+    }
+
+    async fn open_stream(&mut self) -> Result<Stream, ConnectionError> {
+        match &self.state {
+            QuicConnectionState::Connected { connection } => {
+                // Open a bidirectional stream
+                let (send, recv) = connection.open_bi().await.map_err(|e| {
+                    ConnectionError::ConnectionFailed(format!("Failed to open stream: {}", e))
+                })?;
+
+                // Create the raw stream
+                Ok(Stream::new(Box::new(recv), Box::new(send)))
+            }
+            QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
+            QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+                format!("Connection is disconnected: {}", reason),
+            )),
+        }
+    }
+
+    async fn accept_stream(&mut self) -> Result<AcceptStream, ConnectionError> {
+        match &self.state {
+            QuicConnectionState::Connected { connection } => {
+                // Clone the connection to move it into the AcceptStream future
+                let connection_clone = connection.clone();
+
+                // Return an AcceptStream future that will resolve to a Stream when awaited
+                Ok(AcceptStream::new(move || {
+                    let connection = connection_clone.clone();
+                    async move {
+                        // Accept a bidirectional stream
+                        let (send, recv) = connection.accept_bi().await.map_err(|e| {
+                            ConnectionError::ConnectionFailed(format!(
+                                "Failed to accept stream: {}",
+                                e
+                            ))
+                        })?;
+
+                        // Create the raw stream
+                        Ok(Stream::new(Box::new(recv), Box::new(send)))
+                    }
+                }))
+            }
+            QuicConnectionState::NotReady => Err(ConnectionError::NotConnected),
+            QuicConnectionState::Disconnected { reason } => Err(ConnectionError::ConnectionFailed(
+                format!("Connection is disconnected: {}", reason),
+            )),
+        }
+    }
 }
+
 
 #[derive(thiserror::Error, Debug)]
 pub enum ConnectionError {
