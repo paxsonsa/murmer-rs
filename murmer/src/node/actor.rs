@@ -1,15 +1,15 @@
 //! Core NodeActor implementation for distributed node communication
 
-use crate::{
-    actor::{Actor, Handler},
-    context::Context,
-    net::{Connection, FrameBody, NetworkAddrRef},
-};
 use super::{
     connection::ConnectionState,
     errors::NodeError,
     messages::{NodeInfo, Payload, RecvFrame},
-    status::{NodeState, ReachabilityStatus, MembershipStatus},
+    status::{MembershipStatus, NodeState, ReachabilityStatus},
+};
+use crate::{
+    actor::{Actor, Handler},
+    context::Context,
+    net::{Connection, FrameBody, NetworkAddrRef},
 };
 
 // Include trait implementations from submodules
@@ -210,7 +210,11 @@ impl NodeActor {
     }
 
     /// Handle ActorAdd message from remote node
-    async fn handle_actor_add(&mut self, remote_path: crate::path::ActorPath, ctx: &mut Context<Self>) {
+    async fn handle_actor_add(
+        &mut self,
+        remote_path: crate::path::ActorPath,
+        ctx: &mut Context<Self>,
+    ) {
         // Handle the ActorAdd message from the remote node.
         tracing::info!(
             "Node {} received ActorAdd message for actor {:?} from remote node {:?}",
@@ -219,7 +223,6 @@ impl NodeActor {
             self.info.remote_id
         );
 
-        // FIXME: AI Generated Please Review
         let Some(remote_id) = self.info.remote_id else {
             tracing::error!(
                 "Cannot handle ActorAdd - remote node ID not set for connection {}",
@@ -230,7 +233,7 @@ impl NodeActor {
 
         // Transform the path to reflect the actual remote location
         let transformed_path = self.transform_remote_path(remote_path);
-        
+
         // Create a Node from this NodeActor's endpoint
         let node_endpoint = ctx.endpoint();
         let local_endpoint = crate::system::LocalEndpoint::from_endpoint(node_endpoint);
@@ -238,15 +241,19 @@ impl NodeActor {
             id: remote_id,
             endpoint: local_endpoint,
         };
-        
+
         // Create a RemoteEndpointFactory for lazy proxy creation
         let factory = Box::new(crate::system::RemoteEndpointFactory::new(
             node,
             transformed_path.clone(),
         ));
-        
+
         // Register the remote actor with the local receptionist
-        if let Err(err) = self.receptionist.register_remote(transformed_path.clone(), factory).await {
+        if let Err(err) = self
+            .receptionist
+            .register_remote(transformed_path.clone(), factory)
+            .await
+        {
             tracing::error!(
                 "Failed to register remote actor {:?} from node {:?}: {}",
                 transformed_path,
@@ -263,7 +270,11 @@ impl NodeActor {
     }
 
     /// Handle ActorRemove message from remote node
-    async fn handle_actor_remove(&mut self, remote_path: crate::path::ActorPath, _ctx: &mut Context<Self>) {
+    async fn handle_actor_remove(
+        &mut self,
+        remote_path: crate::path::ActorPath,
+        _ctx: &mut Context<Self>,
+    ) {
         // Handle the ActorRemove message from the remote node.
         tracing::info!(
             "Node {} received ActorRemove message for actor {:?} from remote node {:?}",
@@ -272,7 +283,6 @@ impl NodeActor {
             self.info.remote_id
         );
 
-        // FIXME: AI Generated Please Review
         let Some(remote_id) = self.info.remote_id else {
             tracing::error!(
                 "Cannot handle ActorRemove - remote node ID not set for connection {}",
@@ -283,7 +293,7 @@ impl NodeActor {
 
         // Transform the path to reflect the actual remote location
         let transformed_path = self.transform_remote_path(remote_path);
-        
+
         // Deregister the remote actor from the local receptionist
         if let Err(err) = self.receptionist.deregister(transformed_path.clone()).await {
             tracing::error!(
@@ -304,14 +314,18 @@ impl NodeActor {
     /// Start heartbeat monitoring tasks
     async fn start_heartbeat_tasks(&mut self, ctx: &mut Context<Self>) {
         // Send heartbeat every 3 seconds
-        ctx.interval(Duration::from_secs(3), move |cancellation| super::messages::SendHeartbeat {
-            cancellation: cancellation.clone(),
+        ctx.interval(Duration::from_secs(3), move |cancellation| {
+            super::messages::SendHeartbeat {
+                cancellation: cancellation.clone(),
+            }
         });
-        
+
         // Check for missed heartbeats every 3 seconds
-        ctx.interval(Duration::from_secs(3), move |cancellation| super::messages::CheckHeartbeat {
-            reference_time: chrono::Utc::now(),
-            cancellation: cancellation.clone(),
+        ctx.interval(Duration::from_secs(3), move |cancellation| {
+            super::messages::CheckHeartbeat {
+                reference_time: chrono::Utc::now(),
+                cancellation: cancellation.clone(),
+            }
         });
     }
 
@@ -338,12 +352,9 @@ impl NodeActor {
 
                         // Send the event back to the NodeActor for processing
                         let handle_event_msg = super::messages::HandleRegistryEvent { event };
-                        
+
                         if let Err(err) = endpoint.send(handle_event_msg).await {
-                            tracing::error!(
-                                "Failed to send registry event to NodeActor: {}",
-                                err
-                            );
+                            tracing::error!("Failed to send registry event to NodeActor: {}", err);
                             break;
                         }
                     }
@@ -363,14 +374,14 @@ impl NodeActor {
     /// Transform a remote actor path to reflect its actual remote location
     fn transform_remote_path(&self, remote_path: crate::path::ActorPath) -> crate::path::ActorPath {
         let _remote_id = self.info.remote_id.expect("Remote ID must be set");
-        
+
         // For now, we'll create a remote scheme based on the network address
         // TODO: Extract actual host/port from network address
         let scheme = crate::path::AddressScheme::Remote {
             host: "127.0.0.1".to_string(), // TODO: Extract from network_address
-            port: 4000, // TODO: Extract from network_address
+            port: 4000,                    // TODO: Extract from network_address
         };
-        
+
         crate::path::ActorPath {
             scheme,
             type_id: remote_path.type_id,
@@ -574,7 +585,11 @@ impl Handler<RecvFrame> for NodeActor {
 
 #[async_trait::async_trait]
 impl Handler<super::messages::SendHeartbeat> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: super::messages::SendHeartbeat) -> () {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: super::messages::SendHeartbeat,
+    ) -> () {
         // Send a heartbeat message to the remote node.
         tracing::debug!(
             "Sending heartbeat to remote node: {:?}",
@@ -603,7 +618,11 @@ impl Handler<super::messages::SendHeartbeat> for NodeActor {
 
 #[async_trait::async_trait]
 impl Handler<super::messages::CheckHeartbeat> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: super::messages::CheckHeartbeat) -> () {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: super::messages::CheckHeartbeat,
+    ) -> () {
         tracing::info!(
             "Checking heartbeat for remote node: {:?}",
             self.info.remote_id.expect("Remote ID must be set")
@@ -733,7 +752,11 @@ impl Handler<super::messages::CheckHeartbeat> for NodeActor {
 
 #[async_trait::async_trait]
 impl Handler<super::messages::HandleRegistryEvent> for NodeActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: super::messages::HandleRegistryEvent) -> () {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: super::messages::HandleRegistryEvent,
+    ) -> () {
         // Only broadcast events for established connections
         if !matches!(self.connection, ConnectionState::Established { .. }) {
             tracing::debug!("Connection not established, skipping registry event broadcast");
@@ -766,3 +789,4 @@ impl Handler<super::messages::HandleRegistryEvent> for NodeActor {
         }
     }
 }
+

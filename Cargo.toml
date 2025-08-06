@@ -1,6 +1,7 @@
 [workspace]
 members = [
-    "murmer"
+    "murmer", 
+    "murmer-core"
 ]
 resolver = "2"
 
