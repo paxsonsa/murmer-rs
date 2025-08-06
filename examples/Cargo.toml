@@ -1,0 +1,47 @@
+[package]
+name = "murmer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Examples of murmur-rs, a distributed actor framework for Rust"
+keywords = ["actor", "distributed", "async", "network"]
+categories = ["asynchronous", "network-programming", "concurrency"]
+
+[[bin]]
+name = "simple"
+path = "examples/simple.rs"
+
+
+[dependencies]
+async-trait = "0.1.86"
+bincode = {version = "2", features = ["serde"]}
+bytes = { version = "1.10.0", features = ["serde"] }
+chrono = { version = "0.4.40", features = ["serde"] }
+directories-next = "2.0.0"
+dyn-clone = "1.0.19"
+futures = "0.3.31"
+hostname = "0.4.0"
+parking_lot = "0.12.3"
+paste = "1.0.15"
+pin-project = "1.1.5"
+quinn = { version = "0.11.6", features = ["rustls"] }
+quinn-proto = { version = "0.11.9", features = ["rustls"] }
+rcgen = "0.13.2"
+rustls = "0.23.23"
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.218", features = ["derive", "serde_derive"] }
+serde_derive = "1.0.218"
+thiserror = "2.0.11"
+inventory = "0.3.15"
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-util = "0.7.13"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2.5.4", features = ["serde"] }
+uuid = { version = "1.13.1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+assert_matches = "1.5.0"
+test-log = { version = "0.2.17", features = ["trace"] }
+tokio-test = "0.4.3"
