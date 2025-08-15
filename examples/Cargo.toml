@@ -1,5 +1,5 @@
 [package]
-name = "murmer"
+name = "murmer-examples"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,9 +8,13 @@ description = "Examples of murmur-rs, a distributed actor framework for Rust"
 keywords = ["actor", "distributed", "async", "network"]
 categories = ["asynchronous", "network-programming", "concurrency"]
 
+# [[bin]]
+# name = "simple"
+# path = "simple/simple.rs"
+
 [[bin]]
-name = "simple"
-path = "examples/simple.rs"
+name = "cluster-test"
+path = "cluster_test.rs"
 
 
 [dependencies]
