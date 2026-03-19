@@ -10,6 +10,10 @@ description = "Examples for murmer, a distributed actor framework for Rust"
 name = "counter"
 path = "src/counter.rs"
 
+[[bin]]
+name = "chat"
+path = "src/chat.rs"
+
 [dependencies]
 murmer = { workspace = true }
 murmer-macros = { workspace = true }

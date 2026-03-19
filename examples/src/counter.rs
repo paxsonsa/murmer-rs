@@ -1,25 +1,30 @@
-//! POC App — demonstrates:
+//! Counter example — demonstrates:
 //!
-//! 1. Proc macro generates Handler impls + RemoteDispatch from natural method signatures
-//! 2. Endpoint<A> abstracts local vs remote (single send() method)
-//! 3. Receptionist stores type-erased entries, typed lookup by caller
-//! 4. Lifecycle events are type-erased
-//! 5. Same actor accessible locally and remotely through the same API
-//! 6. ReceptionKey<A> groups actors by type for subscription-based discovery
-//! 7. Listing<A> provides async streams with backfill + live updates
-//! 8. Auto-deregister on supervisor shutdown via DeregisterGuard
-//! 9. OpLog replication protocol with version vectors
-//! 10. Node pruning when cluster members leave
-//! 11. Delayed listing flush batches notifications
-//! 12. Blip avoidance skips transient actors in the oplog
+//! 1. `#[derive(Message)]` generates Message + RemoteMessage impls
+//! 2. `#[handlers]` + `#[handler]` generates Handler + RemoteDispatch
+//! 3. Endpoint<A> abstracts local vs remote (single send() API)
+//! 4. Receptionist stores type-erased entries, typed lookup by caller
+//! 5. Lifecycle events are type-erased
+//! 6. Same actor accessible locally and remotely through the same API
+//! 7. ReceptionKey<A> groups actors by type for subscription-based discovery
+//! 8. Listing<A> provides async streams with backfill + live updates
+//! 9. Auto-deregister on supervisor shutdown via DeregisterGuard
+//! 10. OpLog replication protocol with version vectors
+//! 11. Node pruning when cluster members leave
+//! 12. Delayed listing flush batches notifications
+//! 13. Blip avoidance skips transient actors in the oplog
+//! 14. Restart policies with limits and backoff
+//! 15. Router round-robin and broadcast
 
-use murmer::{Actor, ActorContext, Message, RemoteMessage};
+use murmer::prelude::*;
+use murmer_macros::{Message, handlers};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
-// ACTOR DEFINITION — natural Rust code
+// ACTOR DEFINITION
 // =============================================================================
 
+/// A simple counter actor that maintains a running total.
 #[derive(Debug)]
 pub struct CounterActor;
 
@@ -33,43 +38,25 @@ impl Actor for CounterActor {
 }
 
 // =============================================================================
-// MESSAGE DEFINITIONS
+// MESSAGES — derive does the boilerplate
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Increment the counter by an amount. Returns the new total.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = i64, remote = "counter::Increment")]
 pub struct Increment {
     pub amount: i64,
 }
 
-impl Message for Increment {
-    type Result = i64;
-}
-
-impl RemoteMessage for Increment {
-    const TYPE_ID: &'static str = "counter::Increment";
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Query the current count.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = i64, remote = "counter::GetCount")]
 pub struct GetCount;
 
-impl Message for GetCount {
-    type Result = i64;
-}
-
-impl RemoteMessage for GetCount {
-    const TYPE_ID: &'static str = "counter::GetCount";
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Query the counter's name and count together.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = CounterInfo, remote = "counter::GetInfo")]
 pub struct GetInfo;
-
-impl Message for GetInfo {
-    type Result = CounterInfo;
-}
-
-impl RemoteMessage for GetInfo {
-    const TYPE_ID: &'static str = "counter::GetInfo";
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CounterInfo {
@@ -81,7 +68,7 @@ pub struct CounterInfo {
 // HANDLER IMPL — the proc macro generates everything from this
 // =============================================================================
 
-#[murmer_macros::handlers]
+#[handlers]
 impl CounterActor {
     #[handler]
     fn increment(
@@ -123,7 +110,7 @@ impl CounterActor {
 // =============================================================================
 
 fn main() {
-    println!("Run tests with: cargo nextest run -p poc-app");
+    println!("Run tests with: cargo nextest run -p murmer-examples");
 }
 
 // =============================================================================
@@ -767,7 +754,7 @@ mod tests {
     }
 
     // =========================================================================
-    // NEW FEATURE SCENARIO TESTS
+    // SUPERVISION & RESTART TESTS
     // =========================================================================
 
     // -------------------------------------------------------------------------
