@@ -114,6 +114,7 @@ pub mod oplog;
 pub mod receptionist;
 pub mod router;
 pub mod supervisor;
+pub mod system;
 pub mod wire;
 
 /// Re-export bincode so generated code can reference it without the user
@@ -140,6 +141,7 @@ pub mod prelude {
     pub use crate::listing::{Listing, ReceptionKey};
     pub use crate::receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
     pub use crate::router::{Router, RoutingStrategy};
+    pub use crate::system::System;
     pub use crate::wire::SendError;
 }
 
@@ -156,4 +158,5 @@ pub use node::run_node_receiver;
 pub use oplog::{Op, OpType, VersionVector};
 pub use receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
 pub use router::{Router, RoutingStrategy};
+pub use system::System;
 pub use wire::{DispatchRequest, RemoteInvocation, RemoteResponse, ResponseRegistry, SendError};
