@@ -9,14 +9,23 @@ A distributed actor framework for Rust, built on tokio and QUIC.
 
 Murmer provides typed, location-transparent actors that communicate through message passing. Whether an actor lives in the same process or on a remote node across the network, you interact with it through the same `Endpoint<A>` API.
 
-## Features
+## Why I built this
 
-- **Location transparency** — `Endpoint<A>` abstracts local vs remote. Local actors use zero-cost in-memory dispatch; remote actors serialize over QUIC.
-- **Typed message handling** — compile-time checked: if an actor doesn't handle a message type, it won't compile.
-- **Proc macro ergonomics** — `#[derive(Message)]` eliminates message boilerplate. `#[handlers]` generates dispatch tables.
-- **OTP-inspired supervision** — restart policies (Temporary, Transient, Permanent) with configurable limits and exponential backoff.
-- **Subscription-based discovery** — `ReceptionKey<A>` groups actors by type, `Listing<A>` streams endpoints as actors come and go.
-- **Cluster-ready** — SWIM protocol membership, mDNS discovery, OpLog-based registry replication with version vectors.
+I've spent years working with Elixir and the BEAM VM, and the actor model there is something I've grown deeply fond of — the simplicity of processes, message passing, and supervision just *works*. When I looked at bringing that experience to Rust, I studied existing implementations like Actix, Telepathy, and Akka (on the JVM side). They're impressive systems, but I kept running into the same friction: getting a basic actor up and running was complex, and adding remote communication across nodes was even more so.
+
+Murmer is an experiment in answering a simple question: **can you build a robust distributed actor system in Rust that's actually simple to use?**
+
+The answer, it seems, is yes.
+
+The design draws heavy inspiration from Beam OTP's supervision and process model, Akka's clustering approach, and Apple's Swift Distributed Actors for the typed, location-transparent endpoint API. The goal is to combine these ideas with Rust's performance and safety guarantees — zero-cost local dispatch, compile-time message type checking, and automatic serialization over encrypted QUIC connections when actors span nodes.
+
+## What it gives you
+
+- **Send messages without caring where the actor lives.** Local and remote actors use the same `Endpoint<A>` API — your code doesn't change when an actor moves to another node.
+- **Test distributed systems from a single process.** Spin up multiple nodes in-memory and verify clustering, replication, and failover without any network infrastructure.
+- **Define actors with minimal boilerplate.** `#[derive(Message)]` and `#[handlers]` generate the dispatch tables, serialization, and trait impls so you write handlers as plain methods.
+- **Get networking and encryption handled for you.** QUIC transport with automatic TLS, SWIM-based cluster membership, and mDNS discovery — all configured, not hand-rolled.
+- **Supervise actors like OTP.** Restart policies (Temporary, Transient, Permanent) with configurable limits and exponential backoff keep your system running through failures.
 
 ## Quick Start
 
@@ -77,17 +86,18 @@ impl Counter {
 ```rust
 #[tokio::main]
 async fn main() {
-    let receptionist = Receptionist::new();
+    // System::local() for development, System::clustered() for production
+    let system = System::local();
 
     // Start an actor — returns a typed endpoint
-    let counter = receptionist.start("counter/main", Counter, CounterState { count: 0 });
+    let counter = system.start("counter/main", Counter, CounterState { count: 0 });
 
     // Send messages
     let result = counter.send(Increment { amount: 5 }).await.unwrap();
     assert_eq!(result, 5);
 
-    // Lookup by label — same API
-    let looked_up = receptionist.lookup::<Counter>("counter/main").unwrap();
+    // Lookup by label — works for local and remote actors
+    let looked_up = system.lookup::<Counter>("counter/main").unwrap();
     let count = looked_up.send(GetCount).await.unwrap();
     assert_eq!(count, 5);
 }
@@ -97,6 +107,9 @@ async fn main() {
 
 ```
 ┌─────────────────────────────────────────────┐
+│    System  (unified entry point)            │
+│    local() │ clustered(config)              │
+├─────────────────────────────────────────────┤
 │                  Receptionist               │
 │  (type-erased registry, typed lookup)       │
 ├──────────┬──────────┬───────────────────────┤
@@ -261,23 +274,139 @@ router.send(Increment { amount: 1 }).await?;
 let results = router.broadcast(GetCount).await;
 ```
 
-## Clustering
+## From Local to Distributed
 
-Murmer supports multi-node actor systems over QUIC with automatic discovery:
+One of murmer's core design goals is that your actor code doesn't change when you go from a single process to a multi-node cluster. The same `Endpoint<A>` API works in both cases.
+
+### Step 1: Run everything locally
+
+Create a `System::local()` — no networking, no config. Your actors communicate through in-memory channels with zero serialization cost:
 
 ```rust
-use murmer::cluster::{ClusterSystem, ClusterConfigBuilder, Discovery};
+use murmer::prelude::*;
 
-let config = ClusterConfigBuilder::new("node-1", "0.0.0.0:9000")
-    .discovery(Discovery::Mdns)           // Zero-config LAN discovery
-    .gossip_interval(Duration::from_secs(1))
-    .sync_interval(Duration::from_secs(5))
+let system = System::local();
+
+let room = system.start("room/general", ChatRoom, ChatRoomState {
+    room_name: "general".into(),
+    messages: vec![],
+});
+
+// Send messages — works instantly
+room.send(PostMessage { from: "alice".into(), text: "Hello!".into() }).await?;
+
+// Look up actors by label
+let ep = system.lookup::<ChatRoom>("room/general").unwrap();
+let history = ep.send(GetHistory).await?;
+```
+
+### Step 2: Go distributed
+
+When you're ready for real networking, swap `System::local()` for `System::clustered()`. **Your actor code stays identical** — only the system construction changes:
+
+```rust
+use murmer::prelude::*;
+use murmer::cluster::config::{ClusterConfig, Discovery};
+use murmer::cluster::sync::TypeRegistry;
+
+let config = ClusterConfig::builder()
+    .name("alpha")
+    .listen("0.0.0.0:7100".parse()?)
+    .advertise("192.168.1.5:7100".parse()?)
+    .cookie("my-cluster-secret")
+    .seed_nodes(["192.168.1.1:7100".parse()?])
     .build()?;
 
-let cluster = ClusterSystem::start(config, receptionist).await?;
+let system = System::clustered(config, TypeRegistry::new()).await?;
+
+// Same API as local — start, lookup, send
+let room = system.start("room/alpha", ChatRoom, state);
+room.send(PostMessage { from: "alice".into(), text: "Hello!".into() }).await?;
+
+// Actors on other nodes appear automatically via registry replication
+let remote_room = system.lookup::<ChatRoom>("room/beta").unwrap();
+remote_room.send(GetHistory).await?;  // transparently serialized over QUIC
 ```
 
 Each node gets a single QUIC connection to every peer, multiplexed over per-actor streams. The OpLog replication protocol uses version vectors for efficient, idempotent sync.
+
+### Step 3: Test it interactively
+
+The [`cluster_chat`](examples/src/cluster_chat.rs) example lets you try both modes with an interactive CLI:
+
+```sh
+# Local mode — all actors in one process
+cargo run -p murmer-examples --bin cluster_chat -- --local
+```
+
+```text
+=== murmer cluster_chat (local mode) ===
+  Started room: #general
+  Started room: #random
+
+> post general alice Hello everyone!
+  [1 messages in #general]
+> post general bob Hey alice!
+  [2 messages in #general]
+> history general
+  --- #general ---
+  alice: Hello everyone!
+  bob: Hey alice!
+> rooms
+  Known rooms:
+    #general — 2 messages
+    #random — 0 messages
+```
+
+Same binary, same commands — just add cluster config:
+
+```sh
+# Terminal 1 — seed node
+cargo run -p murmer-examples --bin cluster_chat -- --node alpha --port 7100
+
+# Terminal 2 — joins via seed
+cargo run -p murmer-examples --bin cluster_chat -- --node beta --port 7200 --seed 127.0.0.1:7100
+```
+
+### Step 4: Deploy with Docker
+
+The [`docker-compose.yml`](docker-compose.yml) in this repo runs a 3-node cluster:
+
+```sh
+docker compose up --build
+```
+
+This starts three containers — `alpha`, `beta`, and `gamma` — each running the `cluster_chat` example. Beta and gamma seed from alpha and automatically mesh together:
+
+```yaml
+services:
+  alpha:
+    build: .
+    command: ["--node", "alpha", "--port", "7100"]
+
+  beta:
+    build: .
+    command: ["--node", "beta", "--port", "7100", "--seed", "alpha:7100"]
+
+  gamma:
+    build: .
+    command: ["--node", "gamma", "--port", "7100", "--seed", "alpha:7100"]
+```
+
+Or run locally across terminals:
+
+```sh
+# Terminal 1 — seed node
+cargo run -p murmer-examples --bin cluster_chat -- --node alpha --port 7100
+
+# Terminal 2
+cargo run -p murmer-examples --bin cluster_chat -- --node beta --port 7200 --seed 127.0.0.1:7100
+
+# Terminal 3
+cargo run -p murmer-examples --bin cluster_chat -- --node gamma --port 7300 --seed 127.0.0.1:7100
+```
+
+See [`examples/src/cluster_chat.rs`](examples/src/cluster_chat.rs) for the full runnable example.
 
 ## Actor Watches
 
