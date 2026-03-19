@@ -1,44 +1,202 @@
-//! Core actor traits and types for the actor system.
-use crate::context::Context;
+//! Core actor traits and types.
 
-use super::message::{Message, RemoteMessage};
-pub use async_trait::async_trait;
+use std::fmt::Debug;
+use std::marker::PhantomData;
 
-/// The core actor trait that must be implemented by all actors.
-///
-/// Actors are the fundamental unit of computation in the actor system. They:
-/// - Process messages one at a time
-/// - Maintain private state
-/// - Can send messages to other actors
-/// - Have a lifecycle managed by the system
-#[async_trait]
-pub trait Actor: Unpin + Sized + Send + 'static {
-    /// A unique key for identifying the actor across the system.
-    const ACTOR_TYPE_KEY: &'static str;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
-    /// Called when the actor is started but before it begins processing messages.
-    /// Use this to perform any initialization.
-    async fn started(&mut self, _ctx: &mut Context<Self>) {}
+use crate::endpoint::Endpoint;
+use crate::lifecycle::{ActorTerminated, SystemSignal};
+use crate::receptionist::Receptionist;
+use crate::wire::EnvelopeProxy;
 
-    /// Called when the actor is about to be shut down, before processing remaining messages.
-    /// Use this to prepare for shutdown.
-    async fn stopping(&mut self, _ctx: &mut Context<Self>) {}
+// =============================================================================
+// CORE TRAITS
+// =============================================================================
 
-    /// Called after the actor has been shut down and finished processing messages.
-    /// Use this for final cleanup.
-    async fn stopped(&mut self, _ctx: &mut Context<Self>) {}
+/// A message that can be sent to an actor. Defines its response type.
+pub trait Message: Debug + Send + 'static {
+    type Result: Send + 'static;
 }
 
-/// A trait for handling specific message types.
-///
-/// Implement this trait for your actor for each message type it should handle.
-/// The associated Result type defines what will be returned to the sender.
-#[async_trait]
-pub trait Handler<M>
+/// A message that can cross the wire. Requires serialization for both
+/// the message and its result. TYPE_ID is the dispatch key on the receiver.
+pub trait RemoteMessage: Message + Serialize + DeserializeOwned
 where
-    Self: Actor,
-    M: Message,
+    Self::Result: Serialize + DeserializeOwned,
 {
-    /// Handle a message of type M and return a result of type M::Result
-    async fn handle(&mut self, ctx: &mut Context<Self>, message: M) -> M::Result;
+    const TYPE_ID: &'static str;
 }
+
+/// An actor — a stateful message processor.
+pub trait Actor: Send + 'static {
+    type State: Send + 'static;
+
+    /// Called when a watched actor terminates. Override to react to failures.
+    fn on_actor_terminated(&mut self, _state: &mut Self::State, _terminated: &ActorTerminated) {
+        // default: no-op — actors opt in by overriding
+    }
+}
+
+/// Intrinsic context available to every actor handler invocation.
+/// Provides the actor's identity, a self-endpoint, and receptionist access.
+pub struct ActorContext<A: Actor> {
+    pub(crate) label: String,
+    pub(crate) node_id: String,
+    pub(crate) mailbox_tx: mpsc::UnboundedSender<Box<dyn EnvelopeProxy<A>>>,
+    pub(crate) receptionist: Receptionist,
+    pub(crate) system_tx: mpsc::UnboundedSender<SystemSignal>,
+}
+
+impl<A: Actor + 'static> ActorContext<A> {
+    /// This actor's label in the receptionist.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The node ID this actor is running on.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// Get an endpoint to this actor (useful for self-sends or passing identity).
+    pub fn endpoint(&self) -> Endpoint<A> {
+        Endpoint::local(self.mailbox_tx.clone())
+    }
+
+    /// Access the receptionist for lookups or subscriptions.
+    pub fn receptionist(&self) -> &Receptionist {
+        &self.receptionist
+    }
+
+    /// Watch another actor for termination. Erlang-style one-shot monitor.
+    /// If the watched actor doesn't exist, fires immediately.
+    pub fn watch(&self, label: &str) {
+        self.receptionist
+            .add_watch(label, &self.label, self.system_tx.clone());
+    }
+
+    /// Get a serializable reference to this actor.
+    /// The returned `ActorRef<A>` can be embedded in messages and sent to other actors/nodes.
+    pub fn actor_ref(&self) -> ActorRef<A> {
+        ActorRef {
+            label: self.label.clone(),
+            node_id: self.node_id.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// ACTOR REF — serializable distributed actor identity
+// =============================================================================
+
+/// A serializable, typed reference to an actor. Can be embedded in messages
+/// and sent across the wire to other nodes. Resolve it via a receptionist
+/// to get a live `Endpoint<A>`.
+#[derive(Debug)]
+pub struct ActorRef<A: Actor> {
+    pub label: String,
+    pub node_id: String,
+    _phantom: PhantomData<A>,
+}
+
+impl<A: Actor> Clone for ActorRef<A> {
+    fn clone(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            node_id: self.node_id.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Wire format for ActorRef serialization (no PhantomData).
+#[derive(Serialize, Deserialize)]
+struct ActorRefWire {
+    label: String,
+    node_id: String,
+}
+
+impl<A: Actor> Serialize for ActorRef<A> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ActorRefWire {
+            label: self.label.clone(),
+            node_id: self.node_id.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de, A: Actor> Deserialize<'de> for ActorRef<A> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ActorRefWire::deserialize(deserializer)?;
+        Ok(ActorRef {
+            label: wire.label,
+            node_id: wire.node_id,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl<A: Actor + 'static> ActorRef<A> {
+    /// Create a new ActorRef with the given label and node ID.
+    pub fn new(label: impl Into<String>, node_id: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            node_id: node_id.into(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Resolve this reference to a live Endpoint via the receptionist.
+    /// Returns `None` if the actor is not registered or has a different type.
+    pub fn resolve(&self, receptionist: &Receptionist) -> Option<Endpoint<A>> {
+        receptionist.lookup::<A>(&self.label)
+    }
+}
+
+/// Declares that actor A can handle message M.
+pub trait Handler<M: Message>: Actor + Sized {
+    fn handle(
+        &mut self,
+        ctx: &ActorContext<Self>,
+        state: &mut Self::State,
+        message: M,
+    ) -> M::Result;
+}
+
+/// Generated by proc macro: dispatches a remote message by type tag.
+/// Each match arm deserializes to the concrete type, calls the handler,
+/// and serializes the result. This is the Rust equivalent of Swift's
+/// compiler-generated accessor thunks.
+pub trait RemoteDispatch: Actor + Sized {
+    fn dispatch_remote(
+        &mut self,
+        ctx: &ActorContext<Self>,
+        state: &mut Self::State,
+        message_type: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DispatchError>;
+}
+
+#[derive(Debug)]
+pub enum DispatchError {
+    UnknownMessageType(String),
+    DeserializeFailed(String),
+    SerializeFailed(String),
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownMessageType(t) => write!(f, "unknown message type: {t}"),
+            Self::DeserializeFailed(e) => write!(f, "deserialize failed: {e}"),
+            Self::SerializeFailed(e) => write!(f, "serialize failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}

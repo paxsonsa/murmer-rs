@@ -1,0 +1,105 @@
+//! Lifecycle and restart types for actor supervision.
+
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+
+use crate::actor::{Actor, RemoteDispatch};
+
+// =============================================================================
+// LIFECYCLE & RESTART TYPES
+// =============================================================================
+
+/// Why an actor terminated — used by watches and restart policies.
+#[derive(Debug, Clone)]
+pub enum TerminationReason {
+    /// Clean shutdown (receptionist.stop() or channel close)
+    Stopped,
+    /// Handler returned error (future use)
+    Failed(String),
+    /// catch_unwind caught a panic
+    Panicked(String),
+    /// Restart limit exceeded within the configured time window
+    RestartLimitExceeded,
+}
+
+/// Notification delivered to watchers when a watched actor terminates.
+#[derive(Debug, Clone)]
+pub struct ActorTerminated {
+    pub label: String,
+    pub reason: TerminationReason,
+}
+
+/// Restart strategy for an actor — mirrors Erlang/OTP child spec strategies.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum RestartPolicy {
+    /// Never restart (current behavior)
+    #[default]
+    Temporary,
+    /// Restart only on crash (panic), not clean stop
+    Transient,
+    /// Always restart regardless of reason
+    Permanent,
+}
+
+/// Configuration for restart limits and backoff behavior.
+#[derive(Debug, Clone)]
+pub struct RestartConfig {
+    pub policy: RestartPolicy,
+    /// Maximum number of restarts allowed within the rolling `window`.
+    pub max_restarts: u32,
+    /// Rolling time window for counting restarts.
+    pub window: Duration,
+    pub backoff: BackoffConfig,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            policy: RestartPolicy::Temporary,
+            max_restarts: 5,
+            window: Duration::from_secs(60),
+            backoff: BackoffConfig::default(),
+        }
+    }
+}
+
+/// Exponential backoff configuration for actor restarts.
+#[derive(Debug, Clone)]
+pub struct BackoffConfig {
+    /// Initial delay before the first restart.
+    pub initial: Duration,
+    /// Maximum delay between restarts.
+    pub max: Duration,
+    /// Multiplier applied after each restart.
+    pub multiplier: f64,
+}
+
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_millis(100),
+            max: Duration::from_secs(30),
+            multiplier: 2.0,
+        }
+    }
+}
+
+/// Factory for creating actor instances on restart.
+/// `&mut self` allows stateful factories (e.g. incrementing restart counters).
+pub trait ActorFactory: Send + 'static {
+    type Actor: Actor + RemoteDispatch;
+    fn create(&mut self) -> (Self::Actor, <Self::Actor as Actor>::State);
+}
+
+/// Internal: signals delivered to actors from the system.
+pub(crate) enum SystemSignal {
+    ActorTerminated(ActorTerminated),
+}
+
+/// Internal: a watch entry stored in the receptionist.
+pub(crate) struct WatchEntry {
+    #[allow(dead_code)]
+    pub(crate) watcher_label: String,
+    pub(crate) system_tx: mpsc::UnboundedSender<SystemSignal>,
+}

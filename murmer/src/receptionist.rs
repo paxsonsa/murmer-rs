@@ -1,532 +1,1018 @@
-use async_trait::async_trait;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-};
-use tokio::sync::mpsc;
+//! Receptionist — type-erased actor registry with typed lookup.
 
-use crate::message::{Message, SendError};
-use crate::{
-    actor::{Actor, Handler},
-    context::Context,
-};
-use crate::{
-    path::ActorPath,
-    system::{AnyEndpoint, Endpoint},
-};
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-#[cfg(test)]
-#[path = "receptionist.test.rs"]
-mod tests;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
-/// Events emitted by the receptionist when actors are registered or deregistered
+use crate::actor::{Actor, ActorContext, RemoteDispatch};
+use crate::endpoint::Endpoint;
+use crate::lifecycle::{
+    ActorFactory, ActorTerminated, RestartConfig, RestartPolicy, SystemSignal, TerminationReason,
+    WatchEntry,
+};
+use crate::listing::{
+    ErasedListingSender, ErasedReceptionKey, Listing, ReceptionKey, TypedListingSender,
+};
+use crate::oplog::{Op, OpLog, OpType, VersionVector};
+use crate::supervisor::{run_supervisor, should_restart};
+use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegistry};
+
+// =============================================================================
+// LIFECYCLE EVENTS
+// =============================================================================
+
+/// Lifecycle events. Fully type-erased — subscribers don't need to know the
+/// actor type. If they want an endpoint, they call lookup::<A>() with the
+/// type they expect.
 #[derive(Debug, Clone)]
-pub enum RegistryEvent {
-    /// An actor was added to the registry
-    Added(ActorPath, AnyEndpoint),
-    /// An actor was removed from the registry
-    Removed(ActorPath),
+pub enum ActorEvent {
+    Registered { label: String, actor_type: String },
+    Deregistered { label: String, actor_type: String },
 }
 
-/// Filter configuration for registry event subscriptions
-#[derive(Debug, Clone)]
-pub struct SubscriptionFilter {
-    /// Exact actor type to subscribe to (required - no wildcards allowed)
-    pub actor_type: String,
-    /// Optional glob pattern for group matching (e.g., "region*", "default")
-    pub group_pattern: Option<String>,
+// =============================================================================
+// ENDPOINT FACTORY — type-erased endpoint creation
+// =============================================================================
+
+/// Type-erased endpoint factory stored in the receptionist.
+/// Created at registration time when the actor type is known.
+/// Used at lookup time to produce a typed Endpoint<A>.
+pub(crate) trait ErasedEndpointFactory: Send + Sync {
+    fn create_endpoint_any(&self) -> Box<dyn Any + Send>;
 }
 
-impl Default for SubscriptionFilter {
+pub(crate) struct LocalEndpointFactory<A: Actor> {
+    mailbox_tx: mpsc::UnboundedSender<Box<dyn EnvelopeProxy<A>>>,
+}
+
+impl<A: Actor + 'static> ErasedEndpointFactory for LocalEndpointFactory<A> {
+    fn create_endpoint_any(&self) -> Box<dyn Any + Send> {
+        Box::new(Endpoint::<A>::local(self.mailbox_tx.clone()))
+    }
+}
+
+// =============================================================================
+// ACTOR ENTRY
+// =============================================================================
+
+/// What the receptionist stores per actor. No actor type parameter.
+pub(crate) struct ActorEntry {
+    pub(crate) label: String,
+    pub(crate) type_id: TypeId,
+    pub(crate) actor_type_name: String,
+    pub(crate) location: EntryLocation,
+    pub(crate) keys: Vec<ErasedReceptionKey>,
+    pub(crate) node_id: String,
+}
+
+pub(crate) enum EntryLocation {
+    Local {
+        /// Produces typed Endpoint<A> at lookup time (via internal downcast)
+        endpoint_factory: Box<dyn ErasedEndpointFactory>,
+        /// Non-generic channel for routing incoming remote messages
+        dispatch_tx: mpsc::UnboundedSender<DispatchRequest>,
+        /// Shutdown signal for the supervisor
+        shutdown_tx: Option<oneshot::Sender<()>>,
+    },
+    Remote {
+        wire_tx: mpsc::UnboundedSender<RemoteInvocation>,
+        response_registry: ResponseRegistry,
+    },
+}
+
+// =============================================================================
+// RECEPTIONIST CONFIG
+// =============================================================================
+
+/// Receptionist configuration for clustering features.
+#[derive(Debug, Clone)]
+pub struct ReceptionistConfig {
+    pub node_id: String,
+    /// "host:port" of this node — embedded in Register ops so remote nodes
+    /// can route back to the actor's home node.
+    pub origin_addr: String,
+    /// If set, listing notifications are batched and flushed on this interval.
+    pub flush_interval: Option<Duration>,
+    /// If set, oplog entries are delayed by this window. If the actor deregisters
+    /// before the window expires, the op is never committed (blip avoidance).
+    pub blip_window: Option<Duration>,
+}
+
+impl Default for ReceptionistConfig {
     fn default() -> Self {
         Self {
-            actor_type: "*".to_string(), // Match all types by default (for backward compatibility)
-            group_pattern: None,         // No group filtering by default
+            node_id: "local".to_string(),
+            origin_addr: "127.0.0.1:0".to_string(),
+            flush_interval: None,
+            blip_window: None,
         }
     }
 }
 
-/// A subscription to registry events
-pub struct Subscription {
-    /// Channel receiver for registry events
-    receiver: mpsc::UnboundedReceiver<RegistryEvent>,
+// =============================================================================
+// DEREGISTER GUARD
+// =============================================================================
+
+/// Deregister guard — dropped when the supervisor exits, triggering auto-deregister.
+/// Carries the termination reason so watches receive accurate information.
+pub(crate) struct DeregisterGuard {
+    pub(crate) receptionist: Receptionist,
+    pub(crate) label: String,
+    pub(crate) reason: Arc<Mutex<TerminationReason>>,
 }
 
-impl Subscription {
-    /// Create a new subscription with the given receiver
-    fn new(receiver: mpsc::UnboundedReceiver<RegistryEvent>) -> Self {
-        Self { receiver }
-    }
-
-    /// Get the next registry event
-    pub async fn next(&mut self) -> Option<RegistryEvent> {
-        self.receiver.recv().await
-    }
-}
-
-/// Internal subscription tracking
-#[derive(Debug)]
-struct SubscriberInfo {
-    /// Channel sender for this subscription
-    sender: mpsc::UnboundedSender<RegistryEvent>,
-    /// Filter configuration
-    filter: SubscriptionFilter,
-}
-
-/// Errors that can occur during subscription operations
-#[derive(Debug, thiserror::Error)]
-pub enum SubscriptionError {
-    /// Failed to send message to receptionist
-    #[error("Failed to communicate with receptionist: {0}")]
-    CommunicationError(#[from] SendError),
-}
-
-/// Factory trait for creating endpoints on demand
-pub trait EndpointFactory: Send + Sync + 'static {
-    fn create(&self) -> AnyEndpoint;
-    fn clone_factory(&self) -> Box<dyn EndpointFactory>;
-}
-
-/// A lazy endpoint that can create the actual endpoint on demand
-#[derive(Clone)]
-struct LazyEndpoint {
-    /// Cached endpoint, created on first access
-    endpoint: Arc<Mutex<Option<AnyEndpoint>>>,
-    /// Factory function to create the endpoint when needed
-    endpoint_factory: Box<dyn EndpointFactory>,
-}
-
-impl LazyEndpoint {
-    /// Create a new lazy endpoint with an existing endpoint (for local actors)
-    fn from_endpoint(endpoint: AnyEndpoint) -> Self {
-        Self {
-            endpoint: Arc::new(Mutex::new(Some(endpoint))),
-            endpoint_factory: Box::new(NoOpFactory),
-        }
-    }
-
-    /// Create a new lazy endpoint with a factory (for remote actors)
-    fn from_factory(factory: Box<dyn EndpointFactory>) -> Self {
-        Self {
-            endpoint: Arc::new(Mutex::new(None)),
-            endpoint_factory: factory,
-        }
-    }
-
-    /// Get the endpoint, creating it if necessary
-    fn get_endpoint(&self) -> AnyEndpoint {
-        let mut endpoint_guard = self.endpoint.lock().unwrap();
-        if endpoint_guard.is_none() {
-            *endpoint_guard = Some(self.endpoint_factory.create());
-        }
-        endpoint_guard.as_ref().unwrap().clone()
+impl Drop for DeregisterGuard {
+    fn drop(&mut self) {
+        let reason = self.reason.lock().unwrap().clone();
+        self.receptionist
+            .deregister_with_reason(&self.label, reason);
     }
 }
 
-impl Clone for Box<dyn EndpointFactory> {
-    fn clone(&self) -> Self {
-        self.clone_factory()
-    }
+/// Pending listing notification for delayed flush.
+struct PendingListingNotification {
+    label: String,
+    key_id: String,
+    type_id: TypeId,
 }
 
-/// No-op factory for endpoints that are already created
-struct NoOpFactory;
-
-impl EndpointFactory for NoOpFactory {
-    fn create(&self) -> AnyEndpoint {
-        panic!("NoOpFactory should never be called - endpoint should already exist")
-    }
-
-    fn clone_factory(&self) -> Box<dyn EndpointFactory> {
-        Box::new(NoOpFactory)
-    }
+struct ReceptionistInner {
+    config: ReceptionistConfig,
+    entries: Mutex<HashMap<String, ActorEntry>>,
+    event_subscribers: Mutex<Vec<mpsc::UnboundedSender<ActorEvent>>>,
+    listing_subscribers: Mutex<Vec<Box<dyn ErasedListingSender>>>,
+    oplog: Mutex<OpLog>,
+    observed_versions: Mutex<VersionVector>,
+    watches: Mutex<HashMap<String, Vec<WatchEntry>>>,
+    pending_notifications: Mutex<Vec<PendingListingNotification>>,
+    blip_pending: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
+// =============================================================================
+// RECEPTIONIST
+// =============================================================================
 
-impl PartialEq for LazyEndpoint {
-    fn eq(&self, other: &Self) -> bool {
-        // For equality, we compare the actual endpoints if available
-        // This is a simplified comparison - in practice you might want to compare paths
-        std::ptr::eq(self.endpoint.as_ref(), other.endpoint.as_ref())
-    }
-}
-
-impl Eq for LazyEndpoint {}
-
-impl std::hash::Hash for LazyEndpoint {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Hash based on the pointer to the Arc - this is a simplified approach
-        std::ptr::hash(self.endpoint.as_ref(), state);
-    }
-}
-
-impl std::fmt::Debug for LazyEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LazyEndpoint")
-            .field("has_endpoint", &self.endpoint.lock().unwrap().is_some())
-            .finish()
-    }
-}
-
-/// Entry representing a registered actor
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Entry {
-    actor_path: ActorPath,
-    endpoint: LazyEndpoint,
-}
-
-#[derive(Default)]
-pub struct ReceptionistActor {
-    /// Map of the actors registered with the receptionist.
-    /// This stores the actors under their actor type key.
-    registered_actors: HashMap<String, HashSet<Entry>>,
-    /// Active subscriptions to registry events
-    subscribers: Vec<SubscriberInfo>,
-    /// Next subscription ID for tracking
-    next_subscription_id: usize,
-}
-
-impl Actor for ReceptionistActor {
-    const ACTOR_TYPE_KEY: &'static str = "system.receptionist";
-}
-
-/// Message to register an actor with the receptionist
-pub struct RegisterMessage {
-    /// The actor path of the actor to register
-    pub path: ActorPath,
-    /// Optional endpoint for local actors, None for remote actors that will be created lazily
-    pub endpoint: Option<AnyEndpoint>,
-    /// Optional factory for creating remote endpoints
-    pub endpoint_factory: Option<Box<dyn EndpointFactory>>,
-}
-
-impl std::fmt::Debug for RegisterMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegisterMessage")
-            .field("path", &self.path)
-            .field("has_endpoint", &self.endpoint.is_some())
-            .field("has_factory", &self.endpoint_factory.is_some())
-            .finish()
-    }
-}
-
-impl RegisterMessage {
-    /// Create a registration message for a local actor with an existing endpoint
-    pub fn local(path: ActorPath, endpoint: AnyEndpoint) -> Self {
-        Self {
-            path,
-            endpoint: Some(endpoint),
-            endpoint_factory: None,
-        }
-    }
-
-    /// Create a registration message for a remote actor with a factory
-    pub fn remote(path: ActorPath, factory: Box<dyn EndpointFactory>) -> Self {
-        Self {
-            path,
-            endpoint: None,
-            endpoint_factory: Some(factory),
-        }
-    }
-}
-
-impl Message for RegisterMessage {
-    type Result = bool;
-}
-
-#[async_trait]
-impl Handler<RegisterMessage> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: RegisterMessage) -> bool {
-        let actor_path = msg.path.clone();
-        let key = msg.path.type_id.to_string();
-
-        let lazy_endpoint = if let Some(endpoint) = msg.endpoint {
-            LazyEndpoint::from_endpoint(endpoint)
-        } else if let Some(factory) = msg.endpoint_factory {
-            LazyEndpoint::from_factory(factory)
-        } else {
-            tracing::error!("RegisterMessage must have either endpoint or endpoint_factory");
-            return false;
-        };
-
-        let event = RegistryEvent::Added(actor_path.clone(), lazy_endpoint.get_endpoint());
-        let entry = Entry {
-            actor_path,
-            endpoint: lazy_endpoint,
-        };
-        self.registered_actors
-            .entry(key)
-            .or_insert_with(HashSet::new)
-            .insert(entry);
-
-        // Broadcast the registration event to subscribers
-        self.broadcast_event(event);
-
-        true
-    }
-}
-
-/// Message to deregister an actor from the receptionist
-#[derive(Debug)]
-pub struct DeregisterMessage {
-    /// The actor path of the actor to deregister
-    pub path: ActorPath,
-}
-
-impl Message for DeregisterMessage {
-    type Result = bool;
-}
-
-#[async_trait]
-impl Handler<DeregisterMessage> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: DeregisterMessage) -> bool {
-        let key = msg.path.type_id.to_string();
-
-        if let Some(entries) = self.registered_actors.get_mut(&key) {
-            let original_len = entries.len();
-            entries.retain(|entry| entry.actor_path != msg.path);
-            let was_removed = entries.len() < original_len;
-
-            if was_removed {
-                let event = RegistryEvent::Removed(msg.path);
-                self.broadcast_event(event);
-            }
-
-            was_removed
-        } else {
-            false
-        }
-    }
-}
-
-/// Message to lookup actors by type key
-#[derive(Debug)]
-pub struct LookupMessage {
-    /// The actor type key to lookup
-    pub actor_type_key: String,
-}
-
-/// Message to subscribe to registry events
-#[derive(Debug)]
-pub struct SubscribeMessage {
-    /// Filter for subscription events
-    pub filter: SubscriptionFilter,
-    /// Channel sender for delivering events
-    pub sender: mpsc::UnboundedSender<RegistryEvent>,
-}
-
-impl Message for LookupMessage {
-    type Result = Vec<AnyEndpoint>;
-}
-
-impl Message for SubscribeMessage {
-    type Result = ();
-}
-
-#[async_trait]
-impl Handler<LookupMessage> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: LookupMessage) -> Vec<AnyEndpoint> {
-        self.registered_actors
-            .get(&msg.actor_type_key)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| entry.endpoint.get_endpoint())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}
-
-#[async_trait]
-impl Handler<SubscribeMessage> for ReceptionistActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: SubscribeMessage) -> () {
-        let subscriber_info = SubscriberInfo {
-            sender: msg.sender,
-            filter: msg.filter,
-        };
-
-        self.subscribers.push(subscriber_info);
-
-        tracing::debug!(
-            "Added new subscription, total subscribers: {}",
-            self.subscribers.len()
-        );
-    }
-}
-
-impl ReceptionistActor {
-    /// Broadcast a registry event to all matching subscribers
-    fn broadcast_event(&mut self, event: RegistryEvent) {
-        let mut to_remove = Vec::new();
-
-        for (index, subscriber) in self.subscribers.iter().enumerate() {
-            if self.should_send_event(&event, &subscriber.filter) {
-                if let Err(_) = subscriber.sender.send(event.clone()) {
-                    // Subscriber channel is closed, mark for removal
-                    tracing::debug!("Removing disconnected subscriber");
-                    to_remove.push(index);
-                }
-            }
-        }
-
-        // Remove disconnected subscribers in reverse order to maintain indices
-        for &index in to_remove.iter().rev() {
-            self.subscribers.remove(index);
-        }
-    }
-
-    /// Check if an event should be sent to a subscriber based on their filter
-    fn should_send_event(&self, event: &RegistryEvent, filter: &SubscriptionFilter) -> bool {
-        let path = match event {
-            RegistryEvent::Added(path, _) => path,
-            RegistryEvent::Removed(path) => path,
-        };
-
-        // Check actor type match (exact match required, unless "*" for all types)
-        if filter.actor_type != "*" && path.type_id.as_ref() != filter.actor_type {
-            return false;
-        }
-
-        // Check group pattern if specified
-        if let Some(group_pattern) = &filter.group_pattern {
-            match glob::Pattern::new(group_pattern) {
-                Ok(pattern) => pattern.matches(path.group_id.as_ref()),
-                Err(_) => {
-                    tracing::warn!("Invalid glob pattern: {}", group_pattern);
-                    false
-                }
-            }
-        } else {
-            // No group filtering, type matched, so send event
-            true
-        }
-    }
-}
-
-/// Errors that can occur during actor lookup operations
-#[derive(Debug, thiserror::Error)]
-pub enum LookupError {
-    /// No actor was found registered under the given key
-    #[error("no actor registered for key")]
-    NotFound,
-    /// Multiple actors were found when expecting only one
-    #[error("multiple actors registered for unique key")]
-    MultipleFound,
-    /// An error occurred in the underlying actor system
-    #[error("actor system error: {0}")]
-    SystemError(#[from] SendError),
-}
-
-/// Client interface for interacting with the ReceptionistActor
+/// The receptionist: type-erased actor registry with typed lookup,
+/// subscription-based discovery, and distributed replication support.
 ///
-/// This struct provides a high-level API for registering, deregistering,
-/// looking up actors, and subscribing to registration updates.
+/// Cheap to clone (wraps Arc).
 #[derive(Clone)]
 pub struct Receptionist {
-    /// Endpoint to the underlying ReceptionistActor
-    inner_endpoint: Endpoint<ReceptionistActor>,
+    inner: Arc<ReceptionistInner>,
 }
 
 impl Receptionist {
-    /// Creates a new Receptionist client connected to the given ReceptionistActor endpoint
-    pub fn new(endpoint: Endpoint<ReceptionistActor>) -> Self {
-        Self {
-            inner_endpoint: endpoint,
+    pub fn new() -> Self {
+        Self::with_config(ReceptionistConfig::default())
+    }
+
+    pub fn with_node_id(node_id: impl Into<String>) -> Self {
+        Self::with_config(ReceptionistConfig {
+            node_id: node_id.into(),
+            ..Default::default()
+        })
+    }
+
+    pub fn with_config(config: ReceptionistConfig) -> Self {
+        let node_id = config.node_id.clone();
+        let flush_interval = config.flush_interval;
+
+        let receptionist = Self {
+            inner: Arc::new(ReceptionistInner {
+                config,
+                entries: Mutex::new(HashMap::new()),
+                event_subscribers: Mutex::new(Vec::new()),
+                listing_subscribers: Mutex::new(Vec::new()),
+                oplog: Mutex::new(OpLog::new(node_id)),
+                observed_versions: Mutex::new(VersionVector::new()),
+                watches: Mutex::new(HashMap::new()),
+                pending_notifications: Mutex::new(Vec::new()),
+                blip_pending: Mutex::new(HashMap::new()),
+            }),
+        };
+
+        // Spawn the flush task if configured
+        if let Some(interval) = flush_interval {
+            let r = receptionist.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    ticker.tick().await;
+                    r.flush_pending_notifications();
+                }
+            });
         }
+
+        receptionist
     }
 
-
-    /// Register a local actor with an existing endpoint
-    pub async fn register_local(
-        &self,
-        path: ActorPath,
-        endpoint: AnyEndpoint,
-    ) -> Result<bool, SendError> {
-        self.inner_endpoint
-            .send(RegisterMessage::local(path, endpoint))
-            .await
+    pub fn node_id(&self) -> &str {
+        &self.inner.config.node_id
     }
 
-    /// Register a remote actor with a factory for lazy endpoint creation
-    pub async fn register_remote(
-        &self,
-        path: ActorPath,
-        factory: Box<dyn EndpointFactory>,
-    ) -> Result<bool, SendError> {
-        self.inner_endpoint
-            .send(RegisterMessage::remote(path, factory))
-            .await
-    }
+    // =========================================================================
+    // CORE REGISTRATION & LOOKUP
+    // =========================================================================
 
-    /// Deregister an actor from the receptionist
-    pub async fn deregister(&self, path: ActorPath) -> Result<bool, SendError> {
-        self.inner_endpoint.send(DeregisterMessage { path }).await
-    }
-
-    /// Lookup all actors registered under a specific actor type key
-    pub async fn lookup(&self, actor_type_key: String) -> Result<Vec<AnyEndpoint>, SendError> {
-        self.inner_endpoint
-            .send(LookupMessage { actor_type_key })
-            .await
-    }
-
-    /// Lookup a single actor by type key, returns error if none or multiple found
-    pub async fn lookup_one(&self, actor_type_key: String) -> Result<AnyEndpoint, LookupError> {
-        let endpoints = self.lookup(actor_type_key).await?;
-        match endpoints.len() {
-            0 => Err(LookupError::NotFound),
-            1 => Ok(endpoints.into_iter().next().unwrap()),
-            _ => Err(LookupError::MultipleFound),
-        }
-    }
-
-    /// Lookup actors with type safety - converts AnyEndpoint to typed Endpoint<T>
-    pub async fn lookup_typed<T>(
-        &self,
-        actor_type_key: String,
-    ) -> Result<Vec<Endpoint<T>>, LookupError>
+    /// Start a local actor, register it, and return its typed endpoint.
+    /// Uses `Temporary` restart policy (never restarts).
+    pub fn start<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
     where
-        T: Actor + 'static,
+        A: Actor + RemoteDispatch + 'static,
     {
-        let any_endpoints = self.lookup(actor_type_key).await?;
-        let typed_endpoints: Vec<Endpoint<T>> = any_endpoints
-            .into_iter()
-            .filter_map(|any_endpoint| any_endpoint.downcast())
-            .collect();
+        let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel::<Box<dyn EnvelopeProxy<A>>>();
+        let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchRequest>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (system_tx, system_rx) = mpsc::unbounded_channel::<SystemSignal>();
 
-        Ok(typed_endpoints)
+        let exit_reason = Arc::new(Mutex::new(TerminationReason::Stopped));
+
+        // Create deregister guard for auto-cleanup on supervisor exit
+        let guard = DeregisterGuard {
+            receptionist: self.clone(),
+            label: label.to_string(),
+            reason: exit_reason.clone(),
+        };
+
+        // Build the actor context
+        let ctx = ActorContext {
+            label: label.to_string(),
+            node_id: self.inner.config.node_id.clone(),
+            mailbox_tx: mailbox_tx.clone(),
+            receptionist: self.clone(),
+            system_tx,
+        };
+
+        // Spawn the supervisor task
+        tokio::spawn(async move {
+            let _ = run_supervisor(
+                actor,
+                state,
+                ctx,
+                mailbox_rx,
+                dispatch_rx,
+                shutdown_rx,
+                system_rx,
+                exit_reason,
+                guard,
+            )
+            .await;
+        });
+
+        // Create the user's endpoint
+        let endpoint = Endpoint::local(mailbox_tx.clone());
+
+        // Register in the receptionist
+        let entry = ActorEntry {
+            label: label.to_string(),
+            type_id: TypeId::of::<A>(),
+            actor_type_name: std::any::type_name::<A>().to_string(),
+            location: EntryLocation::Local {
+                endpoint_factory: Box::new(LocalEndpointFactory { mailbox_tx }),
+                dispatch_tx,
+                shutdown_tx: Some(shutdown_tx),
+            },
+            keys: Vec::new(),
+            node_id: self.inner.config.node_id.clone(),
+        };
+        self.inner
+            .entries
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), entry);
+
+        // Record in oplog (respects blip window if configured)
+        self.record_register_op(label, std::any::type_name::<A>(), &[]);
+
+        self.emit(ActorEvent::Registered {
+            label: label.to_string(),
+            actor_type: std::any::type_name::<A>().to_string(),
+        });
+
+        endpoint
     }
 
-    /// Lookup a single typed actor
-    pub async fn lookup_one_typed<T>(
+    /// Start an actor with a restart policy and factory.
+    ///
+    /// The factory is called to create each incarnation of the actor (initial + restarts).
+    /// The returned endpoint remains valid across restarts — the underlying mailbox
+    /// channel is reused so existing `Endpoint<A>` handles keep working.
+    pub fn start_with_policy<F: ActorFactory>(
         &self,
-        actor_type_key: String,
-    ) -> Result<Endpoint<T>, LookupError>
-    where
-        T: Actor + 'static,
-    {
-        let endpoints = self.lookup_typed::<T>(actor_type_key).await?;
-        match endpoints.len() {
-            0 => Err(LookupError::NotFound),
-            1 => Ok(endpoints.into_iter().next().unwrap()),
-            _ => Err(LookupError::MultipleFound),
+        label: &str,
+        factory: F,
+        policy: RestartPolicy,
+    ) -> Endpoint<F::Actor> {
+        self.start_with_config(
+            label,
+            factory,
+            RestartConfig {
+                policy,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Start an actor with full restart configuration (limits, backoff, policy).
+    ///
+    /// Like `start_with_policy`, the returned endpoint remains valid across restarts.
+    /// When the restart limit is exceeded within the configured window, the actor
+    /// terminates with `TerminationReason::RestartLimitExceeded` and watchers are notified.
+    pub fn start_with_config<F: ActorFactory>(
+        &self,
+        label: &str,
+        mut factory: F,
+        config: RestartConfig,
+    ) -> Endpoint<F::Actor> {
+        // Stable channels that survive across restarts
+        let (mailbox_tx, mut mailbox_rx) =
+            mpsc::unbounded_channel::<Box<dyn EnvelopeProxy<F::Actor>>>();
+        let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded_channel::<DispatchRequest>();
+
+        // Create the user's endpoint (stable across restarts)
+        let endpoint = Endpoint::local(mailbox_tx.clone());
+
+        // Initial registration
+        let (actor, state) = factory.create();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (system_tx, system_rx) = mpsc::unbounded_channel::<SystemSignal>();
+
+        let exit_reason = Arc::new(Mutex::new(TerminationReason::Stopped));
+
+        let guard = DeregisterGuard {
+            receptionist: self.clone(),
+            label: label.to_string(),
+            reason: exit_reason.clone(),
+        };
+
+        let ctx = ActorContext {
+            label: label.to_string(),
+            node_id: self.inner.config.node_id.clone(),
+            mailbox_tx: mailbox_tx.clone(),
+            receptionist: self.clone(),
+            system_tx,
+        };
+
+        let entry = ActorEntry {
+            label: label.to_string(),
+            type_id: TypeId::of::<F::Actor>(),
+            actor_type_name: std::any::type_name::<F::Actor>().to_string(),
+            location: EntryLocation::Local {
+                endpoint_factory: Box::new(LocalEndpointFactory {
+                    mailbox_tx: mailbox_tx.clone(),
+                }),
+                dispatch_tx: dispatch_tx.clone(),
+                shutdown_tx: Some(shutdown_tx),
+            },
+            keys: Vec::new(),
+            node_id: self.inner.config.node_id.clone(),
+        };
+        self.inner
+            .entries
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), entry);
+
+        self.record_register_op(label, std::any::type_name::<F::Actor>(), &[]);
+
+        self.emit(ActorEvent::Registered {
+            label: label.to_string(),
+            actor_type: std::any::type_name::<F::Actor>().to_string(),
+        });
+
+        // Spawn restart wrapper
+        let receptionist = self.clone();
+        let label_owned = label.to_string();
+        let node_id = self.inner.config.node_id.clone();
+
+        tokio::spawn(async move {
+            let mut restart_times: VecDeque<Instant> = VecDeque::new();
+            let mut backoff_duration = config.backoff.initial;
+
+            // First run uses the actor/state/channels created above
+            let (mb, dp) = run_supervisor(
+                actor,
+                state,
+                ctx,
+                mailbox_rx,
+                dispatch_rx,
+                shutdown_rx,
+                system_rx,
+                exit_reason.clone(),
+                guard,
+            )
+            .await;
+            mailbox_rx = mb;
+            dispatch_rx = dp;
+
+            let reason = exit_reason.lock().unwrap().clone();
+            if !should_restart(&config.policy, &reason) {
+                return;
+            }
+
+            // Restart loop with limits and backoff
+            loop {
+                // Prune timestamps outside the rolling window
+                let now = Instant::now();
+                while restart_times
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) > config.window)
+                {
+                    restart_times.pop_front();
+                }
+
+                // Check if we've exceeded the restart limit
+                if restart_times.len() >= config.max_restarts as usize {
+                    // The previous incarnation's guard already removed the entry.
+                    // Re-register briefly so deregister_with_reason can fire watches.
+                    let entry = ActorEntry {
+                        label: label_owned.clone(),
+                        type_id: TypeId::of::<F::Actor>(),
+                        actor_type_name: std::any::type_name::<F::Actor>().to_string(),
+                        location: EntryLocation::Local {
+                            endpoint_factory: Box::new(LocalEndpointFactory {
+                                mailbox_tx: mailbox_tx.clone(),
+                            }),
+                            dispatch_tx: dispatch_tx.clone(),
+                            shutdown_tx: None,
+                        },
+                        keys: Vec::new(),
+                        node_id: node_id.clone(),
+                    };
+                    receptionist
+                        .inner
+                        .entries
+                        .lock()
+                        .unwrap()
+                        .insert(label_owned.clone(), entry);
+                    receptionist.deregister_with_reason(
+                        &label_owned,
+                        TerminationReason::RestartLimitExceeded,
+                    );
+                    break;
+                }
+
+                restart_times.push_back(now);
+
+                // Apply backoff delay
+                tokio::time::sleep(backoff_duration).await;
+                backoff_duration = Duration::from_secs_f64(
+                    (backoff_duration.as_secs_f64() * config.backoff.multiplier)
+                        .min(config.backoff.max.as_secs_f64()),
+                );
+
+                let (actor, state) = factory.create();
+                let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+                let (system_tx, system_rx) = mpsc::unbounded_channel::<SystemSignal>();
+
+                let exit_reason = Arc::new(Mutex::new(TerminationReason::Stopped));
+
+                let guard = DeregisterGuard {
+                    receptionist: receptionist.clone(),
+                    label: label_owned.clone(),
+                    reason: exit_reason.clone(),
+                };
+
+                let ctx = ActorContext {
+                    label: label_owned.clone(),
+                    node_id: node_id.clone(),
+                    mailbox_tx: mailbox_tx.clone(),
+                    receptionist: receptionist.clone(),
+                    system_tx,
+                };
+
+                // Re-register with the same label and stable channels
+                let entry = ActorEntry {
+                    label: label_owned.clone(),
+                    type_id: TypeId::of::<F::Actor>(),
+                    actor_type_name: std::any::type_name::<F::Actor>().to_string(),
+                    location: EntryLocation::Local {
+                        endpoint_factory: Box::new(LocalEndpointFactory {
+                            mailbox_tx: mailbox_tx.clone(),
+                        }),
+                        dispatch_tx: dispatch_tx.clone(),
+                        shutdown_tx: Some(shutdown_tx),
+                    },
+                    keys: Vec::new(),
+                    node_id: node_id.clone(),
+                };
+                receptionist
+                    .inner
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .insert(label_owned.clone(), entry);
+
+                receptionist.emit(ActorEvent::Registered {
+                    label: label_owned.clone(),
+                    actor_type: std::any::type_name::<F::Actor>().to_string(),
+                });
+
+                let (mb, dp) = run_supervisor(
+                    actor,
+                    state,
+                    ctx,
+                    mailbox_rx,
+                    dispatch_rx,
+                    shutdown_rx,
+                    system_rx,
+                    exit_reason.clone(),
+                    guard,
+                )
+                .await;
+                mailbox_rx = mb;
+                dispatch_rx = dp;
+
+                let reason = exit_reason.lock().unwrap().clone();
+                if !should_restart(&config.policy, &reason) {
+                    break;
+                }
+            }
+        });
+
+        endpoint
+    }
+
+    /// Register a remote actor (discovered via cluster gossip).
+    pub fn register_remote<A: Actor + 'static>(
+        &self,
+        label: &str,
+        wire_tx: mpsc::UnboundedSender<RemoteInvocation>,
+        response_registry: ResponseRegistry,
+    ) {
+        self.register_remote_from_node::<A>(
+            label,
+            wire_tx,
+            response_registry,
+            &self.inner.config.node_id.clone(),
+        );
+    }
+
+    /// Register a remote actor from a specific node.
+    pub fn register_remote_from_node<A: Actor + 'static>(
+        &self,
+        label: &str,
+        wire_tx: mpsc::UnboundedSender<RemoteInvocation>,
+        response_registry: ResponseRegistry,
+        node_id: &str,
+    ) {
+        let entry = ActorEntry {
+            label: label.to_string(),
+            type_id: TypeId::of::<A>(),
+            actor_type_name: std::any::type_name::<A>().to_string(),
+            location: EntryLocation::Remote {
+                wire_tx,
+                response_registry,
+            },
+            keys: Vec::new(),
+            node_id: node_id.to_string(),
+        };
+        self.inner
+            .entries
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), entry);
+
+        self.record_register_op(label, std::any::type_name::<A>(), &[]);
+
+        self.emit(ActorEvent::Registered {
+            label: label.to_string(),
+            actor_type: std::any::type_name::<A>().to_string(),
+        });
+    }
+
+    /// Deregister an actor. Idempotent — no-op if already gone.
+    pub fn deregister(&self, label: &str) {
+        self.deregister_with_reason(label, TerminationReason::Stopped);
+    }
+
+    /// Deregister an actor with a specific termination reason.
+    /// Fires any watches registered for this actor.
+    pub fn deregister_with_reason(&self, label: &str, reason: TerminationReason) {
+        // Cancel any pending blip timer
+        if let Some(handle) = self.inner.blip_pending.lock().unwrap().remove(label) {
+            handle.abort();
+        }
+
+        if let Some(entry) = self.inner.entries.lock().unwrap().remove(label) {
+            // Record remove op in oplog (immediate, no blip window for removes)
+            self.inner.oplog.lock().unwrap().append(OpType::Remove {
+                label: label.to_string(),
+            });
+
+            // Fire watches (one-shot: remove drains the list)
+            if let Some(watchers) = self.inner.watches.lock().unwrap().remove(label) {
+                let terminated = ActorTerminated {
+                    label: label.to_string(),
+                    reason: reason.clone(),
+                };
+                for watcher in watchers {
+                    let _ = watcher
+                        .system_tx
+                        .send(SystemSignal::ActorTerminated(terminated.clone()));
+                }
+            }
+
+            self.emit(ActorEvent::Deregistered {
+                label: entry.label,
+                actor_type: entry.actor_type_name,
+            });
         }
     }
 
-    /// Subscribe to registry events with optional filtering
-    pub async fn subscribe(
+    /// Register a watch on an actor. Erlang semantics: if the watched actor
+    /// doesn't exist, fires immediately.
+    pub(crate) fn add_watch(
         &self,
-        filter: SubscriptionFilter,
-    ) -> Result<Subscription, SubscriptionError> {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        watched_label: &str,
+        watcher_label: &str,
+        system_tx: mpsc::UnboundedSender<SystemSignal>,
+    ) {
+        let exists = self
+            .inner
+            .entries
+            .lock()
+            .unwrap()
+            .contains_key(watched_label);
+        if !exists {
+            // Erlang semantics: immediate fire if watched actor doesn't exist
+            let _ = system_tx.send(SystemSignal::ActorTerminated(ActorTerminated {
+                label: watched_label.to_string(),
+                reason: TerminationReason::Stopped,
+            }));
+            return;
+        }
 
-        // Send subscribe message to the receptionist actor
-        self.inner_endpoint
-            .send(SubscribeMessage { filter, sender })
-            .await?;
+        self.inner
+            .watches
+            .lock()
+            .unwrap()
+            .entry(watched_label.to_string())
+            .or_default()
+            .push(WatchEntry {
+                watcher_label: watcher_label.to_string(),
+                system_tx,
+            });
+    }
 
-        // Return the subscription handle
-        Ok(Subscription::new(receiver))
+    /// Stop a local actor gracefully. Sends shutdown signal to supervisor.
+    /// The supervisor will exit, and the DeregisterGuard will auto-deregister.
+    pub fn stop(&self, label: &str) {
+        let mut entries = self.inner.entries.lock().unwrap();
+        if let Some(entry) = entries.get_mut(label)
+            && let EntryLocation::Local { shutdown_tx, .. } = &mut entry.location
+            && let Some(tx) = shutdown_tx.take()
+        {
+            let _ = tx.send(());
+        }
+        // Don't remove entry here — the supervisor's DeregisterGuard will handle it
+    }
+
+    /// Lookup an actor by label. **The caller provides the expected type.**
+    /// Returns None if not found or if the type doesn't match.
+    pub fn lookup<A: Actor + 'static>(&self, label: &str) -> Option<Endpoint<A>> {
+        let entries = self.inner.entries.lock().unwrap();
+        let entry = entries.get(label)?;
+
+        // TypeId guard — ensures the downcast inside is safe
+        if entry.type_id != TypeId::of::<A>() {
+            return None;
+        }
+
+        match &entry.location {
+            EntryLocation::Local {
+                endpoint_factory, ..
+            } => {
+                let any_endpoint = endpoint_factory.create_endpoint_any();
+                any_endpoint.downcast::<Endpoint<A>>().ok().map(|b| *b)
+            }
+            EntryLocation::Remote {
+                wire_tx,
+                response_registry,
+            } => Some(Endpoint::remote(
+                entry.label.clone(),
+                wire_tx.clone(),
+                response_registry.clone(),
+            )),
+        }
+    }
+
+    /// Get the dispatch channel for routing incoming remote messages
+    /// to a local actor's supervisor.
+    pub fn get_dispatch_sender(
+        &self,
+        label: &str,
+    ) -> Option<mpsc::UnboundedSender<DispatchRequest>> {
+        let entries = self.inner.entries.lock().unwrap();
+        let entry = entries.get(label)?;
+        match &entry.location {
+            EntryLocation::Local { dispatch_tx, .. } => Some(dispatch_tx.clone()),
+            EntryLocation::Remote { .. } => None,
+        }
+    }
+
+    /// Check if an entry exists for the given label.
+    pub fn has_entry(&self, label: &str) -> bool {
+        self.inner.entries.lock().unwrap().contains_key(label)
+    }
+
+    // =========================================================================
+    // LIFECYCLE EVENTS
+    // =========================================================================
+
+    /// Subscribe to lifecycle events (type-erased).
+    pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<ActorEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.event_subscribers.lock().unwrap().push(tx);
+        rx
+    }
+
+    fn emit(&self, event: ActorEvent) {
+        let mut subs = self.inner.event_subscribers.lock().unwrap();
+        subs.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+
+    // =========================================================================
+    // RECEPTION KEYS & LISTINGS
+    // =========================================================================
+
+    /// Check in an actor with a group key. The actor must already be
+    /// registered (via `start()` or `register_remote()`).
+    ///
+    /// Multiple actors can share the same key. This is how you build
+    /// actor groups — register several actors with the same key, then
+    /// subscribe to the key to discover them all.
+    pub fn check_in<A: Actor + 'static>(&self, label: &str, key: ReceptionKey<A>) {
+        let erased_key = ErasedReceptionKey {
+            id: key.id.clone(),
+            type_id: TypeId::of::<A>(),
+        };
+
+        // Lock both in consistent order: entries → listing_subscribers
+        let entries = self.inner.entries.lock().unwrap();
+        let Some(entry) = entries.get(label) else {
+            return;
+        };
+        if entry.type_id != TypeId::of::<A>() {
+            return;
+        }
+
+        // Notify matching listing subscribers
+        if self.inner.config.flush_interval.is_some() {
+            // Delayed flush mode: buffer the notification
+            self.inner
+                .pending_notifications
+                .lock()
+                .unwrap()
+                .push(PendingListingNotification {
+                    label: label.to_string(),
+                    key_id: key.id.clone(),
+                    type_id: TypeId::of::<A>(),
+                });
+        } else {
+            // Immediate mode: notify now
+            let mut listing_subs = self.inner.listing_subscribers.lock().unwrap();
+            listing_subs.retain(|sub| !sub.is_closed());
+            for sub in listing_subs.iter() {
+                if sub.key_id() == key.id && sub.actor_type_id() == TypeId::of::<A>() {
+                    sub.try_send_from_entry(entry);
+                }
+            }
+        }
+
+        // Must drop entries before mutating it (need mutable borrow)
+        drop(entries);
+
+        // Add key to entry
+        if let Some(e) = self.inner.entries.lock().unwrap().get_mut(label) {
+            e.keys.push(erased_key);
+        }
+    }
+
+    /// Get a live listing of actors registered with the given key.
+    ///
+    /// Returns existing matches immediately (backfill), then streams
+    /// new actors as they check in with the matching key.
+    ///
+    /// Analogous to Swift's `receptionist.listing(of: key)`.
+    pub fn listing<A: Actor + 'static>(&self, key: ReceptionKey<A>) -> Listing<A> {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Lock both atomically: entries → listing_subscribers
+        // This prevents a race where an actor checks in between
+        // backfill and subscription registration.
+        let entries = self.inner.entries.lock().unwrap();
+        let mut listing_subs = self.inner.listing_subscribers.lock().unwrap();
+
+        // Backfill: send all existing actors that match this key
+        for entry in entries.values() {
+            if entry.type_id == TypeId::of::<A>()
+                && entry
+                    .keys
+                    .iter()
+                    .any(|k| k.id == key.id && k.type_id == TypeId::of::<A>())
+            {
+                let temp_sender = TypedListingSender::<A> {
+                    key_id: key.id.clone(),
+                    tx: tx.clone(),
+                };
+                temp_sender.try_send_from_entry(entry);
+            }
+        }
+
+        // Register for future notifications
+        listing_subs.push(Box::new(TypedListingSender::<A> {
+            key_id: key.id.clone(),
+            tx,
+        }));
+
+        // Clean up closed subscribers while we have the lock
+        listing_subs.retain(|sub| !sub.is_closed());
+
+        Listing::new(rx)
+    }
+
+    // =========================================================================
+    // OPLOG REPLICATION
+    // =========================================================================
+
+    /// Get this receptionist's current version vector.
+    /// Includes our own latest sequence + observed sequences from peers.
+    pub fn version_vector(&self) -> VersionVector {
+        let mut vv = self.inner.observed_versions.lock().unwrap().clone();
+        let oplog = self.inner.oplog.lock().unwrap();
+        let latest = oplog.latest_seq();
+        if latest > 0 {
+            vv.update(&self.inner.config.node_id, latest);
+        }
+        vv
+    }
+
+    /// Get ops from our local log that the peer hasn't seen yet.
+    /// The peer provides their version vector so we know what to send.
+    pub fn ops_since(&self, peer_versions: &VersionVector) -> Vec<Op> {
+        let oplog = self.inner.oplog.lock().unwrap();
+        let peer_has_seen = peer_versions.get(&self.inner.config.node_id);
+        oplog.ops_since(peer_has_seen).to_vec()
+    }
+
+    /// Apply operations received from a remote peer.
+    /// Uses version vectors for deduplication — already-seen ops are skipped.
+    pub fn apply_ops(&self, ops: Vec<Op>) {
+        for op in ops {
+            {
+                let mut versions = self.inner.observed_versions.lock().unwrap();
+                let already_seen = versions.get(&op.node_id) >= op.seq;
+                if already_seen {
+                    continue;
+                }
+                versions.update(&op.node_id, op.seq);
+            }
+
+            match &op.op_type {
+                OpType::Register {
+                    label,
+                    actor_type_name,
+                    ..
+                } => {
+                    // For remote ops, we emit an event but don't create a full entry
+                    // (the actual entry would be created by register_remote when
+                    // the connection is established).
+                    self.emit(ActorEvent::Registered {
+                        label: label.clone(),
+                        actor_type: actor_type_name.clone(),
+                    });
+                }
+                OpType::Remove { label } => {
+                    self.deregister(label);
+                }
+            }
+        }
+    }
+
+    /// Remove all actors owned by a specific node.
+    /// Used when the cluster detects a node has left or crashed.
+    pub fn prune_node(&self, node_id: &str) {
+        let labels_to_remove: Vec<String> = {
+            let entries = self.inner.entries.lock().unwrap();
+            entries
+                .values()
+                .filter(|e| e.node_id == node_id)
+                .map(|e| e.label.clone())
+                .collect()
+        };
+
+        for label in &labels_to_remove {
+            // deregister handles oplog recording + event emission
+            self.deregister(label);
+        }
+    }
+
+    /// Get a snapshot of the oplog for inspection/testing.
+    pub fn oplog_snapshot(&self) -> Vec<Op> {
+        self.inner.oplog.lock().unwrap().ops.clone()
+    }
+
+    // =========================================================================
+    // DELAYED FLUSH & BLIP AVOIDANCE
+    // =========================================================================
+
+    /// Record a register op, respecting blip window if configured.
+    fn record_register_op(&self, label: &str, actor_type_name: &str, key_ids: &[String]) {
+        let blip_window = self.inner.config.blip_window;
+        let origin_addr = self.inner.config.origin_addr.clone();
+
+        if let Some(window) = blip_window {
+            // Blip avoidance: delay the oplog entry
+            let receptionist = self.clone();
+            let label_owned = label.to_string();
+            let actor_type_name = actor_type_name.to_string();
+            let key_ids = key_ids.to_vec();
+
+            let label_for_insert = label_owned.clone();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(window).await;
+
+                // If the actor is still registered after the window, commit the op
+                let still_exists = receptionist
+                    .inner
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .contains_key(&label_owned);
+
+                if still_exists {
+                    receptionist
+                        .inner
+                        .oplog
+                        .lock()
+                        .unwrap()
+                        .append(OpType::Register {
+                            label: label_owned.clone(),
+                            actor_type_name,
+                            key_ids,
+                            origin_addr,
+                        });
+                }
+
+                // Remove from pending
+                receptionist
+                    .inner
+                    .blip_pending
+                    .lock()
+                    .unwrap()
+                    .remove(&label_owned);
+            });
+
+            self.inner
+                .blip_pending
+                .lock()
+                .unwrap()
+                .insert(label_for_insert, handle);
+        } else {
+            // No blip window: commit immediately
+            self.inner.oplog.lock().unwrap().append(OpType::Register {
+                label: label.to_string(),
+                actor_type_name: actor_type_name.to_string(),
+                key_ids: key_ids.to_vec(),
+                origin_addr,
+            });
+        }
+    }
+
+    /// Flush pending listing notifications (called by the flush timer task).
+    fn flush_pending_notifications(&self) {
+        let pending: Vec<PendingListingNotification> = {
+            let mut pending = self.inner.pending_notifications.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+
+        if pending.is_empty() {
+            return;
+        }
+
+        let entries = self.inner.entries.lock().unwrap();
+        let mut listing_subs = self.inner.listing_subscribers.lock().unwrap();
+        listing_subs.retain(|sub| !sub.is_closed());
+
+        for notif in &pending {
+            if let Some(entry) = entries.get(&notif.label) {
+                for sub in listing_subs.iter() {
+                    if sub.key_id() == notif.key_id && sub.actor_type_id() == notif.type_id {
+                        sub.try_send_from_entry(entry);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Default for Receptionist {
+    fn default() -> Self {
+        Self::new()
     }
 }

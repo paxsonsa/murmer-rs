@@ -1,10 +1,14 @@
 [workspace]
 members = [
-    "murmer", 
-    "murmer-core",
-    # "examples"
+    "murmer",
+    "murmer-macros",
+    "examples"
 ]
 resolver = "2"
+
+[workspace.dependencies]
+murmer = { path = "murmer" }
+murmer-macros = { path = "murmer-macros" }
 
 [workspace.package]
 version = "0.1.0"
@@ -12,4 +16,3 @@ edition = "2024"
 authors = ["Andrew Paxson <andrew.paxson@icloud.com>"]
 keywords = ["actor", "distributed", "actor-model", "async"]
 license = "MIT or Apache-2.0"
-

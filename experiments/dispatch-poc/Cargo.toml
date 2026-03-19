@@ -1,3 +1,0 @@
-[workspace]
-members = ["poc-framework", "poc-macros", "poc-app"]
-resolver = "2"
