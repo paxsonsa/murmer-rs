@@ -1,4 +1,19 @@
-//! Reception keys and listings for actor discovery.
+//! Reception keys and listings for subscription-based actor discovery.
+//!
+//! This module provides group-based actor discovery:
+//!
+//! - [`ReceptionKey<A>`] — a typed key for grouping actors (e.g., `"workers"`, `"caches"`)
+//! - [`Listing<A>`] — an async stream of endpoints matching a key
+//!
+//! # How it works
+//!
+//! 1. Start actors via the receptionist
+//! 2. Check them in with a key: `receptionist.check_in("counter/w1", worker_key)`
+//! 3. Subscribe to the key: `let mut listing = receptionist.listing(worker_key)`
+//! 4. The listing immediately yields all existing matches (backfill)
+//! 5. New actors that check in with the same key appear as live updates
+//!
+//! Inspired by Swift's `DistributedReception.Key<Guest>` and `GuestListing<Guest>`.
 
 use std::any::TypeId;
 use std::fmt::Debug;

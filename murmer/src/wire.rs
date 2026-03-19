@@ -1,4 +1,24 @@
 //! Wire types for remote message dispatch.
+//!
+//! These types define the protocol for sending messages between nodes:
+//!
+//! - [`RemoteInvocation`] — a serialized message heading to a remote actor
+//! - [`RemoteResponse`] — the serialized response coming back
+//! - [`DispatchRequest`] — internal routing from the wire layer to a local supervisor
+//! - [`SendError`] — errors that can occur during message delivery
+//! - [`ResponseRegistry`] — correlates in-flight call IDs to response channels
+//!
+//! # Wire protocol
+//!
+//! Messages are serialized with bincode. Each invocation carries a `call_id` for
+//! response correlation, the target `actor_label`, and a `message_type` string
+//! (the `RemoteMessage::TYPE_ID`) so the receiver knows which type to deserialize into.
+//!
+//! # Envelope pattern (local dispatch)
+//!
+//! For local actors, the [`EnvelopeProxy`] trait provides zero-cost type-erased
+//! dispatch. A [`TypedEnvelope<M>`] wraps the concrete message and a oneshot
+//! channel for the response, then erases the message type behind `dyn EnvelopeProxy<A>`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

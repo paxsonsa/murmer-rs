@@ -1,4 +1,24 @@
-//! Endpoint — the user-facing send handle (abstracts local vs remote).
+//! Endpoint — the user-facing send handle that abstracts local vs remote actors.
+//!
+//! [`Endpoint<A>`] is the primary API for sending messages to actors. It is
+//! generic over the actor type `A`, which provides compile-time guarantees
+//! that the actor can handle the message being sent.
+//!
+//! # Location transparency
+//!
+//! Under the hood, an endpoint is either:
+//! - **Local** — wraps an `mpsc` channel to the actor's supervisor (zero serialization cost)
+//! - **Remote** — serializes the message with bincode, sends it over a QUIC stream,
+//!   and awaits the deserialized response
+//!
+//! The caller never knows which variant they hold — the `send()` API is identical.
+//!
+//! # Obtaining endpoints
+//!
+//! - `receptionist.start(label, actor, state)` returns an `Endpoint<A>` for the new actor
+//! - `receptionist.lookup::<A>(label)` returns `Option<Endpoint<A>>`
+//! - `ctx.endpoint()` inside a handler returns a self-endpoint
+//! - `listing.next().await` yields endpoints from a subscription stream
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;

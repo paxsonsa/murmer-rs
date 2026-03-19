@@ -1,4 +1,23 @@
 //! Receptionist — type-erased actor registry with typed lookup.
+//!
+//! The [`Receptionist`] is the central coordination point for all actors in a
+//! murmer system. It provides:
+//!
+//! - **Start actors**: `receptionist.start("label", actor, state)` spawns a supervised actor
+//! - **Lookup actors**: `receptionist.lookup::<A>("label")` returns a typed `Endpoint<A>`
+//! - **Lifecycle events**: subscribe to registration/deregistration notifications
+//! - **Group discovery**: check actors into [`ReceptionKey`](crate::ReceptionKey) groups
+//!   and subscribe via [`Listing`](crate::Listing) streams
+//! - **Supervision**: `start_with_config` enables restart policies with backoff
+//! - **Distributed replication**: OpLog-based sync with version vectors
+//! - **Node pruning**: remove all actors from a departed cluster node
+//!
+//! # Type erasure with safe downcasts
+//!
+//! Internally, the receptionist stores entries as type-erased [`ActorEntry`] values
+//! (no actor type parameter). At lookup time, the caller provides the expected type
+//! via `lookup::<A>()`, and a `TypeId` guard ensures the internal downcast is safe.
+//! This design means the receptionist never needs to be generic over actor types.
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};

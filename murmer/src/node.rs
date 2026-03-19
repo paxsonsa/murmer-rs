@@ -1,4 +1,14 @@
-//! Simulated node server — processes incoming remote invocations.
+//! Node receiver — routes incoming remote invocations to local actors.
+//!
+//! [`run_node_receiver`] bridges the network layer to the receptionist.
+//! It reads [`RemoteInvocation`](crate::RemoteInvocation) messages from a
+//! channel, looks up the target actor's dispatch channel via the receptionist,
+//! and forwards the request. Responses are sent back through the response channel.
+//!
+//! In the real cluster implementation, this role is handled by
+//! [`cluster::remote::handle_actor_stream`](crate::cluster::remote::handle_actor_stream)
+//! which operates directly on QUIC streams. This function is primarily used
+//! for testing and simulated multi-node scenarios.
 
 use std::sync::Arc;
 

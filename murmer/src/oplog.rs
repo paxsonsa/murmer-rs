@@ -1,4 +1,19 @@
 //! OpLog — operation log for distributed receptionist replication.
+//!
+//! The OpLog is a CRDT-inspired mechanism for keeping actor registries
+//! consistent across cluster nodes:
+//!
+//! - Each node appends [`Op`]s (Register/Remove) to its local log
+//! - Nodes exchange ops they haven't seen via [`VersionVector`]-based diffing
+//! - The receptionist's [`apply_ops`](crate::Receptionist::apply_ops) method
+//!   ingests remote ops and updates the local registry
+//!
+//! # Blip avoidance
+//!
+//! Short-lived actors (registered then immediately deregistered) can cause
+//! unnecessary replication traffic. When configured with a `blip_window`,
+//! the receptionist delays oplog commits — if the actor deregisters within
+//! the window, no Register op is ever committed.
 
 use std::collections::HashMap;
 

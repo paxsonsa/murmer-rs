@@ -1,4 +1,25 @@
 //! Lifecycle and restart types for actor supervision.
+//!
+//! This module defines the types that control how actors are supervised:
+//!
+//! - [`TerminationReason`] — why an actor stopped (clean shutdown, panic, restart limit)
+//! - [`RestartPolicy`] — whether and when to restart (Temporary, Transient, Permanent)
+//! - [`RestartConfig`] — full restart specification with limits, rolling window, and backoff
+//! - [`ActorFactory`] — creates new actor instances on restart
+//!
+//! # Restart policies (OTP-inspired)
+//!
+//! | Policy | Restart on panic? | Restart on clean stop? |
+//! |--------|-------------------|------------------------|
+//! | `Temporary` | No | No |
+//! | `Transient` | Yes | No |
+//! | `Permanent` | Yes | Yes |
+//!
+//! # Backoff
+//!
+//! When an actor crashes repeatedly, [`BackoffConfig`] applies exponential
+//! backoff between restarts to avoid tight crash loops. The delay starts at
+//! `initial` and doubles (by `multiplier`) up to `max`.
 
 use std::time::Duration;
 

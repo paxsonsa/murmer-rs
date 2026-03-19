@@ -1,4 +1,26 @@
 //! Router — distribute messages across a pool of actor endpoints.
+//!
+//! A [`Router<A>`] holds multiple [`Endpoint<A>`] handles and distributes
+//! messages according to a [`RoutingStrategy`]:
+//!
+//! - **RoundRobin** — cycles through endpoints sequentially (default)
+//! - **Random** — picks a random endpoint per message
+//! - **Broadcast** — via [`Router::broadcast`], sends to all endpoints
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! let router = Router::new(
+//!     vec![ep1, ep2, ep3],
+//!     RoutingStrategy::RoundRobin,
+//! );
+//!
+//! // Each send goes to the next endpoint in sequence
+//! router.send(Increment { amount: 1 }).await?;
+//!
+//! // Or send to all at once
+//! let results = router.broadcast(GetCount).await;
+//! ```
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

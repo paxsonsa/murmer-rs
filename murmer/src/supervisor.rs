@@ -1,4 +1,18 @@
-//! Supervisor — runs an actor, handles both local and remote messages.
+//! Supervisor — runs an actor, processing both local and remote messages.
+//!
+//! Each actor is driven by a supervisor task that:
+//!
+//! 1. Receives local messages from the mailbox (typed `EnvelopeProxy<A>`)
+//! 2. Receives remote messages from the dispatch channel (`DispatchRequest`)
+//! 3. Receives system signals (actor termination notifications from watches)
+//! 4. Handles graceful shutdown via a oneshot signal
+//!
+//! The supervisor wraps every handler invocation in `catch_unwind`, so a panicking
+//! handler doesn't crash the entire runtime — it records the panic as a
+//! [`TerminationReason::Panicked`](crate::TerminationReason::Panicked) and exits cleanly.
+//!
+//! On exit, the [`DeregisterGuard`] RAII type automatically removes the actor
+//! from the receptionist and fires any registered watches.
 
 use std::sync::{Arc, Mutex};
 
