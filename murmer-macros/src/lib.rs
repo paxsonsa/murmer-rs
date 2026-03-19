@@ -1,17 +1,135 @@
 //! Murmer Proc Macros
 //!
-//! `#[handlers]` on an impl block:
-//!   - Finds methods marked with `#[handler]`
-//!   - Generates `Handler<M>` trait impls for each
-//!   - Generates `RemoteDispatch` impl with dispatch table
+//! # `#[derive(Message)]`
 //!
-//! The generated dispatch table is the Rust equivalent of Swift's
-//! compiler-generated accessor thunks — each arm knows the concrete
-//! message type at compile time.
+//! Derives [`murmer::Message`] (and optionally [`murmer::RemoteMessage`]) for a struct or enum.
+//!
+//! ```ignore
+//! #[derive(Debug, Clone, Serialize, Deserialize, Message)]
+//! #[message(result = i64)]
+//! struct Increment { amount: i64 }
+//! ```
+//!
+//! Add `remote = "..."` to also implement `RemoteMessage` with a wire-stable type ID:
+//!
+//! ```ignore
+//! #[derive(Debug, Clone, Serialize, Deserialize, Message)]
+//! #[message(result = i64, remote = "counter::Increment")]
+//! struct Increment { amount: i64 }
+//! ```
+//!
+//! # `#[handlers]` + `#[handler]`
+//!
+//! Place `#[handlers]` on an `impl` block containing actor message handlers.
+//! Mark each handler method with `#[handler]`.
+//!
+//! ```ignore
+//! #[handlers]
+//! impl MyActor {
+//!     #[handler]
+//!     fn increment(&mut self, ctx: &ActorContext<Self>, state: &mut MyState, msg: Increment) -> i64 {
+//!         state.count += msg.amount;
+//!         state.count
+//!     }
+//! }
+//! ```
+//!
+//! Generates:
+//! - `impl Handler<M> for MyActor { ... }` for each `#[handler]` method
+//! - `impl RemoteDispatch for MyActor { ... }` with a dispatch table matching on `TYPE_ID`
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{FnArg, ImplItem, ItemImpl, parse_macro_input};
+use syn::{DeriveInput, FnArg, ImplItem, ItemImpl, parse_macro_input};
+
+// =============================================================================
+// #[derive(Message)]
+// =============================================================================
+
+/// Derive macro for `murmer::Message` and optionally `murmer::RemoteMessage`.
+///
+/// # Attributes
+///
+/// - `#[message(result = Type)]` — **required**. The response type for this message.
+/// - `#[message(result = Type, remote = "type_id")]` — also implements `RemoteMessage`
+///   with the given TYPE_ID string used for wire dispatch.
+///
+/// # Examples
+///
+/// Local-only message (no serialization needed for the message itself):
+/// ```ignore
+/// #[derive(Debug, Message)]
+/// #[message(result = ())]
+/// struct Shutdown;
+/// ```
+///
+/// Remote-capable message (requires Serialize + Deserialize):
+/// ```ignore
+/// #[derive(Debug, Clone, Serialize, Deserialize, Message)]
+/// #[message(result = i64, remote = "counter::Increment")]
+/// struct Increment { amount: i64 }
+/// ```
+#[proc_macro_derive(Message, attributes(message))]
+pub fn derive_message(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    // Parse #[message(result = Type, remote = "id")]
+    let mut result_type: Option<syn::Type> = None;
+    let mut remote_id: Option<String> = None;
+
+    for attr in &input.attrs {
+        if attr.path().is_ident("message") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("result") {
+                    let value = meta.value()?;
+                    result_type = Some(value.parse()?);
+                    Ok(())
+                } else if meta.path.is_ident("remote") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    remote_id = Some(lit.value());
+                    Ok(())
+                } else {
+                    Err(meta.error("expected `result` or `remote`"))
+                }
+            })
+            .unwrap_or_else(|e| panic!("failed to parse #[message] attribute: {e}"));
+        }
+    }
+
+    let result_ty = result_type.unwrap_or_else(|| {
+        panic!("#[derive(Message)] on `{name}` requires #[message(result = Type)]")
+    });
+
+    let message_impl = quote! {
+        impl #impl_generics murmer::Message for #name #ty_generics #where_clause {
+            type Result = #result_ty;
+        }
+    };
+
+    let remote_impl = if let Some(id) = remote_id {
+        quote! {
+            impl #impl_generics murmer::RemoteMessage for #name #ty_generics #where_clause {
+                const TYPE_ID: &'static str = #id;
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let output = quote! {
+        #message_impl
+        #remote_impl
+    };
+
+    output.into()
+}
+
+// =============================================================================
+// #[handlers] + #[handler]
+// =============================================================================
 
 struct HandlerInfo {
     method_name: syn::Ident,
@@ -20,20 +138,45 @@ struct HandlerInfo {
 
 /// Attribute macro for an impl block containing actor message handlers.
 ///
-/// Usage:
+/// Place `#[handlers]` on a bare `impl MyActor { ... }` block. Each method
+/// marked with `#[handler]` must follow this signature:
+///
 /// ```ignore
-/// #[handlers]
-/// impl MyActor {
-///     #[handler]
-///     fn do_something(&mut self, state: &mut MyState, msg: DoSomething) -> Result {
-///         // ...
-///     }
-/// }
+/// fn method_name(
+///     &mut self,
+///     ctx: &ActorContext<Self>,
+///     state: &mut <Self as Actor>::State,
+///     msg: MessageType,
+/// ) -> <MessageType as Message>::Result
 /// ```
 ///
-/// Generates:
-/// - `impl Handler<DoSomething> for MyActor { ... }` for each `#[handler]` method
-/// - `impl RemoteDispatch for MyActor { ... }` with a match arm per handler
+/// The macro generates:
+/// - `impl Handler<MessageType> for MyActor` for each `#[handler]` method
+/// - `impl RemoteDispatch for MyActor` with a match-based dispatch table
+///
+/// The dispatch table is the Rust equivalent of Swift's compiler-generated
+/// accessor thunks — each arm knows the concrete message type at compile time.
+///
+/// # Example
+///
+/// ```ignore
+/// #[handlers]
+/// impl CounterActor {
+///     #[handler]
+///     fn increment(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState, msg: Increment) -> i64 {
+///         state.count += msg.amount;
+///         state.count
+///     }
+///
+///     #[handler]
+///     fn get_count(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState, _msg: GetCount) -> i64 {
+///         state.count
+///     }
+///
+///     // Non-handler methods are preserved as-is
+///     fn helper(&self) -> String { "helper".to_string() }
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
@@ -146,7 +289,7 @@ pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Extract the message type from a handler method's last parameter.
 ///
-/// Expected signature: `fn name(&mut self, state: &mut State, msg: MsgType) -> Result`
+/// Expected signature: `fn name(&mut self, ctx: &ActorContext<Self>, state: &mut State, msg: MsgType) -> Result`
 fn extract_message_type(method: &syn::ImplItemFn) -> Box<syn::Type> {
     let inputs: Vec<_> = method.sig.inputs.iter().collect();
 
