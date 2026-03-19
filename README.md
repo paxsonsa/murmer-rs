@@ -1,5 +1,10 @@
 # murmer
 
+[![CI](https://github.com/paxsonsa/murmer-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/paxsonsa/murmer-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/murmer.svg)](https://crates.io/crates/murmer)
+[![docs.rs](https://docs.rs/murmer/badge.svg)](https://docs.rs/murmer)
+[![License](https://img.shields.io/crates/l/murmer.svg)](https://github.com/paxsonsa/murmer-rs#license)
+
 A distributed actor framework for Rust, built on tokio and QUIC.
 
 Murmer provides typed, location-transparent actors that communicate through message passing. Whether an actor lives in the same process or on a remote node across the network, you interact with it through the same `Endpoint<A>` API.
@@ -308,4 +313,9 @@ cargo clippy -- -D warnings
 
 ## License
 
-MIT or Apache-2.0
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
