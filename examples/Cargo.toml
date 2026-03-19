@@ -14,6 +14,10 @@ path = "src/counter.rs"
 name = "chat"
 path = "src/chat.rs"
 
+[[bin]]
+name = "cluster_chat"
+path = "src/cluster_chat.rs"
+
 [dependencies]
 murmer = { workspace = true }
 murmer-macros = { workspace = true }

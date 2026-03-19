@@ -1,0 +1,36 @@
+# Runs a 3-node murmer cluster using the cluster_chat example.
+#
+# Usage:
+#   docker compose up --build
+#
+# Each node starts a chat room actor. The beta and gamma nodes
+# join the cluster by seeding from alpha.
+
+services:
+  alpha:
+    build: .
+    command: ["--node", "alpha", "--port", "7100"]
+    ports:
+      - "7100:7100/udp"
+    networks:
+      - murmer
+
+  beta:
+    build: .
+    command: ["--node", "beta", "--port", "7100", "--seed", "alpha:7100"]
+    depends_on:
+      - alpha
+    networks:
+      - murmer
+
+  gamma:
+    build: .
+    command: ["--node", "gamma", "--port", "7100", "--seed", "alpha:7100"]
+    depends_on:
+      - alpha
+    networks:
+      - murmer
+
+networks:
+  murmer:
+    driver: bridge
