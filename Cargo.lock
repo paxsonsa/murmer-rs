@@ -438,6 +438,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "murmer-app"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "murmer",
+ "murmer-macros",
+ "rand",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "murmer-examples"
 version = "0.1.0"
 dependencies = [

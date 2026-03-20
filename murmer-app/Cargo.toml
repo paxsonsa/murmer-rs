@@ -1,0 +1,24 @@
+[package]
+name = "murmer-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Orchestration layer for murmer — coordinator, placement strategies, and leader election"
+keywords = ["actor", "distributed", "orchestration", "placement"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+murmer = { path = "../murmer" }
+murmer-macros = { path = "../murmer-macros" }
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+rand = "0.9"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

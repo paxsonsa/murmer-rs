@@ -2,6 +2,7 @@
 members = [
     "murmer",
     "murmer-macros",
+    "murmer-app",
     "examples"
 ]
 resolver = "2"
