@@ -90,7 +90,7 @@ impl LeaderElection for OldestNode {
                     None => true,
                 }
             })
-            .min_by_key(|node| node.identity.incarnation)
+            .min_by_key(|node| (node.identity.incarnation, node.identity.name.clone()))
             .map(|node| node.node_id())
     }
 

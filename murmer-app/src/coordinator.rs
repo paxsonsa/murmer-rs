@@ -63,6 +63,8 @@ pub struct CoordinatorState {
     pub pending_spawns: HashMap<u64, PendingSpawn>,
     /// Specs waiting for a failed node to return, keyed by label.
     pub waiting_for_return: HashMap<String, WaitingSpec>,
+    /// Monotonic counter for generating unique request IDs.
+    next_request_id: u64,
 }
 
 /// A spawn request that's been sent but not yet acknowledged.
@@ -191,7 +193,7 @@ pub struct SerializableNodeInfo {
     pub host: String,
     pub port: u16,
     pub incarnation: u64,
-    pub class: String,
+    pub class: murmer::cluster::config::NodeClass,
     pub metadata: HashMap<String, String>,
 }
 
@@ -237,10 +239,15 @@ impl Coordinator {
         // Track the spec
         state.specs.insert(label.clone(), msg.spec);
 
-        // Record actor placement in view
-        state
-            .cluster_view
-            .add_actor(&decision.node_id, &label);
+        // Record as pending — actual placement happens on spawn ack
+        let request_id = state.next_request_id();
+        state.pending_spawns.insert(
+            request_id,
+            PendingSpawn {
+                spec_label: label,
+                target_node_id: decision.node_id.clone(),
+            },
+        );
 
         Ok(decision)
     }
@@ -347,13 +354,7 @@ impl Coordinator {
                 port: msg.info.port,
                 incarnation: msg.info.incarnation,
             },
-            // Parse class from string
-            match msg.info.class.as_str() {
-                "worker" => murmer::cluster::config::NodeClass::Worker,
-                "coordinator" => murmer::cluster::config::NodeClass::Coordinator,
-                "edge" => murmer::cluster::config::NodeClass::Edge,
-                other => murmer::cluster::config::NodeClass::Custom(other.to_string()),
-            },
+            msg.info.class,
             msg.info.metadata,
         );
 
@@ -372,13 +373,19 @@ impl Coordinator {
         for label in rejoined {
             if let Some(ws) = state.waiting_for_return.remove(&label) {
                 tracing::info!(
-                    "Node {} returned — spec {} can resume",
+                    "Node {} returned — re-spawning spec {} on it",
                     msg.node_id,
                     ws.spec.label
                 );
-                state
-                    .cluster_view
-                    .add_actor(&msg.node_id, &ws.spec.label);
+                // Create a pending spawn rather than phantom-placing
+                let request_id = state.next_request_id();
+                state.pending_spawns.insert(
+                    request_id,
+                    PendingSpawn {
+                        spec_label: ws.spec.label,
+                        target_node_id: msg.node_id.clone(),
+                    },
+                );
             }
         }
     }
@@ -392,71 +399,7 @@ impl Coordinator {
     ) {
         tracing::warn!("Node failed: {}", msg.node_id);
         state.cluster_view.mark_failed(&msg.node_id);
-
-        // Find all specs placed on the failed node
-        let affected_labels: Vec<String> = state
-            .specs
-            .keys()
-            .filter(|label| {
-                state
-                    .cluster_view
-                    .find_actor(label)
-                    .is_some_and(|n| n == msg.node_id)
-            })
-            .cloned()
-            .collect();
-
-        for label in affected_labels {
-            let spec = match state.specs.get(&label) {
-                Some(s) => s.clone(),
-                None => continue,
-            };
-
-            // Remove actor from the failed node's tracking
-            state.cluster_view.remove_actor(&msg.node_id, &label);
-
-            match &spec.crash_strategy {
-                CrashStrategy::Redistribute => {
-                    tracing::info!("Redistributing {label} (node {} failed)", msg.node_id);
-                    // Try to re-place
-                    if let Some(decision) = placement::select_node(
-                        state.placement_strategy.as_ref(),
-                        &spec,
-                        &state.cluster_view,
-                    ) {
-                        state
-                            .cluster_view
-                            .add_actor(&decision.node_id, &label);
-                        tracing::info!(
-                            "Re-placed {label} on {} ({})",
-                            decision.node_id,
-                            decision.reason
-                        );
-                    } else {
-                        tracing::warn!("No eligible node for {label} — spec remains unplaced");
-                    }
-                }
-                CrashStrategy::WaitForReturn(duration) => {
-                    tracing::info!(
-                        "Waiting {:?} for node {} to return (spec: {label})",
-                        duration,
-                        msg.node_id
-                    );
-                    state.waiting_for_return.insert(
-                        label.clone(),
-                        WaitingSpec {
-                            spec: spec.clone(),
-                            failed_node_id: msg.node_id.clone(),
-                        },
-                    );
-                    // TODO: spawn a timer that converts to Redistribute after duration
-                }
-                CrashStrategy::Abandon => {
-                    tracing::info!("Abandoning {label} (node {} failed)", msg.node_id);
-                    state.specs.remove(&label);
-                }
-            }
-        }
+        state.handle_node_departure(&msg.node_id, false);
     }
 
     #[handler]
@@ -467,58 +410,7 @@ impl Coordinator {
         msg: NotifyNodeLeft,
     ) {
         tracing::info!("Node left gracefully: {}", msg.node_id);
-
-        // Graceful departure — treat all specs as needing redistribution
-        // regardless of WaitForReturn, since the node chose to leave.
-        let affected_labels: Vec<String> = state
-            .specs
-            .keys()
-            .filter(|label| {
-                state
-                    .cluster_view
-                    .find_actor(label)
-                    .is_some_and(|n| n == msg.node_id)
-            })
-            .cloned()
-            .collect();
-
-        state.cluster_view.mark_failed(&msg.node_id);
-
-        for label in affected_labels {
-            let spec = match state.specs.get(&label) {
-                Some(s) => s.clone(),
-                None => continue,
-            };
-
-            state.cluster_view.remove_actor(&msg.node_id, &label);
-
-            match &spec.crash_strategy {
-                CrashStrategy::Abandon => {
-                    tracing::info!("Abandoning {label} (node {} left)", msg.node_id);
-                    state.specs.remove(&label);
-                }
-                _ => {
-                    // Graceful departure — always redistribute, don't wait
-                    if let Some(decision) = placement::select_node(
-                        state.placement_strategy.as_ref(),
-                        &spec,
-                        &state.cluster_view,
-                    ) {
-                        state
-                            .cluster_view
-                            .add_actor(&decision.node_id, &label);
-                        tracing::info!(
-                            "Re-placed {label} on {} after graceful departure ({})",
-                            decision.node_id,
-                            decision.reason
-                        );
-                    } else {
-                        tracing::warn!("No eligible node for {label} after departure");
-                    }
-                }
-            }
-        }
-
+        state.handle_node_departure(&msg.node_id, true);
         state.cluster_view.remove_node(&msg.node_id);
     }
 
@@ -569,7 +461,15 @@ impl CoordinatorState {
             local_node_id: local_node_id.into(),
             pending_spawns: HashMap::new(),
             waiting_for_return: HashMap::new(),
+            next_request_id: 0,
         }
+    }
+
+    /// Generate a unique request ID.
+    fn next_request_id(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        id
     }
 
     /// Check if this node is the current leader.
@@ -577,6 +477,90 @@ impl CoordinatorState {
         self.election
             .elect(&self.cluster_view)
             .is_some_and(|leader| leader == self.local_node_id)
+    }
+
+    /// Handle a node departure — shared logic for both failure and graceful leave.
+    ///
+    /// When `graceful` is true (node left voluntarily), WaitForReturn is
+    /// collapsed to Redistribute since the node chose to leave.
+    fn handle_node_departure(&mut self, node_id: &str, graceful: bool) {
+        // Find all specs placed on the departing node (running or pending spawn)
+        let affected_labels: Vec<String> = self
+            .specs
+            .keys()
+            .filter(|label| {
+                // Check if running on this node
+                let running_on = self
+                    .cluster_view
+                    .find_actor(label)
+                    .is_some_and(|n| n == node_id);
+                // Check if pending spawn on this node
+                let pending_on = self
+                    .pending_spawns
+                    .values()
+                    .any(|ps| ps.spec_label == **label && ps.target_node_id == node_id);
+                running_on || pending_on
+            })
+            .cloned()
+            .collect();
+
+        // Clear any pending spawns targeting this node
+        self.pending_spawns
+            .retain(|_, ps| ps.target_node_id != node_id);
+
+        for label in affected_labels {
+            let spec = match self.specs.get(&label) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+
+            self.cluster_view.remove_actor(node_id, &label);
+
+            match &spec.crash_strategy {
+                CrashStrategy::Abandon => {
+                    tracing::info!("Abandoning {label} (node {node_id} departed)");
+                    self.specs.remove(&label);
+                }
+                CrashStrategy::WaitForReturn(duration) if !graceful => {
+                    tracing::warn!(
+                        "Waiting {:?} for node {} to return (spec: {label}) — \
+                         NOTE: timeout fallback to Redistribute is not yet implemented; \
+                         spec will wait indefinitely until the node returns or spec is removed",
+                        duration,
+                        node_id,
+                    );
+                    self.waiting_for_return.insert(
+                        label.clone(),
+                        WaitingSpec {
+                            spec: spec.clone(),
+                            failed_node_id: node_id.to_string(),
+                        },
+                    );
+                    // TODO: spawn a timer that converts to Redistribute after duration
+                }
+                _ => {
+                    // Redistribute (or WaitForReturn on graceful departure)
+                    let reason = if graceful { "graceful departure" } else { "failure" };
+                    tracing::info!("Redistributing {label} (node {node_id} {reason})");
+
+                    if let Some(decision) = placement::select_node(
+                        self.placement_strategy.as_ref(),
+                        &spec,
+                        &self.cluster_view,
+                    ) {
+                        self.cluster_view
+                            .add_actor(&decision.node_id, &label);
+                        tracing::info!(
+                            "Re-placed {label} on {} ({})",
+                            decision.node_id,
+                            decision.reason
+                        );
+                    } else {
+                        tracing::warn!("No eligible node for {label} — spec remains unplaced");
+                    }
+                }
+            }
+        }
     }
 }
 

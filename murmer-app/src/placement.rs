@@ -118,8 +118,8 @@ pub fn select_node(
 
 /// Place actors on the node with the fewest running actors.
 ///
-/// Ties are broken by whichever node is encountered first in the iteration
-/// order (deterministic but not guaranteed to be stable across view updates).
+/// Ties are broken by whichever node is encountered first in HashMap
+/// iteration order, which is non-deterministic across process restarts.
 pub struct LeastLoaded;
 
 impl PlacementStrategy for LeastLoaded {
