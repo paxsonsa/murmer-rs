@@ -69,6 +69,8 @@ impl NodeInfo {
 pub struct ClusterView {
     /// All known nodes, keyed by node_id_string().
     pub nodes: HashMap<String, NodeInfo>,
+    /// Reverse index: actor label → node_id for O(1) lookups.
+    actor_locations: HashMap<String, String>,
 }
 
 impl ClusterView {
@@ -98,7 +100,14 @@ impl ClusterView {
 
     /// Remove a node from the view entirely.
     pub fn remove_node(&mut self, node_id: &str) -> Option<NodeInfo> {
-        self.nodes.remove(node_id)
+        if let Some(node) = self.nodes.remove(node_id) {
+            for label in &node.running_actors {
+                self.actor_locations.remove(label);
+            }
+            Some(node)
+        } else {
+            None
+        }
     }
 
     /// Record that an actor has been placed on a node.
@@ -107,6 +116,8 @@ impl ClusterView {
             && !node.running_actors.contains(&label.to_string())
         {
             node.running_actors.push(label.to_string());
+            self.actor_locations
+                .insert(label.to_string(), node_id.to_string());
         }
     }
 
@@ -115,27 +126,24 @@ impl ClusterView {
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.running_actors.retain(|l| l != label);
         }
+        self.actor_locations.remove(label);
     }
 
     /// Remove an actor from whatever node it's on. Returns the node_id if found.
     pub fn remove_actor_anywhere(&mut self, label: &str) -> Option<String> {
-        for (node_id, node) in &mut self.nodes {
-            if let Some(pos) = node.running_actors.iter().position(|l| l == label) {
-                node.running_actors.remove(pos);
-                return Some(node_id.clone());
+        if let Some(node_id) = self.actor_locations.remove(label) {
+            if let Some(node) = self.nodes.get_mut(&node_id) {
+                node.running_actors.retain(|l| l != label);
             }
+            Some(node_id)
+        } else {
+            None
         }
-        None
     }
 
-    /// Find which node is running a given actor label.
+    /// Find which node is running a given actor label. O(1) via reverse index.
     pub fn find_actor(&self, label: &str) -> Option<&str> {
-        for (node_id, node) in &self.nodes {
-            if node.running_actors.iter().any(|l| l == label) {
-                return Some(node_id);
-            }
-        }
-        None
+        self.actor_locations.get(label).map(|s| s.as_str())
     }
 
     /// All nodes that are currently alive.

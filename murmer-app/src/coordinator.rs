@@ -144,6 +144,13 @@ pub struct NotifySpawnAck {
     pub error: Option<String>,
 }
 
+/// Internal: WaitForReturn timeout expired — fall back to Redistribute.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = (), remote = "coordinator::WaitForReturnTimeout")]
+pub struct WaitForReturnTimeout {
+    pub label: String,
+}
+
 // =============================================================================
 // RESPONSE TYPES
 // =============================================================================
@@ -210,6 +217,10 @@ impl Coordinator {
         state: &mut CoordinatorState,
         msg: SubmitSpec,
     ) -> Result<PlacementDecision, String> {
+        if !state.is_leader() {
+            return Err(OrchestratorError::NotLeader.to_string());
+        }
+
         let label = msg.spec.label.clone();
 
         if state.specs.contains_key(&label) {
@@ -259,6 +270,10 @@ impl Coordinator {
         state: &mut CoordinatorState,
         msg: RemoveSpec,
     ) -> Result<(), String> {
+        if !state.is_leader() {
+            return Err(OrchestratorError::NotLeader.to_string());
+        }
+
         if state.specs.remove(&msg.label).is_none() {
             return Err(OrchestratorError::SpecNotFound {
                 label: msg.label.clone(),
@@ -393,13 +408,22 @@ impl Coordinator {
     #[handler]
     fn notify_node_failed(
         &mut self,
-        _ctx: &ActorContext<Self>,
+        ctx: &ActorContext<Self>,
         state: &mut CoordinatorState,
         msg: NotifyNodeFailed,
     ) {
         tracing::warn!("Node failed: {}", msg.node_id);
         state.cluster_view.mark_failed(&msg.node_id);
-        state.handle_node_departure(&msg.node_id, false);
+        let timers = state.handle_node_departure(&msg.node_id, false);
+
+        // Spawn timeout tasks for WaitForReturn specs
+        for (label, duration) in timers {
+            let endpoint = ctx.endpoint();
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                let _ = endpoint.send(WaitForReturnTimeout { label }).await;
+            });
+        }
     }
 
     #[handler]
@@ -410,7 +434,8 @@ impl Coordinator {
         msg: NotifyNodeLeft,
     ) {
         tracing::info!("Node left gracefully: {}", msg.node_id);
-        state.handle_node_departure(&msg.node_id, true);
+        // Graceful departures never produce WaitForReturn timers (guarded by !graceful)
+        let _timers = state.handle_node_departure(&msg.node_id, true);
         state.cluster_view.remove_node(&msg.node_id);
     }
 
@@ -439,6 +464,50 @@ impl Coordinator {
                 );
             }
         }
+    }
+
+    #[handler]
+    fn wait_for_return_timeout(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: WaitForReturnTimeout,
+    ) {
+        // If the spec is still waiting, the node didn't return in time — redistribute
+        if let Some(ws) = state.waiting_for_return.remove(&msg.label) {
+            tracing::warn!(
+                "WaitForReturn timeout for {} (was on {}) — falling back to Redistribute",
+                msg.label,
+                ws.failed_node_id,
+            );
+
+            if let Some(decision) = placement::select_node(
+                state.placement_strategy.as_ref(),
+                &ws.spec,
+                &state.cluster_view,
+            ) {
+                let request_id = state.next_request_id();
+                state.pending_spawns.insert(
+                    request_id,
+                    PendingSpawn {
+                        spec_label: msg.label.clone(),
+                        target_node_id: decision.node_id.clone(),
+                    },
+                );
+                tracing::info!(
+                    "Re-placed {} on {} after timeout ({})",
+                    msg.label,
+                    decision.node_id,
+                    decision.reason
+                );
+            } else {
+                tracing::warn!(
+                    "No eligible node for {} after WaitForReturn timeout — spec remains unplaced",
+                    msg.label
+                );
+            }
+        }
+        // If not in waiting_for_return, the node already returned — timer is a no-op
     }
 }
 
@@ -483,7 +552,14 @@ impl CoordinatorState {
     ///
     /// When `graceful` is true (node left voluntarily), WaitForReturn is
     /// collapsed to Redistribute since the node chose to leave.
-    fn handle_node_departure(&mut self, node_id: &str, graceful: bool) {
+    ///
+    /// Returns `(label, duration)` pairs for specs that need WaitForReturn timers.
+    fn handle_node_departure(
+        &mut self,
+        node_id: &str,
+        graceful: bool,
+    ) -> Vec<(String, std::time::Duration)> {
+        let mut timers_needed = Vec::new();
         // Find all specs placed on the departing node (running or pending spawn)
         let affected_labels: Vec<String> = self
             .specs
@@ -523,9 +599,7 @@ impl CoordinatorState {
                 }
                 CrashStrategy::WaitForReturn(duration) if !graceful => {
                     tracing::warn!(
-                        "Waiting {:?} for node {} to return (spec: {label}) — \
-                         NOTE: timeout fallback to Redistribute is not yet implemented; \
-                         spec will wait indefinitely until the node returns or spec is removed",
+                        "Waiting {:?} for node {} to return (spec: {label})",
                         duration,
                         node_id,
                     );
@@ -536,7 +610,7 @@ impl CoordinatorState {
                             failed_node_id: node_id.to_string(),
                         },
                     );
-                    // TODO: spawn a timer that converts to Redistribute after duration
+                    timers_needed.push((label, *duration));
                 }
                 _ => {
                     // Redistribute (or WaitForReturn on graceful departure)
@@ -561,6 +635,8 @@ impl CoordinatorState {
                 }
             }
         }
+
+        timers_needed
     }
 }
 
@@ -573,20 +649,26 @@ mod tests {
 
     fn make_system_and_coordinator() -> (murmer::System, Endpoint<Coordinator>) {
         let system = murmer::System::local();
+
+        // "alpha" has the lowest incarnation, so OldestNode will elect it leader.
+        // We set local_node_id to alpha's node_id_string so is_leader() returns true.
+        let alpha_identity = NodeIdentity {
+            name: "alpha".into(),
+            host: "127.0.0.1".into(),
+            port: 7100,
+            incarnation: 1,
+        };
+        let local_node_id = alpha_identity.node_id_string();
+
         let mut state = CoordinatorState::new(
-            "local",
+            &local_node_id,
             Box::new(LeastLoaded),
             Box::new(OldestNode::any()),
         );
 
         // Add a couple nodes to the view
         state.cluster_view.upsert_node(NodeInfo::new(
-            NodeIdentity {
-                name: "alpha".into(),
-                host: "127.0.0.1".into(),
-                port: 7100,
-                incarnation: 1,
-            },
+            alpha_identity,
             NodeClass::Worker,
             HashMap::new(),
         ));
@@ -750,5 +832,94 @@ mod tests {
         assert_eq!(view.alive_count, 2);
         assert_eq!(view.total_count, 2);
         assert_eq!(view.nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_return_timeout_redistributes() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let result = coordinator
+            .send(SubmitSpec {
+                spec: ActorSpec::new("worker/0", "app::Worker")
+                    .with_crash_strategy(CrashStrategy::WaitForReturn(
+                        std::time::Duration::from_millis(50),
+                    )),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let original_node = result.node_id.clone();
+
+        // Fail the node — spec enters WaitForReturn state
+        coordinator
+            .send(NotifyNodeFailed {
+                node_id: original_node.clone(),
+            })
+            .await
+            .unwrap();
+
+        let specs = coordinator.send(GetSpecs).await.unwrap();
+        assert!(matches!(specs[0].state, SpecState::WaitingForReturn));
+
+        // Simulate the timeout firing (rather than waiting for real timer)
+        coordinator
+            .send(WaitForReturnTimeout {
+                label: "worker/0".into(),
+            })
+            .await
+            .unwrap();
+
+        // Should now be pending/running on a different node
+        let specs = coordinator.send(GetSpecs).await.unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(!matches!(specs[0].state, SpecState::WaitingForReturn));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_return_node_rejoins() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let result = coordinator
+            .send(SubmitSpec {
+                spec: ActorSpec::new("worker/0", "app::Worker")
+                    .with_crash_strategy(CrashStrategy::WaitForReturn(
+                        std::time::Duration::from_secs(60),
+                    )),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let original_node = result.node_id.clone();
+
+        // Fail the node
+        coordinator
+            .send(NotifyNodeFailed {
+                node_id: original_node.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Node rejoins — spec should be re-spawned on it
+        coordinator
+            .send(NotifyNodeJoined {
+                node_id: original_node.clone(),
+                info: SerializableNodeInfo {
+                    name: "alpha".into(),
+                    host: "127.0.0.1".into(),
+                    port: 7100,
+                    incarnation: 1,
+                    class: NodeClass::Worker,
+                    metadata: HashMap::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let specs = coordinator.send(GetSpecs).await.unwrap();
+        assert_eq!(specs.len(), 1);
+        // Should be pending (re-spawn in progress), not WaitingForReturn
+        assert!(matches!(specs[0].state, SpecState::Pending));
     }
 }

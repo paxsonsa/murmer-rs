@@ -11,8 +11,10 @@
 //! - [`placement`] — Pluggable placement strategies (LeastLoaded, Random, Pinned)
 //! - [`election`] — Pluggable leader election (default: OldestNode)
 //! - [`coordinator`] — The Coordinator actor that orchestrates placement
+//! - [`bridge`] — Cluster event bridge connecting cluster layer to Coordinator
 //! - [`error`] — Error types
 
+pub mod bridge;
 pub mod coordinator;
 pub mod election;
 pub mod error;
