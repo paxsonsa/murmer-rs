@@ -30,7 +30,7 @@
 
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::error::ClusterError;
-use crate::cluster::sync::TypeRegistry;
+use crate::cluster::sync::{SpawnRegistry, TypeRegistry};
 use crate::cluster::ClusterSystem;
 use crate::lifecycle::{ActorFactory, RestartConfig, RestartPolicy};
 use crate::listing::{Listing, ReceptionKey};
@@ -79,8 +79,9 @@ impl System {
     pub async fn clustered(
         config: ClusterConfig,
         type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
     ) -> Result<Self, ClusterError> {
-        let cluster = ClusterSystem::start(config, type_registry).await?;
+        let cluster = ClusterSystem::start(config, type_registry, spawn_registry).await?;
         Ok(Self {
             inner: SystemInner::Clustered {
                 cluster: Box::new(cluster),

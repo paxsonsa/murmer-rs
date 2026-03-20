@@ -148,6 +148,107 @@ impl<A: Actor + 'static> Router<A> {
         results
     }
 
+    /// Send a message to ALL endpoints concurrently and collect all results
+    /// within a timeout. Returns partial results if the timeout expires.
+    ///
+    /// Unlike `broadcast()` which sends sequentially, this fires all sends
+    /// concurrently and returns results in completion order.
+    pub async fn scatter_gather<M>(
+        &self,
+        msg: M,
+        timeout: std::time::Duration,
+    ) -> Vec<Result<M::Result, SendError>>
+    where
+        A: Handler<M>,
+        M: RemoteMessage + Clone,
+        M::Result: Serialize + DeserializeOwned,
+    {
+        if self.endpoints.is_empty() {
+            return vec![Err(SendError::MailboxClosed)];
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for ep in &self.endpoints {
+            let ep = ep.clone();
+            let msg = msg.clone();
+            join_set.spawn(async move { ep.send(msg).await });
+        }
+
+        let mut results = Vec::with_capacity(self.endpoints.len());
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            tokio::select! {
+                Some(join_result) = join_set.join_next() => {
+                    results.push(join_result.unwrap_or(Err(SendError::ResponseDropped)));
+                    if results.len() == self.endpoints.len() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    join_set.abort_all();
+                    break;
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Send a message to ALL endpoints concurrently and return the first
+    /// successful response. Remaining in-flight sends are cancelled.
+    ///
+    /// Returns `Err` only if ALL endpoints fail.
+    pub async fn first_response<M>(&self, msg: M) -> Result<M::Result, SendError>
+    where
+        A: Handler<M>,
+        M: RemoteMessage + Clone,
+        M::Result: Serialize + DeserializeOwned,
+    {
+        if self.endpoints.is_empty() {
+            return Err(SendError::MailboxClosed);
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for ep in &self.endpoints {
+            let ep = ep.clone();
+            let msg = msg.clone();
+            join_set.spawn(async move { ep.send(msg).await });
+        }
+
+        let mut last_error = SendError::MailboxClosed;
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result.unwrap_or(Err(SendError::ResponseDropped)) {
+                Ok(result) => {
+                    join_set.abort_all();
+                    return Ok(result);
+                }
+                Err(e) => last_error = e,
+            }
+        }
+
+        Err(last_error)
+    }
+
+    /// Send a message to ALL endpoints concurrently without waiting for responses.
+    ///
+    /// Fire-and-forget pattern. The sends are spawned as background tasks.
+    /// Errors are silently dropped.
+    pub fn fan_out<M>(&self, msg: M)
+    where
+        A: Handler<M>,
+        M: RemoteMessage + Clone + 'static,
+        M::Result: Serialize + DeserializeOwned,
+    {
+        for ep in &self.endpoints {
+            let ep = ep.clone();
+            let msg = msg.clone();
+            tokio::spawn(async move {
+                let _ = ep.send(msg).await;
+            });
+        }
+    }
+
     pub fn add(&mut self, endpoint: Endpoint<A>) {
         self.endpoints.push(endpoint);
     }

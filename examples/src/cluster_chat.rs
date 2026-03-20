@@ -325,7 +325,7 @@ async fn main() {
         // CLUSTER MODE — System::clustered(), QUIC networking
         // =====================================================================
         use murmer::cluster::config::{ClusterConfig, Discovery};
-        use murmer::cluster::sync::TypeRegistry;
+        use murmer::cluster::sync::{SpawnRegistry, TypeRegistry};
 
         let node_name = args
             .iter()
@@ -369,7 +369,7 @@ async fn main() {
 
         println!("=== murmer cluster_chat (cluster mode: {node_name} on :{port}) ===\n");
 
-        let system = System::clustered(config, TypeRegistry::new())
+        let system = System::clustered(config, TypeRegistry::new(), SpawnRegistry::new())
             .await
             .expect("failed to start cluster");
 

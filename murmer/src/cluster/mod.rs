@@ -8,6 +8,7 @@ pub mod remote;
 pub mod sync;
 pub mod transport;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,12 +21,56 @@ use crate::{
     ReceptionistConfig, RemoteDispatch, RemoteInvocation, RemoteResponse,
 };
 
-use config::{ClusterConfig, NodeIdentity};
+use config::{ClusterConfig, NodeClass, NodeIdentity};
 use error::ClusterError;
 use framing::ControlMessage;
 use membership::{ClusterEvent, ClusterMembership, FocaRuntime, TimerEvent};
-use sync::TypeRegistry;
+use sync::{SpawnRegistry, TypeRegistry};
 use transport::{ConnectionEvent, Transport};
+
+// =============================================================================
+// NODE REGISTRY — tracks node class and metadata from handshakes
+// =============================================================================
+
+/// Stores class and metadata for each connected node, populated during handshake.
+///
+/// This information is not part of the SWIM protocol — it comes from the QUIC
+/// handshake and is only available for nodes we've directly connected to.
+#[derive(Debug, Clone)]
+pub struct NodeRegistryEntry {
+    pub class: NodeClass,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Thread-safe registry of node capabilities, populated during connection setup.
+#[derive(Debug, Clone, Default)]
+pub struct NodeRegistry {
+    nodes: Arc<std::sync::RwLock<HashMap<String, NodeRegistryEntry>>>,
+}
+
+impl NodeRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a node's class and metadata (called during handle_new_connection).
+    pub fn insert(&self, node_id: &str, class: NodeClass, metadata: HashMap<String, String>) {
+        self.nodes
+            .write()
+            .unwrap()
+            .insert(node_id.to_string(), NodeRegistryEntry { class, metadata });
+    }
+
+    /// Look up a node's class and metadata.
+    pub fn get(&self, node_id: &str) -> Option<NodeRegistryEntry> {
+        self.nodes.read().unwrap().get(node_id).cloned()
+    }
+
+    /// Remove a node entry (called when a node departs/fails).
+    pub fn remove(&self, node_id: &str) {
+        self.nodes.write().unwrap().remove(node_id);
+    }
+}
 
 // =============================================================================
 // CLUSTER SYSTEM — the main entry point for clustered actor systems
@@ -42,6 +87,7 @@ pub struct ClusterSystem {
     event_tx: broadcast::Sender<ClusterEvent>,
     #[allow(dead_code)]
     type_registry: Arc<TypeRegistry>,
+    node_registry: NodeRegistry,
     shutdown: CancellationToken,
 }
 
@@ -53,6 +99,7 @@ impl ClusterSystem {
     pub async fn start(
         config: ClusterConfig,
         type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
     ) -> Result<Self, ClusterError> {
         let identity = config.identity.clone();
         let shutdown = CancellationToken::new();
@@ -87,6 +134,8 @@ impl ClusterSystem {
         let membership = ClusterMembership::new(identity.clone(), event_tx.clone());
 
         let type_registry = Arc::new(type_registry);
+        let spawn_registry = Arc::new(spawn_registry);
+        let node_registry = NodeRegistry::new();
 
         // Spawn the main event loop
         let system = Self {
@@ -96,6 +145,7 @@ impl ClusterSystem {
             identity: identity.clone(),
             event_tx: event_tx.clone(),
             type_registry: Arc::clone(&type_registry),
+            node_registry: node_registry.clone(),
             shutdown: shutdown.clone(),
         };
 
@@ -106,6 +156,8 @@ impl ClusterSystem {
             identity,
             event_tx,
             type_registry,
+            spawn_registry,
+            node_registry,
             incoming_rx,
             discovery_rx,
             connection_events_rx,
@@ -153,6 +205,11 @@ impl ClusterSystem {
         &self.receptionist
     }
 
+    /// Access the node registry (class and metadata for connected nodes).
+    pub fn node_registry(&self) -> &NodeRegistry {
+        &self.node_registry
+    }
+
     /// Get the actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.transport.local_addr()
@@ -187,6 +244,8 @@ fn spawn_event_loop(
     identity: NodeIdentity,
     event_tx: broadcast::Sender<ClusterEvent>,
     type_registry: Arc<TypeRegistry>,
+    spawn_registry: Arc<SpawnRegistry>,
+    node_registry: NodeRegistry,
     mut incoming_rx: mpsc::UnboundedReceiver<transport::IncomingConnection>,
     mut discovery_rx: mpsc::UnboundedReceiver<discovery::DiscoveryEvent>,
     mut conn_events: mpsc::UnboundedReceiver<transport::ConnectionEvent>,
@@ -232,6 +291,7 @@ fn spawn_event_loop(
                         &shutdown,
                         &receptionist,
                         &transport,
+                        &node_registry,
                     ).await;
                 }
 
@@ -245,6 +305,7 @@ fn spawn_event_loop(
                         &shutdown,
                         &receptionist,
                         &transport,
+                        &node_registry,
                     ).await;
                 }
 
@@ -390,27 +451,51 @@ fn spawn_event_loop(
                                 "SpawnActor request from {node_id}: label={}, type={}",
                                 request.label, request.actor_type_name
                             );
-                            // TODO: look up SpawnRegistry, deserialize state, start actor
-                            // For now, ack with error — SpawnRegistry not wired yet
-                            let _ = transport.send_control(
-                                &node_id,
-                                ControlMessage::SpawnAckErr {
-                                    request_id: request.request_id,
-                                    error: "SpawnRegistry not yet configured".into(),
-                                },
-                            ).await;
+                            match spawn_registry.spawn(
+                                &receptionist,
+                                &request.label,
+                                &request.actor_type_name,
+                                &request.initial_state,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "Spawned {} (type: {}) successfully",
+                                        request.label, request.actor_type_name
+                                    );
+                                    let _ = transport.send_control(
+                                        &node_id,
+                                        ControlMessage::SpawnAckOk {
+                                            request_id: request.request_id,
+                                            label: request.label.clone(),
+                                        },
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to spawn {}: {e}",
+                                        request.label
+                                    );
+                                    let _ = transport.send_control(
+                                        &node_id,
+                                        ControlMessage::SpawnAckErr {
+                                            request_id: request.request_id,
+                                            error: e.to_string(),
+                                        },
+                                    ).await;
+                                }
+                            }
                         }
                         ControlMessage::SpawnAckOk { request_id, ref label } => {
                             tracing::info!(
                                 "SpawnAckOk from {node_id}: request_id={request_id}, label={label}"
                             );
-                            // TODO: notify Coordinator actor of successful spawn
+                            // Coordinator should be subscribed to ClusterEvents
+                            // and will handle this via its own mechanism
                         }
                         ControlMessage::SpawnAckErr { request_id, ref error } => {
                             tracing::warn!(
                                 "SpawnAckErr from {node_id}: request_id={request_id}, error={error}"
                             );
-                            // TODO: notify Coordinator actor of failed spawn
                         }
                         ControlMessage::Handshake(_) => {
                             tracing::warn!("Unexpected handshake from {node_id}");
@@ -426,6 +511,7 @@ fn spawn_event_loop(
                             tracing::info!("Node departed: {node_id} — pruning actors");
                             receptionist.prune_node(&node_id);
                             transport.remove_connection(&node_id).await;
+                            node_registry.remove(&node_id);
                             let _ = event_tx.send(ClusterEvent::NodePruned(identity.clone()));
                         }
                         _ => {}
@@ -460,6 +546,7 @@ fn spawn_event_loop(
 /// Handles a newly established connection (inbound or outbound):
 /// spawns the control stream reader, announces to foca, spawns the
 /// stream acceptor for subsequent bi-streams, and requests initial sync.
+#[allow(clippy::too_many_arguments)]
 async fn handle_new_connection(
     incoming: transport::IncomingConnection,
     membership: &mut ClusterMembership,
@@ -468,9 +555,17 @@ async fn handle_new_connection(
     shutdown: &CancellationToken,
     receptionist: &Receptionist,
     transport: &Arc<Transport>,
+    node_registry: &NodeRegistry,
 ) {
     let node_id = incoming.remote_identity.node_id_string();
     tracing::info!("New peer connected: {node_id}");
+
+    // Store node class and metadata from handshake
+    node_registry.insert(
+        &node_id,
+        incoming.node_class.clone(),
+        incoming.node_metadata.clone(),
+    );
 
     // Tell foca about the new member
     let _ = membership.foca.apply_many(
@@ -854,14 +949,14 @@ mod tests {
 
         let config_a = test_config("node-a");
 
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
 
         // Node B uses A as a seed
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -889,7 +984,7 @@ mod tests {
 
         // Start node A with a counter actor
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -903,7 +998,7 @@ mod tests {
 
         // Start node B with A as seed
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -936,7 +1031,7 @@ mod tests {
 
         // Node A has counter/a, Node B has counter/b
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -944,7 +1039,7 @@ mod tests {
         system_a.start_actor("counter/a", TestCounter, TestCounterState { count: 100 });
 
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -985,7 +1080,7 @@ mod tests {
         init_crypto();
 
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -997,7 +1092,7 @@ mod tests {
         );
 
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -1042,7 +1137,7 @@ mod tests {
         init_crypto();
 
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -1054,7 +1149,7 @@ mod tests {
         );
 
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -1094,7 +1189,7 @@ mod tests {
         init_crypto();
 
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -1106,7 +1201,7 @@ mod tests {
         );
 
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_b = system_b.local_addr();
@@ -1130,7 +1225,7 @@ mod tests {
 
         // Now start a NEW node A and connect it to B (rejoin)
         let config_a2 = test_config_with_seed("node-a-2", addr_b);
-        let system_a2 = ClusterSystem::start(config_a2, test_type_registry())
+        let system_a2 = ClusterSystem::start(config_a2, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -1252,7 +1347,7 @@ mod tests {
 
         // Node A: start 2 TestCounter actors
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -1262,7 +1357,7 @@ mod tests {
 
         // Node B: connect to A as seed
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -1320,7 +1415,7 @@ mod tests {
 
         // Node A: start "counter/ref-target" (TestCounter, count=0)
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, extended_type_registry())
+        let system_a = ClusterSystem::start(config_a, extended_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -1334,7 +1429,7 @@ mod tests {
 
         // Node B: start "ref-receiver/main" (RefReceiver)
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, extended_type_registry())
+        let system_b = ClusterSystem::start(config_b, extended_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -1393,7 +1488,7 @@ mod tests {
 
         // Node A: start "counter/on-a"
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, test_type_registry())
+        let system_a = ClusterSystem::start(config_a, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_a = system_a.local_addr();
@@ -1402,7 +1497,7 @@ mod tests {
 
         // Node B: seed = A, start "counter/on-b"
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, test_type_registry())
+        let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
         let addr_b = system_b.local_addr();
@@ -1436,7 +1531,7 @@ mod tests {
 
         // Node C: seed = B only (no direct connection to A)
         let config_c = test_config_with_seed("node-c", addr_b);
-        let system_c = ClusterSystem::start(config_c, test_type_registry())
+        let system_c = ClusterSystem::start(config_c, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
@@ -1487,7 +1582,7 @@ mod tests {
         // This test uses the cluster infrastructure for a single node to
         // stress-test the mailbox concurrency safety with many concurrent senders.
         let config = test_config("stress-node");
-        let system = ClusterSystem::start(config, test_type_registry())
+        let system = ClusterSystem::start(config, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
