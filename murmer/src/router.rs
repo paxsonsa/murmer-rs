@@ -100,6 +100,54 @@ impl<A: Actor + 'static> Router<A> {
         results
     }
 
+    /// Send a message to ALL endpoints concurrently and return when `k` respond
+    /// successfully (or all have completed).
+    ///
+    /// This enables quorum patterns like "write to 3 replicas, succeed when 2
+    /// acknowledge." Results are returned in completion order, not endpoint order.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic if `k` exceeds the number of endpoints — returns all
+    /// available results instead.
+    pub async fn send_quorum<M>(&self, msg: M, k: usize) -> Vec<Result<M::Result, SendError>>
+    where
+        A: Handler<M>,
+        M: RemoteMessage + Clone,
+        M::Result: Serialize + DeserializeOwned,
+    {
+        if self.endpoints.is_empty() {
+            return vec![Err(SendError::MailboxClosed)];
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for ep in &self.endpoints {
+            let ep = ep.clone();
+            let msg = msg.clone();
+            join_set.spawn(async move { ep.send(msg).await });
+        }
+
+        let target = k.min(self.endpoints.len());
+        let mut results = Vec::with_capacity(target);
+        let mut successes = 0;
+
+        while let Some(join_result) = join_set.join_next().await {
+            let result = join_result.unwrap_or(Err(SendError::ResponseDropped));
+            if result.is_ok() {
+                successes += 1;
+            }
+            results.push(result);
+
+            if successes >= target {
+                // Quorum reached — abort remaining tasks
+                join_set.abort_all();
+                break;
+            }
+        }
+
+        results
+    }
+
     pub fn add(&mut self, endpoint: Endpoint<A>) {
         self.endpoints.push(endpoint);
     }

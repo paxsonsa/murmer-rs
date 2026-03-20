@@ -915,7 +915,10 @@ impl Receptionist {
 
     /// Remove all actors owned by a specific node.
     /// Used when the cluster detects a node has left or crashed.
-    pub fn prune_node(&self, node_id: &str) {
+    ///
+    /// Returns the labels of actors that were removed, so the orchestrator
+    /// can determine which `ActorSpec`s need re-placement.
+    pub fn prune_node(&self, node_id: &str) -> Vec<String> {
         let labels_to_remove: Vec<String> = {
             let entries = self.inner.entries.lock().unwrap();
             entries
@@ -929,6 +932,8 @@ impl Receptionist {
             // deregister handles oplog recording + event emission
             self.deregister(label);
         }
+
+        labels_to_remove
     }
 
     /// Get a snapshot of the oplog for inspection/testing.

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 
@@ -108,6 +109,44 @@ impl foca::Identity for NodeIdentity {
 }
 
 // =============================================================================
+// NODE CLASS — typed node classification for placement decisions
+// =============================================================================
+
+/// Classifies a node's role in the cluster. Inspired by FoundationDB's ProcessClass.
+///
+/// The orchestrator uses this to decide which nodes are eligible for which actors.
+/// For example, a `PlacementStrategy` might require actors to run only on `Worker`
+/// nodes, or ensure the Coordinator runs on a `Coordinator`-class node.
+///
+/// # Custom classes
+///
+/// Use `Custom(String)` for domain-specific roles not covered by the built-in
+/// variants (e.g., `Custom("gpu")`, `Custom("ingest")`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeClass {
+    /// General-purpose actor host.
+    #[default]
+    Worker,
+    /// Eligible for leader election and coordination duties.
+    Coordinator,
+    /// Client-facing node with reduced capability (e.g., edge proxy).
+    Edge,
+    /// User-defined role.
+    Custom(String),
+}
+
+impl std::fmt::Display for NodeClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Worker => write!(f, "worker"),
+            Self::Coordinator => write!(f, "coordinator"),
+            Self::Edge => write!(f, "edge"),
+            Self::Custom(name) => write!(f, "custom({name})"),
+        }
+    }
+}
+
+// =============================================================================
 // CLUSTER CONFIG — builder pattern for cluster setup
 // =============================================================================
 
@@ -135,6 +174,11 @@ pub struct ClusterConfig {
     pub listen_addr: SocketAddr,
     pub cookie: String,
     pub discovery: Discovery,
+    /// This node's class — used by the orchestrator for placement decisions.
+    pub node_class: NodeClass,
+    /// Arbitrary key-value metadata describing this node's capabilities.
+    /// Examples: `"region" = "us-west"`, `"gpu" = "true"`, `"rack" = "A3"`.
+    pub node_metadata: HashMap<String, String>,
 }
 
 /// Builder for `ClusterConfig`.
@@ -144,6 +188,8 @@ pub struct ClusterConfigBuilder {
     advertise_addr: Option<SocketAddr>,
     cookie: Option<String>,
     discovery: Discovery,
+    node_class: NodeClass,
+    node_metadata: HashMap<String, String>,
 }
 
 impl ClusterConfigBuilder {
@@ -154,6 +200,8 @@ impl ClusterConfigBuilder {
             advertise_addr: None,
             cookie: None,
             discovery: Discovery::default(),
+            node_class: NodeClass::default(),
+            node_metadata: HashMap::new(),
         }
     }
 
@@ -199,6 +247,24 @@ impl ClusterConfigBuilder {
         self
     }
 
+    /// Set this node's class for orchestrator placement decisions.
+    pub fn node_class(mut self, class: NodeClass) -> Self {
+        self.node_class = class;
+        self
+    }
+
+    /// Add a single metadata key-value pair.
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.node_metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set all metadata at once (replaces any previously set metadata).
+    pub fn metadata_map(mut self, metadata: HashMap<String, String>) -> Self {
+        self.node_metadata = metadata;
+        self
+    }
+
     pub fn build(self) -> Result<ClusterConfig, &'static str> {
         let listen_addr = self.listen_addr.ok_or("listen address is required")?;
         let cookie = self.cookie.ok_or("cookie is required")?;
@@ -220,6 +286,8 @@ impl ClusterConfigBuilder {
             listen_addr,
             cookie,
             discovery: self.discovery,
+            node_class: self.node_class,
+            node_metadata: self.node_metadata,
         })
     }
 }

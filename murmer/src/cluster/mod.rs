@@ -73,6 +73,8 @@ impl ClusterSystem {
             identity.clone(),
             config.cookie.clone(),
             type_manifest,
+            config.node_class.clone(),
+            config.node_metadata.clone(),
             shutdown.clone(),
         )
         .await?;
@@ -378,8 +380,37 @@ fn spawn_event_loop(
                         ControlMessage::Departure(ref identity) => {
                             let departing_id = identity.node_id_string();
                             tracing::info!("Node {departing_id} departing gracefully");
+                            let _ = event_tx.send(ClusterEvent::NodeLeft(identity.clone()));
                             receptionist.prune_node(&departing_id);
                             transport.remove_connection(&departing_id).await;
+                            let _ = event_tx.send(ClusterEvent::NodePruned(identity.clone()));
+                        }
+                        ControlMessage::SpawnActor(ref request) => {
+                            tracing::info!(
+                                "SpawnActor request from {node_id}: label={}, type={}",
+                                request.label, request.actor_type_name
+                            );
+                            // TODO: look up SpawnRegistry, deserialize state, start actor
+                            // For now, ack with error — SpawnRegistry not wired yet
+                            let _ = transport.send_control(
+                                &node_id,
+                                ControlMessage::SpawnAckErr {
+                                    request_id: request.request_id,
+                                    error: "SpawnRegistry not yet configured".into(),
+                                },
+                            ).await;
+                        }
+                        ControlMessage::SpawnAckOk { request_id, ref label } => {
+                            tracing::info!(
+                                "SpawnAckOk from {node_id}: request_id={request_id}, label={label}"
+                            );
+                            // TODO: notify Coordinator actor of successful spawn
+                        }
+                        ControlMessage::SpawnAckErr { request_id, ref error } => {
+                            tracing::warn!(
+                                "SpawnAckErr from {node_id}: request_id={request_id}, error={error}"
+                            );
+                            // TODO: notify Coordinator actor of failed spawn
                         }
                         ControlMessage::Handshake(_) => {
                             tracing::warn!("Unexpected handshake from {node_id}");
@@ -387,13 +418,17 @@ fn spawn_event_loop(
                     }
                 }
 
-                // ── Cluster events (NodeLeft pruning) ────────────────
+                // ── Cluster events (NodeLeft/NodeFailed pruning) ─────
                 Ok(cluster_event) = cluster_event_rx.recv() => {
-                    if let ClusterEvent::NodeLeft(ref identity) | ClusterEvent::NodeFailed(ref identity) = cluster_event {
-                        let node_id = identity.node_id_string();
-                        tracing::info!("Node departed: {node_id} — pruning actors");
-                        receptionist.prune_node(&node_id);
-                        transport.remove_connection(&node_id).await;
+                    match cluster_event {
+                        ClusterEvent::NodeLeft(ref identity) | ClusterEvent::NodeFailed(ref identity) => {
+                            let node_id = identity.node_id_string();
+                            tracing::info!("Node departed: {node_id} — pruning actors");
+                            receptionist.prune_node(&node_id);
+                            transport.remove_connection(&node_id).await;
+                            let _ = event_tx.send(ClusterEvent::NodePruned(identity.clone()));
+                        }
+                        _ => {}
                     }
                 }
 

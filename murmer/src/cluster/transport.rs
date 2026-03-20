@@ -7,7 +7,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::certs;
-use super::config::NodeIdentity;
+use super::config::{NodeClass, NodeIdentity};
 use super::error::ClusterError;
 use super::framing::{self, ControlMessage, FrameCodec, HandshakePayload, PROTOCOL_VERSION};
 
@@ -37,6 +37,10 @@ pub struct IncomingConnection {
     /// The recv half of the handshake stream — still live, ready
     /// for the event loop to read ongoing control messages from.
     pub control_recv: quinn::RecvStream,
+    /// The peer's declared node class (from handshake).
+    pub node_class: NodeClass,
+    /// The peer's declared metadata (from handshake).
+    pub node_metadata: HashMap<String, String>,
 }
 
 /// Manages a single connection to a peer node.
@@ -55,6 +59,8 @@ pub struct Transport {
     identity: NodeIdentity,
     cookie: String,
     type_manifest: Vec<String>,
+    node_class: NodeClass,
+    node_metadata: HashMap<String, String>,
     connections: Arc<RwLock<HashMap<String, NodeConnection>>>,
     client_config: quinn::ClientConfig,
     shutdown: CancellationToken,
@@ -70,6 +76,8 @@ impl Transport {
         identity: NodeIdentity,
         cookie: String,
         type_manifest: Vec<String>,
+        node_class: NodeClass,
+        node_metadata: HashMap<String, String>,
         shutdown: CancellationToken,
     ) -> Result<
         (
@@ -105,6 +113,8 @@ impl Transport {
             identity: identity.clone(),
             cookie: cookie.clone(),
             type_manifest: type_manifest.clone(),
+            node_class,
+            node_metadata,
             connections: Arc::new(RwLock::new(HashMap::new())),
             client_config,
             shutdown: shutdown.clone(),
@@ -159,6 +169,8 @@ impl Transport {
             cookie: self.cookie.clone(),
             type_manifest: self.type_manifest.clone(),
             protocol_version: PROTOCOL_VERSION,
+            node_class: self.node_class.clone(),
+            node_metadata: self.node_metadata.clone(),
         };
 
         let frame = framing::encode_message(&ControlMessage::Handshake(our_handshake))
@@ -174,6 +186,16 @@ impl Transport {
         if peer_handshake.cookie != self.cookie {
             connection.close(quinn::VarInt::from_u32(1), b"cookie mismatch");
             return Err(ClusterError::CookieMismatch(addr));
+        }
+
+        // Enforce protocol version — FDB-style: reject mismatches, no negotiation
+        if peer_handshake.protocol_version != PROTOCOL_VERSION {
+            connection.close(quinn::VarInt::from_u32(2), b"protocol version mismatch");
+            return Err(ClusterError::ProtocolMismatch {
+                local: PROTOCOL_VERSION,
+                remote: peer_handshake.protocol_version,
+                addr,
+            });
         }
 
         let remote_identity = peer_handshake.identity.clone();
@@ -241,6 +263,8 @@ impl Transport {
             connection,
             control_tx: control_out_tx,
             control_recv: recv,
+            node_class: peer_handshake.node_class,
+            node_metadata: peer_handshake.node_metadata,
         })
     }
 
@@ -367,12 +391,24 @@ impl Transport {
             return Err(ClusterError::CookieMismatch(remote_addr));
         }
 
+        // Enforce protocol version — FDB-style: reject mismatches, no negotiation
+        if peer_handshake.protocol_version != PROTOCOL_VERSION {
+            connection.close(quinn::VarInt::from_u32(2), b"protocol version mismatch");
+            return Err(ClusterError::ProtocolMismatch {
+                local: PROTOCOL_VERSION,
+                remote: peer_handshake.protocol_version,
+                addr: remote_addr,
+            });
+        }
+
         // Send our handshake response
         let our_handshake = HandshakePayload {
             identity: self.identity.clone(),
             cookie: self.cookie.clone(),
             type_manifest: self.type_manifest.clone(),
             protocol_version: PROTOCOL_VERSION,
+            node_class: self.node_class.clone(),
+            node_metadata: self.node_metadata.clone(),
         };
         let frame = framing::encode_message(&ControlMessage::Handshake(our_handshake))
             .map_err(ClusterError::Serialization)?;
@@ -447,6 +483,8 @@ impl Transport {
             connection,
             control_tx: control_out_tx,
             control_recv: recv,
+            node_class: peer_handshake.node_class,
+            node_metadata: peer_handshake.node_metadata,
         })
     }
 }

@@ -21,6 +21,13 @@ pub enum ClusterError {
     #[error("cookie mismatch from {0}")]
     CookieMismatch(SocketAddr),
 
+    #[error("protocol version mismatch: local={local}, remote={remote} from {addr}")]
+    ProtocolMismatch {
+        local: u32,
+        remote: u32,
+        addr: SocketAddr,
+    },
+
     #[error("node not found: {0}")]
     NodeNotFound(String),
 

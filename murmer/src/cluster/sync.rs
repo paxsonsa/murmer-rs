@@ -104,6 +104,94 @@ impl Default for TypeRegistry {
 }
 
 // =============================================================================
+// SPAWN REGISTRY — maps actor type names to local instantiation factories
+// =============================================================================
+
+/// Error returned when a remote spawn request fails.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error("unknown actor type: {0}")]
+    UnknownType(String),
+    #[error("failed to deserialize state: {0}")]
+    DeserializeFailed(String),
+    #[error("failed to start actor: {0}")]
+    StartFailed(String),
+}
+
+/// A factory function that can instantiate an actor locally from serialized state.
+///
+/// Given a receptionist, a label, and serialized state bytes (from `MigratableActor`),
+/// the factory deserializes the state and calls `receptionist.start(label, actor, state)`.
+pub type SpawnFactory = Box<
+    dyn Fn(&Receptionist, &str, &[u8]) -> Result<(), SpawnError> + Send + Sync,
+>;
+
+/// Registry of actor types that can be spawned remotely.
+///
+/// Parallel to [`TypeRegistry`] (which creates remote *endpoints*), the
+/// `SpawnRegistry` creates actual *running actors* from serialized state.
+/// Used when a Coordinator sends a `SpawnActor` control message.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let mut spawn_registry = SpawnRegistry::new();
+/// spawn_registry.register("my_app::Worker", Box::new(|receptionist, label, state_bytes| {
+///     let (state, _): (WorkerState, _) = bincode::serde::decode_from_slice(
+///         state_bytes, bincode::config::standard()
+///     ).map_err(|e| SpawnError::DeserializeFailed(e.to_string()))?;
+///     receptionist.start(label, Worker, state);
+///     Ok(())
+/// }));
+/// ```
+pub struct SpawnRegistry {
+    factories: std::collections::HashMap<String, SpawnFactory>,
+}
+
+impl SpawnRegistry {
+    pub fn new() -> Self {
+        Self {
+            factories: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a factory for spawning actors of the given type.
+    pub fn register(&mut self, actor_type_name: impl Into<String>, factory: SpawnFactory) {
+        self.factories.insert(actor_type_name.into(), factory);
+    }
+
+    /// Look up a factory by actor type name.
+    pub fn get(&self, actor_type_name: &str) -> Option<&SpawnFactory> {
+        self.factories.get(actor_type_name)
+    }
+
+    /// Spawn an actor using the registered factory.
+    pub fn spawn(
+        &self,
+        receptionist: &Receptionist,
+        label: &str,
+        actor_type_name: &str,
+        state_bytes: &[u8],
+    ) -> Result<(), SpawnError> {
+        let factory = self
+            .get(actor_type_name)
+            .ok_or_else(|| SpawnError::UnknownType(actor_type_name.to_string()))?;
+        factory(receptionist, label, state_bytes)
+    }
+
+    /// List all registered actor type names.
+    pub fn known_types(&self) -> Vec<String> {
+        self.factories.keys().cloned().collect()
+    }
+}
+
+impl Default for SpawnRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
 // APPLY REMOTE OPS — process ops received from peers
 // =============================================================================
 

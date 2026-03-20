@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use super::config::NodeIdentity;
+use super::config::{NodeClass, NodeIdentity};
 use crate::{Op, VersionVector};
 
 /// Maximum frame size (4 MB).
@@ -28,15 +30,48 @@ pub enum ControlMessage {
     Pong,
     /// Graceful departure — "I'm leaving cleanly, don't wait for SWIM timeout".
     Departure(NodeIdentity),
+    /// Coordinator instructs a node to spawn an actor locally.
+    SpawnActor(SpawnRequest),
+    /// Node confirms successful actor spawn.
+    SpawnAckOk { request_id: u64, label: String },
+    /// Node reports actor spawn failure.
+    SpawnAckErr { request_id: u64, error: String },
+}
+
+/// A request to spawn an actor on a remote node.
+///
+/// Sent by the Coordinator over the control stream. The receiving node
+/// looks up the `actor_type_name` in its [`SpawnRegistry`], deserializes
+/// the state bytes, and calls `receptionist.start()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnRequest {
+    /// Unique identifier for correlating ack responses.
+    pub request_id: u64,
+    /// Label to register the actor under.
+    pub label: String,
+    /// Key into the SpawnRegistry — identifies the actor type to instantiate.
+    pub actor_type_name: String,
+    /// Serialized initial state (via MigratableActor).
+    pub initial_state: Vec<u8>,
 }
 
 /// The handshake payload exchanged when two nodes first connect.
+///
+/// In addition to authentication (cookie) and capability negotiation
+/// (type_manifest, protocol_version), this carries the node's class and
+/// metadata so the orchestrator can make placement decisions immediately
+/// after a node joins the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakePayload {
     pub identity: NodeIdentity,
     pub cookie: String,
     pub type_manifest: Vec<String>,
     pub protocol_version: u32,
+    /// This node's role in the cluster (Worker, Coordinator, Edge, etc.).
+    pub node_class: NodeClass,
+    /// Arbitrary key-value metadata describing node capabilities.
+    /// Examples: `"region" = "us-west"`, `"gpu" = "true"`, `"rack" = "A3"`.
+    pub node_metadata: HashMap<String, String>,
 }
 
 /// Current protocol version.

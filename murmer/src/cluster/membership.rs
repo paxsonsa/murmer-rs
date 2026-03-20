@@ -15,9 +15,14 @@ use super::config::NodeIdentity;
 /// Events about the cluster that other subsystems can subscribe to.
 #[derive(Debug, Clone)]
 pub enum ClusterEvent {
+    /// A new node has joined the cluster (discovered via SWIM).
     NodeJoined(NodeIdentity),
+    /// A node left gracefully (sent a Departure control message).
     NodeLeft(NodeIdentity),
+    /// A node was detected as failed by the SWIM failure detector (no goodbye).
     NodeFailed(NodeIdentity),
+    /// All actors from a departed/failed node have been pruned from the registry.
+    NodePruned(NodeIdentity),
     ActorRegistered {
         label: String,
         node_id: String,
@@ -125,8 +130,8 @@ impl Runtime<NodeIdentity> for FocaRuntime {
                 }
             }
             Notification::MemberDown(identity) => {
-                tracing::info!("SWIM: node left/failed: {identity}");
-                let _ = self.event_tx.send(ClusterEvent::NodeLeft(identity.clone()));
+                tracing::info!("SWIM: node failed (detected by failure detector): {identity}");
+                let _ = self.event_tx.send(ClusterEvent::NodeFailed(identity.clone()));
             }
             Notification::Defunct => {
                 tracing::warn!("SWIM: local node declared defunct");

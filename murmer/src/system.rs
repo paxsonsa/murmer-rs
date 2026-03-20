@@ -53,7 +53,7 @@ enum SystemInner {
         receptionist: Receptionist,
     },
     Clustered {
-        cluster: ClusterSystem,
+        cluster: Box<ClusterSystem>,
     },
 }
 
@@ -82,7 +82,9 @@ impl System {
     ) -> Result<Self, ClusterError> {
         let cluster = ClusterSystem::start(config, type_registry).await?;
         Ok(Self {
-            inner: SystemInner::Clustered { cluster },
+            inner: SystemInner::Clustered {
+                cluster: Box::new(cluster),
+            },
         })
     }
 

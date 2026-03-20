@@ -131,7 +131,8 @@ pub mod __reexport {
 pub mod prelude {
     pub use crate::actor::DispatchError;
     pub use crate::actor::{
-        Actor, ActorContext, ActorRef, Handler, Message, RemoteDispatch, RemoteMessage,
+        Actor, ActorContext, ActorRef, Handler, Message, MigratableActor, RemoteDispatch,
+        RemoteMessage,
     };
     pub use crate::endpoint::Endpoint;
     pub use crate::lifecycle::{
@@ -147,7 +148,8 @@ pub mod prelude {
 
 // Re-export core types for convenience
 pub use actor::{
-    Actor, ActorContext, ActorRef, DispatchError, Handler, Message, RemoteDispatch, RemoteMessage,
+    Actor, ActorContext, ActorRef, DispatchError, Handler, Message, MigratableActor,
+    RemoteDispatch, RemoteMessage,
 };
 pub use endpoint::Endpoint;
 pub use lifecycle::{
