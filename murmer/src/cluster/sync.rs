@@ -82,6 +82,21 @@ impl TypeRegistry {
         }
     }
 
+    /// Build a TypeRegistry from all `#[handlers]`-annotated actor types.
+    ///
+    /// Iterates the linkme distributed slice [`crate::ACTOR_TYPE_ENTRIES`] and
+    /// registers each entry. This eliminates manual per-actor-type registration
+    /// boilerplate — any actor with `#[handlers]` is automatically included.
+    ///
+    /// Manual entries can still be added afterwards via [`register()`](Self::register).
+    pub fn from_auto() -> Self {
+        let mut reg = Self::new();
+        for entry in crate::ACTOR_TYPE_ENTRIES {
+            reg.register((entry.actor_type_name)(), Box::new(entry.register));
+        }
+        reg
+    }
+
     /// Register a factory for a given actor type name.
     pub fn register(&mut self, actor_type_name: impl Into<String>, factory: RemoteRegistrationFn) {
         self.factories.insert(actor_type_name.into(), factory);
@@ -122,9 +137,8 @@ pub enum SpawnError {
 ///
 /// Given a receptionist, a label, and serialized state bytes (from `MigratableActor`),
 /// the factory deserializes the state and calls `receptionist.start(label, actor, state)`.
-pub type SpawnFactory = Box<
-    dyn Fn(&Receptionist, &str, &[u8]) -> Result<(), SpawnError> + Send + Sync,
->;
+pub type SpawnFactory =
+    Box<dyn Fn(&Receptionist, &str, &[u8]) -> Result<(), SpawnError> + Send + Sync>;
 
 /// Registry of actor types that can be spawned remotely.
 ///

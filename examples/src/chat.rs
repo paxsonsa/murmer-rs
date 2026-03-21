@@ -7,9 +7,10 @@
 //! - Router for broadcasting to participants
 //! - Supervision with restart policies
 //! - ActorRef for serializable actor identity
+//! - Auto-generated message structs and extension traits
 
 use murmer::prelude::*;
-use murmer_macros::{Message, handlers};
+use murmer_macros::handlers;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -33,26 +34,9 @@ impl Actor for ChatRoom {
     type State = ChatRoomState;
 }
 
-/// Post a message to the room. Returns the total message count.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = usize, remote = "chat::PostMessage")]
-struct PostMessage {
-    from: String,
-    text: String,
-}
-
-/// Get the message history.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = Vec<String>, remote = "chat::GetHistory")]
-struct GetHistory;
-
-/// Get room info.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = RoomInfo, remote = "chat::GetRoomInfo")]
-struct GetRoomInfo;
-
+/// Complex response type — kept as a standalone struct
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct RoomInfo {
+pub struct RoomInfo {
     name: String,
     message_count: usize,
 }
@@ -64,22 +48,15 @@ impl ChatRoom {
         &mut self,
         _ctx: &ActorContext<Self>,
         state: &mut ChatRoomState,
-        msg: PostMessage,
+        from: String,
+        text: String,
     ) -> usize {
-        state.messages.push(ChatEntry {
-            from: msg.from,
-            text: msg.text,
-        });
+        state.messages.push(ChatEntry { from, text });
         state.messages.len()
     }
 
     #[handler]
-    fn get_history(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut ChatRoomState,
-        _msg: GetHistory,
-    ) -> Vec<String> {
+    fn get_history(&mut self, _ctx: &ActorContext<Self>, state: &mut ChatRoomState) -> Vec<String> {
         state
             .messages
             .iter()
@@ -88,12 +65,7 @@ impl ChatRoom {
     }
 
     #[handler]
-    fn get_room_info(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut ChatRoomState,
-        _msg: GetRoomInfo,
-    ) -> RoomInfo {
+    fn get_room_info(&mut self, _ctx: &ActorContext<Self>, state: &mut ChatRoomState) -> RoomInfo {
         RoomInfo {
             name: state.room_name.clone(),
             message_count: state.messages.len(),
@@ -124,35 +96,11 @@ impl Actor for Participant {
     }
 }
 
-/// Deliver a notification to the participant's inbox.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = (), remote = "chat::Notify")]
-struct Notify {
-    text: String,
-}
-
-/// Read the participant's inbox.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = Vec<String>, remote = "chat::ReadInbox")]
-struct ReadInbox;
-
-/// Get the participant's username.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = String, remote = "chat::GetUsername")]
-struct GetUsername;
-
-/// Tell this participant to watch another actor.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = (), remote = "chat::WatchActor")]
-struct WatchActor {
-    label: String,
-}
-
 #[handlers]
 impl Participant {
     #[handler]
-    fn notify(&mut self, _ctx: &ActorContext<Self>, state: &mut ParticipantState, msg: Notify) {
-        state.inbox.push(msg.text);
+    fn notify(&mut self, _ctx: &ActorContext<Self>, state: &mut ParticipantState, text: String) {
+        state.inbox.push(text);
     }
 
     #[handler]
@@ -160,18 +108,12 @@ impl Participant {
         &mut self,
         _ctx: &ActorContext<Self>,
         state: &mut ParticipantState,
-        _msg: ReadInbox,
     ) -> Vec<String> {
         state.inbox.clone()
     }
 
     #[handler]
-    fn get_username(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut ParticipantState,
-        _msg: GetUsername,
-    ) -> String {
+    fn get_username(&mut self, _ctx: &ActorContext<Self>, state: &mut ParticipantState) -> String {
         state.username.clone()
     }
 
@@ -180,9 +122,9 @@ impl Participant {
         &mut self,
         ctx: &ActorContext<Self>,
         _state: &mut ParticipantState,
-        msg: WatchActor,
+        label: String,
     ) {
-        ctx.watch(&msg.label);
+        ctx.watch(&label);
     }
 }
 
@@ -217,26 +159,20 @@ mod tests {
             },
         );
 
-        room.send(PostMessage {
-            from: "alice".into(),
-            text: "Hello!".into(),
-        })
-        .await
-        .unwrap();
+        room.post_message("alice".into(), "Hello!".into())
+            .await
+            .unwrap();
 
-        room.send(PostMessage {
-            from: "bob".into(),
-            text: "Hi alice!".into(),
-        })
-        .await
-        .unwrap();
+        room.post_message("bob".into(), "Hi alice!".into())
+            .await
+            .unwrap();
 
-        let history = room.send(GetHistory).await.unwrap();
+        let history = room.get_history().await.unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0], "alice: Hello!");
         assert_eq!(history[1], "bob: Hi alice!");
 
-        let info = room.send(GetRoomInfo).await.unwrap();
+        let info = room.get_room_info().await.unwrap();
         assert_eq!(
             info,
             RoomInfo {
@@ -281,28 +217,23 @@ mod tests {
 
         // Alice posts to the room
         let count = room
-            .send(PostMessage {
-                from: "alice".into(),
-                text: "Anyone here?".into(),
-            })
+            .post_message("alice".into(), "Anyone here?".into())
             .await
             .unwrap();
         assert_eq!(count, 1);
 
         // Notify bob about the message
-        bob.send(Notify {
-            text: "New message in #dev from alice".into(),
-        })
-        .await
-        .unwrap();
+        bob.notify("New message in #dev from alice".into())
+            .await
+            .unwrap();
 
         // Check bob's inbox
-        let inbox = bob.send(ReadInbox).await.unwrap();
+        let inbox = bob.read_inbox().await.unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0], "New message in #dev from alice");
 
         // Verify alice's inbox is empty
-        let alice_inbox = alice.send(ReadInbox).await.unwrap();
+        let alice_inbox = alice.read_inbox().await.unwrap();
         assert!(alice_inbox.is_empty());
     }
 
@@ -331,7 +262,7 @@ mod tests {
         let mut usernames = Vec::new();
         for _ in 0..3 {
             let ep = listing.next().await.unwrap();
-            let name = ep.send(GetUsername).await.unwrap();
+            let name = ep.get_username().await.unwrap();
             usernames.push(name);
         }
         usernames.sort();
@@ -352,7 +283,7 @@ mod tests {
         receptionist.check_in("user/dave", online_key);
 
         let dave_ep = listing.next().await.unwrap();
-        assert_eq!(dave_ep.send(GetUsername).await.unwrap(), "dave");
+        assert_eq!(dave_ep.get_username().await.unwrap(), "dave");
     }
 
     /// Test: router broadcasts notifications to all participants.
@@ -390,8 +321,8 @@ mod tests {
         assert!(results.iter().all(|r| r.is_ok()));
 
         // Both should have the message
-        let alice_inbox = alice.send(ReadInbox).await.unwrap();
-        let bob_inbox = bob.send(ReadInbox).await.unwrap();
+        let alice_inbox = alice.read_inbox().await.unwrap();
+        let bob_inbox = bob.read_inbox().await.unwrap();
         assert_eq!(alice_inbox.len(), 1);
         assert_eq!(bob_inbox.len(), 1);
         assert_eq!(alice_inbox[0], "Server maintenance in 5 minutes");
@@ -423,12 +354,7 @@ mod tests {
         );
 
         // Tell the watcher to watch the room
-        watcher
-            .send(WatchActor {
-                label: "room/temp".into(),
-            })
-            .await
-            .unwrap();
+        watcher.watch_actor("room/temp".into()).await.unwrap();
 
         // Stop the chat room
         receptionist.stop("room/temp");
@@ -437,7 +363,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The watcher should have received a termination notification
-        let inbox = watcher.send(ReadInbox).await.unwrap();
+        let inbox = watcher.read_inbox().await.unwrap();
         assert_eq!(inbox.len(), 1);
         assert!(inbox[0].contains("room/temp"));
         assert!(inbox[0].contains("terminated"));
@@ -508,10 +434,10 @@ mod tests {
         let room_ep = room_ref.resolve(&receptionist).unwrap();
         let user_ep = user_ref.resolve(&receptionist).unwrap();
 
-        let info = room_ep.send(GetRoomInfo).await.unwrap();
+        let info = room_ep.get_room_info().await.unwrap();
         assert_eq!(info.name, "Lobby");
 
-        let username = user_ep.send(GetUsername).await.unwrap();
+        let username = user_ep.get_username().await.unwrap();
         assert_eq!(username, "admin");
 
         // Wrong type resolution returns None

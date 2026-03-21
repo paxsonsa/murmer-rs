@@ -86,7 +86,10 @@ pub fn select_node(
 
     for node in view.alive_nodes() {
         // Filter: must satisfy placement constraints
-        if !spec.placement.is_satisfied_by(&node.class, &node.metadata, &node.running_actors) {
+        if !spec
+            .placement
+            .is_satisfied_by(&node.class, &node.metadata, &node.running_actors)
+        {
             continue;
         }
 
@@ -236,16 +239,15 @@ mod tests {
 
     #[test]
     fn test_no_eligible_nodes_returns_none() {
-        let view = make_view(vec![
-            make_node("alpha", 1, vec![]),
-        ]);
+        let view = make_view(vec![make_node("alpha", 1, vec![])]);
 
         // Require Coordinator class, but only Worker nodes exist
-        let spec = ActorSpec::new("coord/0", "app::Coordinator")
-            .with_constraints(crate::spec::PlacementConstraints {
+        let spec = ActorSpec::new("coord/0", "app::Coordinator").with_constraints(
+            crate::spec::PlacementConstraints {
                 required_classes: vec![NodeClass::Coordinator],
                 ..Default::default()
-            });
+            },
+        );
 
         let decision = select_node(&LeastLoaded, &spec, &view);
         assert!(decision.is_none());

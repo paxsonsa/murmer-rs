@@ -117,11 +117,45 @@ pub mod supervisor;
 pub mod system;
 pub mod wire;
 
-/// Re-export bincode so generated code can reference it without the user
-/// needing bincode in their Cargo.toml.
+/// Re-export dependencies so generated code can reference them without the user
+/// needing them in their Cargo.toml.
 pub mod __reexport {
     pub use bincode;
+    pub use linkme;
 }
+
+// =============================================================================
+// AUTO-REGISTRATION — linkme distributed slice for TypeRegistry entries
+// =============================================================================
+
+/// An entry for auto-registration of an actor type in the cluster's [`cluster::sync::TypeRegistry`].
+///
+/// The `#[handlers]` macro emits one of these per actor type into the
+/// [`ACTOR_TYPE_ENTRIES`] distributed slice. At startup, [`cluster::sync::TypeRegistry::from_auto()`]
+/// iterates the slice to build the registry automatically.
+pub struct TypeRegistryEntry {
+    /// Returns the fully-qualified actor type name (via `std::any::type_name::<A>()`).
+    pub actor_type_name: fn() -> &'static str,
+    /// Registers a remote endpoint for this actor type in the receptionist.
+    pub register: fn(
+        &crate::Receptionist,
+        &str,
+        tokio::sync::mpsc::UnboundedSender<crate::RemoteInvocation>,
+        crate::ResponseRegistry,
+        &str,
+    ),
+}
+
+// TypeRegistryEntry contains only function pointers — inherently Send + Sync.
+unsafe impl Sync for TypeRegistryEntry {}
+
+/// Distributed slice populated by `#[handlers]` macro expansions across all crates.
+///
+/// Each actor type annotated with `#[handlers]` contributes one [`TypeRegistryEntry`]
+/// to this slice at link time. Use [`cluster::sync::TypeRegistry::from_auto()`] to
+/// collect them into a ready-to-use registry.
+#[__reexport::linkme::distributed_slice]
+pub static ACTOR_TYPE_ENTRIES: [TypeRegistryEntry];
 
 /// Convenience prelude — import everything you need for typical actor definitions.
 ///
@@ -131,34 +165,36 @@ pub mod __reexport {
 pub mod prelude {
     pub use crate::actor::DispatchError;
     pub use crate::actor::{
-        Actor, ActorContext, ActorRef, Handler, Message, MigratableActor, RemoteDispatch,
-        RemoteMessage,
+        Actor, ActorContext, ActorRef, AsyncHandler, Handler, Message, MigratableActor,
+        RemoteDispatch, RemoteMessage,
     };
     pub use crate::endpoint::Endpoint;
     pub use crate::lifecycle::{
         ActorFactory, ActorTerminated, BackoffConfig, RestartConfig, RestartPolicy,
         TerminationReason,
     };
-    pub use crate::listing::{Listing, ReceptionKey};
+    pub use crate::listing::{Listing, ListingEvent, ReceptionKey, WatchedListing};
     pub use crate::receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
-    pub use crate::router::{Router, RoutingStrategy};
+    pub use crate::router::{PoolRouter, Router, RoutingStrategy};
     pub use crate::system::System;
-    pub use crate::wire::SendError;
+    pub use crate::wire::{ReplySender, SendError};
 }
 
 // Re-export core types for convenience
 pub use actor::{
-    Actor, ActorContext, ActorRef, DispatchError, Handler, Message, MigratableActor,
+    Actor, ActorContext, ActorRef, AsyncHandler, DispatchError, Handler, Message, MigratableActor,
     RemoteDispatch, RemoteMessage,
 };
 pub use endpoint::Endpoint;
 pub use lifecycle::{
     ActorFactory, ActorTerminated, BackoffConfig, RestartConfig, RestartPolicy, TerminationReason,
 };
-pub use listing::{Listing, ReceptionKey};
+pub use listing::{Listing, ListingEvent, ReceptionKey, WatchedListing};
 pub use node::run_node_receiver;
 pub use oplog::{Op, OpType, VersionVector};
 pub use receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
-pub use router::{Router, RoutingStrategy};
+pub use router::{PoolRouter, Router, RoutingStrategy};
 pub use system::System;
-pub use wire::{DispatchRequest, RemoteInvocation, RemoteResponse, ResponseRegistry, SendError};
+pub use wire::{
+    DispatchRequest, RemoteInvocation, RemoteResponse, ReplySender, ResponseRegistry, SendError,
+};

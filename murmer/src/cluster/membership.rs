@@ -131,7 +131,9 @@ impl Runtime<NodeIdentity> for FocaRuntime {
             }
             Notification::MemberDown(identity) => {
                 tracing::info!("SWIM: node failed (detected by failure detector): {identity}");
-                let _ = self.event_tx.send(ClusterEvent::NodeFailed(identity.clone()));
+                let _ = self
+                    .event_tx
+                    .send(ClusterEvent::NodeFailed(identity.clone()));
             }
             Notification::Defunct => {
                 tracing::warn!("SWIM: local node declared defunct");

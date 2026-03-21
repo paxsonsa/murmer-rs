@@ -34,7 +34,8 @@ use crate::lifecycle::{
     WatchEntry,
 };
 use crate::listing::{
-    ErasedListingSender, ErasedReceptionKey, Listing, ReceptionKey, TypedListingSender,
+    ErasedListingSender, ErasedReceptionKey, ErasedWatchedListingSender, Listing, ReceptionKey,
+    TypedListingSender, TypedWatchedListingSender, WatchedListing,
 };
 use crate::oplog::{Op, OpLog, OpType, VersionVector};
 use crate::supervisor::{run_supervisor, should_restart};
@@ -164,6 +165,7 @@ struct ReceptionistInner {
     entries: Mutex<HashMap<String, ActorEntry>>,
     event_subscribers: Mutex<Vec<mpsc::UnboundedSender<ActorEvent>>>,
     listing_subscribers: Mutex<Vec<Box<dyn ErasedListingSender>>>,
+    watched_listing_subscribers: Mutex<Vec<Box<dyn ErasedWatchedListingSender>>>,
     oplog: Mutex<OpLog>,
     observed_versions: Mutex<VersionVector>,
     watches: Mutex<HashMap<String, Vec<WatchEntry>>>,
@@ -206,6 +208,7 @@ impl Receptionist {
                 entries: Mutex::new(HashMap::new()),
                 event_subscribers: Mutex::new(Vec::new()),
                 listing_subscribers: Mutex::new(Vec::new()),
+                watched_listing_subscribers: Mutex::new(Vec::new()),
                 oplog: Mutex::new(OpLog::new(node_id)),
                 observed_versions: Mutex::new(VersionVector::new()),
                 watches: Mutex::new(HashMap::new()),
@@ -264,6 +267,7 @@ impl Receptionist {
             mailbox_tx: mailbox_tx.clone(),
             receptionist: self.clone(),
             system_tx,
+            reply_token: std::sync::Mutex::new(None),
         };
 
         // Spawn the supervisor task
@@ -374,6 +378,7 @@ impl Receptionist {
             mailbox_tx: mailbox_tx.clone(),
             receptionist: self.clone(),
             system_tx,
+            reply_token: std::sync::Mutex::new(None),
         };
 
         let entry = ActorEntry {
@@ -502,6 +507,7 @@ impl Receptionist {
                     mailbox_tx: mailbox_tx.clone(),
                     receptionist: receptionist.clone(),
                     system_tx,
+                    reply_token: std::sync::Mutex::new(None),
                 };
 
                 // Re-register with the same label and stable channels
@@ -633,6 +639,21 @@ impl Receptionist {
                     let _ = watcher
                         .system_tx
                         .send(SystemSignal::ActorTerminated(terminated.clone()));
+                }
+            }
+
+            // Notify watched listing subscribers of removal
+            if !entry.keys.is_empty() {
+                let mut watched_subs =
+                    self.inner.watched_listing_subscribers.lock().unwrap();
+                watched_subs.retain(|sub| !sub.is_closed());
+                for sub in watched_subs.iter() {
+                    // Only notify if the entry had a matching key
+                    if sub.actor_type_id() == entry.type_id
+                        && entry.keys.iter().any(|k| k.id == sub.key_id())
+                    {
+                        sub.try_send_removed(label);
+                    }
                 }
             }
 
@@ -803,6 +824,17 @@ impl Receptionist {
             }
         }
 
+        // Notify watched listing subscribers (always immediate — no buffering)
+        {
+            let mut watched_subs = self.inner.watched_listing_subscribers.lock().unwrap();
+            watched_subs.retain(|sub| !sub.is_closed());
+            for sub in watched_subs.iter() {
+                if sub.key_id() == key.id && sub.actor_type_id() == TypeId::of::<A>() {
+                    sub.try_send_added(entry);
+                }
+            }
+        }
+
         // Must drop entries before mutating it (need mutable borrow)
         drop(entries);
 
@@ -853,6 +885,50 @@ impl Receptionist {
         listing_subs.retain(|sub| !sub.is_closed());
 
         Listing::new(rx)
+    }
+
+    /// Get a watched listing that streams both additions and removals with labels.
+    ///
+    /// Unlike [`listing`](Self::listing), this returns [`ListingEvent`] values
+    /// that include the actor's label and distinguish between additions and
+    /// removals. Use this to build reactive pools that auto-track membership.
+    ///
+    /// Backfills existing matches as `Added` events, then streams live updates.
+    pub fn watched_listing<A: Actor + 'static>(
+        &self,
+        key: ReceptionKey<A>,
+    ) -> WatchedListing<A> {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Lock atomically: entries → watched_listing_subscribers
+        let entries = self.inner.entries.lock().unwrap();
+        let mut watched_subs = self.inner.watched_listing_subscribers.lock().unwrap();
+
+        // Backfill: send Added events for all existing matches
+        for entry in entries.values() {
+            if entry.type_id == TypeId::of::<A>()
+                && entry
+                    .keys
+                    .iter()
+                    .any(|k| k.id == key.id && k.type_id == TypeId::of::<A>())
+            {
+                let temp_sender = TypedWatchedListingSender::<A> {
+                    key_id: key.id.clone(),
+                    tx: tx.clone(),
+                };
+                temp_sender.try_send_added(entry);
+            }
+        }
+
+        // Register for future add + remove notifications
+        watched_subs.push(Box::new(TypedWatchedListingSender::<A> {
+            key_id: key.id.clone(),
+            tx,
+        }));
+
+        watched_subs.retain(|sub| !sub.is_closed());
+
+        WatchedListing::new(rx)
     }
 
     // =========================================================================

@@ -29,8 +29,11 @@
 //! lives in `Actor::State`. This separation enables the supervisor to manage
 //! state across restarts independently of the actor's handler logic.
 
+use std::any::Any;
 use std::fmt::Debug;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Mutex;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -120,6 +123,9 @@ pub struct ActorContext<A: Actor> {
     pub(crate) mailbox_tx: mpsc::UnboundedSender<Box<dyn EnvelopeProxy<A>>>,
     pub(crate) receptionist: Receptionist,
     pub(crate) system_tx: mpsc::UnboundedSender<SystemSignal>,
+    /// Per-message reply token. Set by the envelope before each handler call,
+    /// cleared after. Interior mutability because ctx is passed by `&`.
+    pub(crate) reply_token: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
 impl<A: Actor + 'static> ActorContext<A> {
@@ -155,6 +161,18 @@ impl<A: Actor + 'static> ActorContext<A> {
             .add_watch(label, &self.label, self.system_tx.clone());
     }
 
+    /// Spawn a fire-and-forget task on the tokio runtime.
+    ///
+    /// Use this for background work that doesn't need to block the handler.
+    /// The spawned future runs independently of the actor's lifecycle.
+    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(future)
+    }
+
     /// Get a serializable reference to this actor.
     ///
     /// The returned [`ActorRef<A>`] can be embedded in messages and sent to
@@ -165,6 +183,73 @@ impl<A: Actor + 'static> ActorContext<A> {
             label: self.label.clone(),
             node_id: self.node_id.clone(),
             _phantom: PhantomData,
+        }
+    }
+
+    /// Reply to the current message immediately. The handler's return value
+    /// will be silently discarded.
+    ///
+    /// Returns `true` if the reply was sent, `false` if already consumed
+    /// (e.g., by a previous `reply()` call or `forward()`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `R` doesn't match the current message's result type.
+    pub fn reply<R: Send + 'static>(&self, value: R) -> bool {
+        let mut token = self.reply_token.lock().unwrap();
+        if let Some(any) = token.take() {
+            let sender = any
+                .downcast::<crate::wire::ReplySender<R>>()
+                .expect("ctx.reply() called with wrong type — R must match M::Result");
+            sender.send(value)
+        } else {
+            tracing::debug!("ctx.reply() called but reply already consumed");
+            false
+        }
+    }
+
+    /// Extract the raw reply channel for advanced patterns (scatter-gather,
+    /// deferred reply from a spawned task, etc.).
+    ///
+    /// After calling this, the handler's return value will be discarded.
+    /// The caller is responsible for eventually calling `sender.send(value)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `R` doesn't match the current message's result type,
+    /// or if the reply was already consumed.
+    pub fn reply_sender<R: Send + 'static>(&self) -> crate::wire::ReplySender<R> {
+        let mut token = self.reply_token.lock().unwrap();
+        if let Some(any) = token.take() {
+            *any.downcast::<crate::wire::ReplySender<R>>()
+                .expect("ctx.reply_sender() called with wrong type — R must match M::Result")
+        } else {
+            panic!("ctx.reply_sender() called but reply already consumed");
+        }
+    }
+
+    /// Forward the current message's reply responsibility to another local actor.
+    ///
+    /// The target actor handles `msg` and its response goes directly to the
+    /// original caller. This actor's return value is discarded.
+    ///
+    /// Only works for local endpoints. Returns `false` if the reply was already
+    /// consumed or the target's mailbox is closed.
+    pub fn forward<B, M>(&self, endpoint: &Endpoint<B>, message: M) -> bool
+    where
+        B: Handler<M> + 'static,
+        M: Message + Send + 'static,
+        M::Result: Send + 'static,
+    {
+        let mut token = self.reply_token.lock().unwrap();
+        if let Some(any) = token.take() {
+            let sender = *any
+                .downcast::<crate::wire::ReplySender<M::Result>>()
+                .expect("ctx.forward() called with wrong result type");
+            endpoint.send_with_reply_sender(message, sender)
+        } else {
+            tracing::debug!("ctx.forward() called but reply already consumed");
+            false
         }
     }
 }
@@ -316,20 +401,46 @@ pub trait Handler<M: Message>: Actor + Sized {
     ) -> M::Result;
 }
 
+/// Declares that actor `A` can handle message `M` asynchronously.
+///
+/// Like [`Handler`], but the handler returns a future, allowing `.await`
+/// inside handler logic without blocking the tokio runtime.
+///
+/// ```rust,ignore
+/// impl AsyncHandler<FetchData> for MyActor {
+///     fn handle(&mut self, ctx: &ActorContext<Self>, state: &mut MyState, msg: FetchData)
+///         -> impl Future<Output = String> + Send + '_ {
+///         async move {
+///             let data = some_async_call().await;
+///             format!("got: {data}")
+///         }
+///     }
+/// }
+/// ```
+pub trait AsyncHandler<M: Message>: Actor + Sized {
+    fn handle<'a>(
+        &'a mut self,
+        ctx: &'a ActorContext<Self>,
+        state: &'a mut Self::State,
+        message: M,
+    ) -> impl Future<Output = M::Result> + Send + 'a;
+}
+
 /// Generated by the `#[handlers]` proc macro: dispatches a remote message by type tag.
 ///
 /// Each match arm in the generated implementation deserializes the payload to the
-/// concrete message type, calls the corresponding [`Handler`], and serializes the result.
+/// concrete message type, calls the corresponding [`Handler`] or [`AsyncHandler`],
+/// and serializes the result.
 ///
 /// You should not need to implement this manually — use `#[handlers]` instead.
 pub trait RemoteDispatch: Actor + Sized {
-    fn dispatch_remote(
-        &mut self,
-        ctx: &ActorContext<Self>,
-        state: &mut Self::State,
-        message_type: &str,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, DispatchError>;
+    fn dispatch_remote<'a>(
+        &'a mut self,
+        ctx: &'a ActorContext<Self>,
+        state: &'a mut Self::State,
+        message_type: &'a str,
+        payload: &'a [u8],
+    ) -> impl Future<Output = Result<Vec<u8>, DispatchError>> + Send + 'a;
 }
 
 /// Errors from remote message dispatch.

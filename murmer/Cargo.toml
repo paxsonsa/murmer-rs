@@ -25,9 +25,11 @@ foca = { version = "0.19", features = ["bincode-codec"] }
 mdns-sd = "0.18"
 rand = "0.9"
 bytes = "1"
+futures-util = "0.3"
 tracing = "0.1"
 thiserror = "2"
 tokio-util = { version = "0.7", features = ["full"] }
+linkme = "0.3"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"

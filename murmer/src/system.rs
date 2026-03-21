@@ -28,10 +28,10 @@
 //! philosophy to murmer: write your actors once, and swap between local
 //! and distributed execution by changing a single line at startup.
 
+use crate::cluster::ClusterSystem;
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::error::ClusterError;
 use crate::cluster::sync::{SpawnRegistry, TypeRegistry};
-use crate::cluster::ClusterSystem;
 use crate::lifecycle::{ActorFactory, RestartConfig, RestartPolicy};
 use crate::listing::{Listing, ReceptionKey};
 use crate::receptionist::{ActorEvent, Receptionist};
@@ -49,12 +49,8 @@ pub struct System {
 }
 
 enum SystemInner {
-    Local {
-        receptionist: Receptionist,
-    },
-    Clustered {
-        cluster: Box<ClusterSystem>,
-    },
+    Local { receptionist: Receptionist },
+    Clustered { cluster: Box<ClusterSystem> },
 }
 
 impl System {
@@ -89,6 +85,14 @@ impl System {
         })
     }
 
+    /// Create a clustered system with auto-discovered type registry.
+    ///
+    /// Uses [`TypeRegistry::from_auto()`] to automatically register all actor
+    /// types annotated with `#[handlers]` — no manual registry setup needed.
+    pub async fn clustered_auto(config: ClusterConfig) -> Result<Self, ClusterError> {
+        Self::clustered(config, TypeRegistry::from_auto(), SpawnRegistry::new()).await
+    }
+
     // =========================================================================
     // ACTOR LIFECYCLE
     // =========================================================================
@@ -116,7 +120,8 @@ impl System {
     where
         F::Actor: RemoteDispatch,
     {
-        self.receptionist().start_with_policy(label, factory, policy)
+        self.receptionist()
+            .start_with_policy(label, factory, policy)
     }
 
     /// Start an actor with full restart configuration (policy, limits, backoff).
@@ -129,7 +134,8 @@ impl System {
     where
         F::Actor: RemoteDispatch,
     {
-        self.receptionist().start_with_config(label, factory, config)
+        self.receptionist()
+            .start_with_config(label, factory, config)
     }
 
     // =========================================================================
@@ -197,5 +203,16 @@ impl System {
     /// Returns `true` if this is a clustered system.
     pub fn is_clustered(&self) -> bool {
         matches!(self.inner, SystemInner::Clustered { .. })
+    }
+
+    /// Returns the local QUIC address if this is a clustered system.
+    ///
+    /// Useful for reading the OS-assigned port after binding to `127.0.0.1:0`,
+    /// e.g. to pass as a seed address to other nodes in tests.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match &self.inner {
+            SystemInner::Local { .. } => None,
+            SystemInner::Clustered { cluster } => Some(cluster.local_addr()),
+        }
     }
 }

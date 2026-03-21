@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use murmer::cluster::membership::ClusterEvent;
 use murmer::cluster::ClusterSystem;
+use murmer::cluster::membership::ClusterEvent;
 use murmer::prelude::*;
 use murmer_macros::{Message, handlers};
 use serde::{Deserialize, Serialize};
@@ -216,10 +216,7 @@ impl ClusterMonitor {
 ///
 /// Subscribes to `ClusterEvent`s from the cluster system and forwards
 /// them to the `ClusterMonitor` actor as typed messages.
-pub async fn run_monitor_bridge(
-    cluster: &ClusterSystem,
-    monitor: Endpoint<ClusterMonitor>,
-) {
+pub async fn run_monitor_bridge(cluster: &ClusterSystem, monitor: Endpoint<ClusterMonitor>) {
     let mut events = cluster.subscribe_events();
 
     loop {
@@ -272,11 +269,7 @@ mod tests {
     #[tokio::test]
     async fn test_monitor_tracks_nodes() {
         let system = murmer::System::local();
-        let monitor = system.start(
-            "murmer/monitor",
-            ClusterMonitor,
-            ClusterMonitorState::new(),
-        );
+        let monitor = system.start("murmer/monitor", ClusterMonitor, ClusterMonitorState::new());
 
         // Simulate nodes joining
         monitor
@@ -306,11 +299,7 @@ mod tests {
     #[tokio::test]
     async fn test_monitor_tracks_failures() {
         let system = murmer::System::local();
-        let monitor = system.start(
-            "murmer/monitor",
-            ClusterMonitor,
-            ClusterMonitorState::new(),
-        );
+        let monitor = system.start("murmer/monitor", ClusterMonitor, ClusterMonitorState::new());
 
         monitor
             .send(MonitorNodeJoined {
@@ -337,11 +326,7 @@ mod tests {
     #[tokio::test]
     async fn test_monitor_tracks_departures() {
         let system = murmer::System::local();
-        let monitor = system.start(
-            "murmer/monitor",
-            ClusterMonitor,
-            ClusterMonitorState::new(),
-        );
+        let monitor = system.start("murmer/monitor", ClusterMonitor, ClusterMonitorState::new());
 
         monitor
             .send(MonitorNodeJoined {

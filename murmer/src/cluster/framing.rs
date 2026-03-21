@@ -189,6 +189,124 @@ pub fn decode_message<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T, St
     Ok(val)
 }
 
+// =============================================================================
+// LEAN WIRE FORMAT — actor stream invocations and responses
+// =============================================================================
+//
+// These functions encode/decode actor stream messages using a custom binary
+// format that writes the payload bytes directly into the frame, avoiding the
+// double-serialization that occurs when using `encode_message(&RemoteInvocation)`.
+//
+// With bincode, encoding a `RemoteInvocation { payload: Vec<u8> }` re-encodes
+// the already-serialized payload bytes (length prefix + full copy). The lean
+// format writes the raw payload bytes directly after the header fields.
+//
+// Additionally, the lean format omits `actor_label` from every frame — the
+// StreamInit message already establishes which actor the stream targets, so
+// repeating it per-message is redundant.
+//
+// Wire format for invocations:
+//   [u32 LE frame_length]            — handled by FrameCodec
+//   [u64 LE call_id]                 — response correlation ID
+//   [u16 LE message_type_len]        — length of the message type string
+//   [message_type bytes]             — UTF-8 TYPE_ID (e.g., "counter::Increment")
+//   [payload bytes until end]        — raw serialized message (no length prefix)
+//
+// Wire format for responses:
+//   [u32 LE frame_length]            — handled by FrameCodec
+//   [u64 LE call_id]                 — matches the invocation's call_id
+//   [u8 status]                      — 1 = Ok, 0 = Err
+//   [body bytes until end]           — raw result payload (Ok) or UTF-8 error string (Err)
+
+/// Encode an actor stream invocation to a length-prefixed frame.
+///
+/// Writes the payload bytes directly — no double-serialization.
+pub fn encode_invocation_frame(call_id: u64, message_type: &str, payload: &[u8]) -> Vec<u8> {
+    let type_bytes = message_type.as_bytes();
+    let body_len = 8 + 2 + type_bytes.len() + payload.len();
+    let mut buf = Vec::with_capacity(4 + body_len);
+    buf.extend_from_slice(&(body_len as u32).to_le_bytes());
+    buf.extend_from_slice(&call_id.to_le_bytes());
+    buf.extend_from_slice(&(type_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(type_bytes);
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Decoded invocation from a frame payload.
+pub struct DecodedInvocation<'a> {
+    pub call_id: u64,
+    pub message_type: &'a str,
+    pub payload: &'a [u8],
+}
+
+/// Decode an actor stream invocation from a frame payload (length prefix already stripped).
+///
+/// Returns borrowed slices into the frame data — zero-copy for the payload.
+pub fn decode_invocation_frame(data: &[u8]) -> Result<DecodedInvocation<'_>, String> {
+    if data.len() < 10 {
+        return Err("invocation frame too short".into());
+    }
+    let call_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let type_len = u16::from_le_bytes(data[8..10].try_into().unwrap()) as usize;
+    if data.len() < 10 + type_len {
+        return Err(format!(
+            "invocation frame too short for message type (need {}, have {})",
+            10 + type_len,
+            data.len()
+        ));
+    }
+    let message_type = std::str::from_utf8(&data[10..10 + type_len])
+        .map_err(|e| format!("invalid message type UTF-8: {e}"))?;
+    let payload = &data[10 + type_len..];
+    Ok(DecodedInvocation {
+        call_id,
+        message_type,
+        payload,
+    })
+}
+
+/// Encode an actor stream response to a length-prefixed frame.
+///
+/// Writes the result bytes directly — no double-serialization.
+pub fn encode_response_frame(call_id: u64, result: &Result<Vec<u8>, String>) -> Vec<u8> {
+    let (status, body): (u8, &[u8]) = match result {
+        Ok(payload) => (1, payload.as_slice()),
+        Err(error) => (0, error.as_bytes()),
+    };
+    let body_len = 8 + 1 + body.len();
+    let mut buf = Vec::with_capacity(4 + body_len);
+    buf.extend_from_slice(&(body_len as u32).to_le_bytes());
+    buf.extend_from_slice(&call_id.to_le_bytes());
+    buf.push(status);
+    buf.extend_from_slice(body);
+    buf
+}
+
+/// Decoded response from a frame payload.
+pub struct DecodedResponse<'a> {
+    pub call_id: u64,
+    pub result: Result<&'a [u8], String>,
+}
+
+/// Decode an actor stream response from a frame payload (length prefix already stripped).
+///
+/// The Ok payload is a borrowed slice — zero-copy.
+pub fn decode_response_frame(data: &[u8]) -> Result<DecodedResponse<'_>, String> {
+    if data.len() < 9 {
+        return Err("response frame too short".into());
+    }
+    let call_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let status = data[8];
+    let body = &data[9..];
+    let result = if status == 1 {
+        Ok(body)
+    } else {
+        Err(String::from_utf8_lossy(body).into_owned())
+    };
+    Ok(DecodedResponse { call_id, result })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +523,122 @@ mod tests {
             }
             other => panic!("expected Departure, got {other:?}"),
         }
+    }
+
+    // ── Lean wire format tests ─────────────────────────────────────
+
+    #[test]
+    fn test_invocation_frame_roundtrip() {
+        let call_id = 42u64;
+        let message_type = "counter::Increment";
+        let payload = b"some-serialized-message-bytes";
+
+        let frame = encode_invocation_frame(call_id, message_type, payload);
+
+        // Strip the 4-byte length prefix (FrameCodec would do this)
+        let body = &frame[4..];
+        let decoded = decode_invocation_frame(body).unwrap();
+
+        assert_eq!(decoded.call_id, call_id);
+        assert_eq!(decoded.message_type, message_type);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_invocation_frame_empty_payload() {
+        let frame = encode_invocation_frame(1, "test::Empty", &[]);
+        let body = &frame[4..];
+        let decoded = decode_invocation_frame(body).unwrap();
+
+        assert_eq!(decoded.call_id, 1);
+        assert_eq!(decoded.message_type, "test::Empty");
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_invocation_frame_through_codec() {
+        let frame = encode_invocation_frame(99, "actor::Ping", b"hello");
+
+        let mut codec = FrameCodec::new();
+        codec.push_data(&frame);
+
+        let body = codec.next_frame().unwrap().unwrap();
+        let decoded = decode_invocation_frame(&body).unwrap();
+
+        assert_eq!(decoded.call_id, 99);
+        assert_eq!(decoded.message_type, "actor::Ping");
+        assert_eq!(decoded.payload, b"hello");
+    }
+
+    #[test]
+    fn test_invocation_frame_too_short() {
+        assert!(decode_invocation_frame(&[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn test_response_frame_roundtrip_ok() {
+        let call_id = 42u64;
+        let result_bytes = vec![1, 2, 3, 4, 5];
+
+        let frame = encode_response_frame(call_id, &Ok(result_bytes.clone()));
+        let body = &frame[4..];
+        let decoded = decode_response_frame(body).unwrap();
+
+        assert_eq!(decoded.call_id, call_id);
+        assert_eq!(decoded.result.unwrap(), &result_bytes[..]);
+    }
+
+    #[test]
+    fn test_response_frame_roundtrip_err() {
+        let call_id = 7u64;
+        let error = "actor not found".to_string();
+
+        let frame = encode_response_frame(call_id, &Err(error.clone()));
+        let body = &frame[4..];
+        let decoded = decode_response_frame(body).unwrap();
+
+        assert_eq!(decoded.call_id, call_id);
+        assert_eq!(decoded.result.unwrap_err(), error);
+    }
+
+    #[test]
+    fn test_response_frame_through_codec() {
+        let frame = encode_response_frame(55, &Ok(vec![10, 20, 30]));
+
+        let mut codec = FrameCodec::new();
+        codec.push_data(&frame);
+
+        let body = codec.next_frame().unwrap().unwrap();
+        let decoded = decode_response_frame(&body).unwrap();
+
+        assert_eq!(decoded.call_id, 55);
+        assert_eq!(decoded.result.unwrap(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_response_frame_too_short() {
+        assert!(decode_response_frame(&[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn test_multiple_invocation_frames_through_codec() {
+        let frame1 = encode_invocation_frame(1, "a::B", b"first");
+        let frame2 = encode_invocation_frame(2, "c::D", b"second");
+
+        let mut codec = FrameCodec::new();
+        codec.push_data(&frame1);
+        codec.push_data(&frame2);
+
+        let body1 = codec.next_frame().unwrap().unwrap();
+        let d1 = decode_invocation_frame(&body1).unwrap();
+        assert_eq!(d1.call_id, 1);
+        assert_eq!(d1.message_type, "a::B");
+        assert_eq!(d1.payload, b"first");
+
+        let body2 = codec.next_frame().unwrap().unwrap();
+        let d2 = decode_invocation_frame(&body2).unwrap();
+        assert_eq!(d2.call_id, 2);
+        assert_eq!(d2.message_type, "c::D");
+        assert_eq!(d2.payload, b"second");
     }
 }

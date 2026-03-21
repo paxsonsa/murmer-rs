@@ -84,11 +84,9 @@ impl Default for OldestNode {
 impl LeaderElection for OldestNode {
     fn elect(&self, view: &ClusterView) -> Option<String> {
         view.alive_nodes()
-            .filter(|node| {
-                match &self.required_class {
-                    Some(required) => &node.class == required,
-                    None => true,
-                }
+            .filter(|node| match &self.required_class {
+                Some(required) => &node.class == required,
+                None => true,
             })
             .min_by_key(|node| (node.identity.incarnation, node.identity.name.clone()))
             .map(|node| node.node_id())

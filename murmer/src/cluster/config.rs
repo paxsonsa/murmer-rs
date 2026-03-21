@@ -147,6 +147,118 @@ impl std::fmt::Display for NodeClass {
 }
 
 // =============================================================================
+// TRANSPORT TUNING — QUIC transport parameters for actor messaging
+// =============================================================================
+
+/// QUIC transport parameters tuned for actor messaging workloads.
+///
+/// Quinn's defaults assume a **100 Mbps link with 100ms RTT** — typical
+/// internet conditions. For LAN clustering (the primary murmer-rs use case),
+/// these are far too conservative. The defaults here target **low-latency LAN**
+/// with sub-millisecond RTT and many small messages.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Use defaults (tuned for LAN)
+/// let config = ClusterConfig::builder()
+///     .listen("127.0.0.1:0".parse().unwrap())
+///     .cookie("secret")
+///     .build()?;
+///
+/// // Custom tuning for WAN or specific requirements
+/// let config = ClusterConfig::builder()
+///     .listen("0.0.0.0:9000".parse().unwrap())
+///     .cookie("secret")
+///     .transport(TransportTuning {
+///         initial_rtt_ms: 50,
+///         max_idle_timeout_secs: 60,
+///         keep_alive_interval_secs: Some(15),
+///         max_concurrent_bidi_streams: 512,
+///         ..Default::default()
+///     })
+///     .build()?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct TransportTuning {
+    /// Initial RTT estimate in milliseconds.
+    ///
+    /// Controls how quickly the first packet loss is detected. Lower = faster
+    /// loss detection, but too low can cause spurious retransmissions.
+    ///
+    /// Default: **1ms** (LAN). Set to 50-100ms for WAN deployments.
+    pub initial_rtt_ms: u64,
+
+    /// Maximum time a connection can remain idle before being closed, in seconds.
+    ///
+    /// Default: **30s**. Pair with `keep_alive_interval_secs` to prevent
+    /// idle connections from being torn down prematurely.
+    pub max_idle_timeout_secs: u64,
+
+    /// Interval between keep-alive packets, in seconds. `None` disables keep-alives.
+    ///
+    /// Keep-alives serve two purposes: (1) prevent NAT/firewall timeouts on idle
+    /// connections, and (2) detect dead peers faster than waiting for the idle timeout.
+    ///
+    /// Should be less than `max_idle_timeout_secs` to prevent idle disconnects.
+    ///
+    /// Default: **5s**.
+    pub keep_alive_interval_secs: Option<u64>,
+
+    /// Maximum concurrent bidirectional streams per connection.
+    ///
+    /// Each remote actor gets its own QUIC stream, so this limits how many
+    /// actors on a single remote node can be communicated with simultaneously.
+    ///
+    /// Default: **1024**.
+    pub max_concurrent_bidi_streams: u32,
+
+    /// Per-stream receive window in bytes.
+    ///
+    /// How much data can be in-flight per stream before flow control kicks in.
+    /// On LAN with sub-ms RTT, small windows are fine. Larger windows help
+    /// on high-latency links.
+    ///
+    /// Default: **256 KiB** (LAN). Quinn default is ~1.2 MiB (internet).
+    pub stream_receive_window: u32,
+
+    /// Connection-level receive window in bytes.
+    ///
+    /// Aggregate flow control across all streams on a connection.
+    ///
+    /// Default: **2 MiB**.
+    pub receive_window: u32,
+
+    /// Connection-level send window in bytes.
+    ///
+    /// Default: **2 MiB**.
+    pub send_window: u64,
+
+    /// Initial MTU for QUIC packets.
+    ///
+    /// LAN environments can safely start higher than the QUIC minimum (1200).
+    /// MTU discovery will probe for larger sizes.
+    ///
+    /// Default: **1452** (typical LAN ethernet).
+    pub initial_mtu: u16,
+}
+
+impl Default for TransportTuning {
+    fn default() -> Self {
+        Self {
+            initial_rtt_ms: 1,
+            max_idle_timeout_secs: 30,
+            keep_alive_interval_secs: Some(5),
+            max_concurrent_bidi_streams: 1024,
+            stream_receive_window: 256 * 1024,  // 256 KiB
+            receive_window: 2 * 1024 * 1024,    // 2 MiB
+            send_window: 2 * 1024 * 1024,       // 2 MiB
+            initial_mtu: 1452,
+        }
+    }
+}
+
+// =============================================================================
 // CLUSTER CONFIG — builder pattern for cluster setup
 // =============================================================================
 
@@ -179,6 +291,8 @@ pub struct ClusterConfig {
     /// Arbitrary key-value metadata describing this node's capabilities.
     /// Examples: `"region" = "us-west"`, `"gpu" = "true"`, `"rack" = "A3"`.
     pub node_metadata: HashMap<String, String>,
+    /// QUIC transport parameters. Defaults are tuned for LAN actor messaging.
+    pub transport: TransportTuning,
 }
 
 /// Builder for `ClusterConfig`.
@@ -190,6 +304,7 @@ pub struct ClusterConfigBuilder {
     discovery: Discovery,
     node_class: NodeClass,
     node_metadata: HashMap<String, String>,
+    transport: TransportTuning,
 }
 
 impl ClusterConfigBuilder {
@@ -202,6 +317,7 @@ impl ClusterConfigBuilder {
             discovery: Discovery::default(),
             node_class: NodeClass::default(),
             node_metadata: HashMap::new(),
+            transport: TransportTuning::default(),
         }
     }
 
@@ -265,6 +381,15 @@ impl ClusterConfigBuilder {
         self
     }
 
+    /// Set QUIC transport tuning parameters.
+    ///
+    /// Defaults are tuned for LAN actor messaging (sub-ms RTT, many small messages).
+    /// Override for WAN deployments or specific requirements.
+    pub fn transport(mut self, tuning: TransportTuning) -> Self {
+        self.transport = tuning;
+        self
+    }
+
     pub fn build(self) -> Result<ClusterConfig, &'static str> {
         let listen_addr = self.listen_addr.ok_or("listen address is required")?;
         let cookie = self.cookie.ok_or("cookie is required")?;
@@ -288,6 +413,7 @@ impl ClusterConfigBuilder {
             discovery: self.discovery,
             node_class: self.node_class,
             node_metadata: self.node_metadata,
+            transport: self.transport,
         })
     }
 }

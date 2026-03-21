@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Actor, DispatchRequest, Endpoint, Listing, OpType, ReceptionKey, Receptionist,
-    ReceptionistConfig, RemoteDispatch, RemoteInvocation, RemoteResponse,
+    ReceptionistConfig, RemoteDispatch, RemoteInvocation,
 };
 
 use config::{ClusterConfig, NodeClass, NodeIdentity};
@@ -115,13 +115,14 @@ impl ClusterSystem {
         // Type manifest from the registry
         let type_manifest = type_registry.known_types();
 
-        // Bind QUIC transport
+        // Bind QUIC transport with tuned parameters
         let (transport, incoming_rx, connection_events_rx) = Transport::bind(
             identity.clone(),
             config.cookie.clone(),
             type_manifest,
             config.node_class.clone(),
             config.node_metadata.clone(),
+            config.transport.clone(),
             shutdown.clone(),
         )
         .await?;
@@ -689,13 +690,11 @@ async fn handle_actor_stream_after_init(
         Some(tx) => tx,
         None => {
             tracing::warn!("Actor stream for unknown actor: {actor_label}");
-            let err = RemoteResponse {
-                call_id: 0,
-                result: Err(format!("actor not found: {actor_label}")),
-            };
-            if let Ok(frame) = framing::encode_message(&err) {
-                let _ = send.write_all(&frame).await;
-            }
+            let frame = framing::encode_response_frame(
+                0,
+                &Err(format!("actor not found: {actor_label}")),
+            );
+            let _ = send.write_all(&frame).await;
             return;
         }
     };
@@ -729,16 +728,16 @@ async fn handle_actor_stream_after_init(
     }
 }
 
-/// Decode a RemoteInvocation frame, dispatch it, await the response, and
-/// write it back. Returns false if the stream should be closed.
+/// Decode an invocation frame (lean wire format), dispatch it, await the
+/// response, and write it back. Returns false if the stream should be closed.
 async fn dispatch_and_respond(
     dispatch_tx: &mpsc::UnboundedSender<DispatchRequest>,
     send: &mut quinn::SendStream,
     frame: &[u8],
     actor_label: &str,
 ) -> bool {
-    let invocation = match framing::decode_message::<RemoteInvocation>(frame) {
-        Ok(inv) => inv,
+    let decoded = match framing::decode_invocation_frame(frame) {
+        Ok(d) => d,
         Err(e) => {
             tracing::warn!("Failed to decode invocation for {actor_label}: {e}");
             return true; // skip this frame but keep stream open
@@ -747,7 +746,12 @@ async fn dispatch_and_respond(
 
     let (resp_tx, resp_rx) = oneshot::channel();
     let request = DispatchRequest {
-        invocation,
+        invocation: RemoteInvocation {
+            call_id: decoded.call_id,
+            actor_label: actor_label.to_string(),
+            message_type: decoded.message_type.to_string(),
+            payload: decoded.payload.to_vec(),
+        },
         respond_to: resp_tx,
     };
 
@@ -756,12 +760,18 @@ async fn dispatch_and_respond(
         return false;
     }
 
-    if let Ok(response) = resp_rx.await
-        && let Ok(frame) = framing::encode_message(&response)
-        && let Err(e) = send.write_all(&frame).await
-    {
-        tracing::warn!("Failed to send response for {actor_label}: {e}");
-        return false;
+    match resp_rx.await {
+        Ok(response) => {
+            let frame = framing::encode_response_frame(response.call_id, &response.result);
+            if let Err(e) = send.write_all(&frame).await {
+                tracing::warn!("Failed to send response for {actor_label}: {e}");
+                return false;
+            }
+        }
+        Err(_) => {
+            tracing::warn!("Response channel dropped for {actor_label}");
+            // Keep stream open — actor may have been restarted
+        }
     }
 
     true
@@ -844,31 +854,33 @@ mod tests {
     }
 
     impl RemoteDispatch for TestCounter {
-        fn dispatch_remote(
-            &mut self,
-            ctx: &ActorContext<Self>,
-            state: &mut TestCounterState,
-            message_type: &str,
-            payload: &[u8],
-        ) -> Result<Vec<u8>, DispatchError> {
-            match message_type {
-                "test::Increment" => {
-                    let (msg, _): (Increment, _) =
-                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                    let result = <Self as Handler<Increment>>::handle(self, ctx, state, msg);
-                    bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+        fn dispatch_remote<'a>(
+            &'a mut self,
+            ctx: &'a ActorContext<Self>,
+            state: &'a mut TestCounterState,
+            message_type: &'a str,
+            payload: &'a [u8],
+        ) -> impl std::future::Future<Output = Result<Vec<u8>, DispatchError>> + Send + 'a {
+            async move {
+                match message_type {
+                    "test::Increment" => {
+                        let (msg, _): (Increment, _) =
+                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                        let result = <Self as Handler<Increment>>::handle(self, ctx, state, msg);
+                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
+                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+                    }
+                    "test::GetCount" => {
+                        let (msg, _): (GetCount, _) =
+                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                        let result = <Self as Handler<GetCount>>::handle(self, ctx, state, msg);
+                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
+                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+                    }
+                    other => Err(DispatchError::UnknownMessageType(other.to_string())),
                 }
-                "test::GetCount" => {
-                    let (msg, _): (GetCount, _) =
-                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                    let result = <Self as Handler<GetCount>>::handle(self, ctx, state, msg);
-                    bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
-                }
-                other => Err(DispatchError::UnknownMessageType(other.to_string())),
             }
         }
     }
@@ -1294,23 +1306,25 @@ mod tests {
     }
 
     impl RemoteDispatch for RefReceiver {
-        fn dispatch_remote(
-            &mut self,
-            ctx: &ActorContext<Self>,
-            state: &mut RefReceiverState,
-            message_type: &str,
-            payload: &[u8],
-        ) -> Result<Vec<u8>, DispatchError> {
-            match message_type {
-                "test::SendRef" => {
-                    let (msg, _): (SendRef, _) =
-                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                    let result = <Self as Handler<SendRef>>::handle(self, ctx, state, msg);
-                    bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+        fn dispatch_remote<'a>(
+            &'a mut self,
+            ctx: &'a ActorContext<Self>,
+            state: &'a mut RefReceiverState,
+            message_type: &'a str,
+            payload: &'a [u8],
+        ) -> impl std::future::Future<Output = Result<Vec<u8>, DispatchError>> + Send + 'a {
+            async move {
+                match message_type {
+                    "test::SendRef" => {
+                        let (msg, _): (SendRef, _) =
+                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                        let result = <Self as Handler<SendRef>>::handle(self, ctx, state, msg);
+                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
+                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+                    }
+                    other => Err(DispatchError::UnknownMessageType(other.to_string())),
                 }
-                other => Err(DispatchError::UnknownMessageType(other.to_string())),
             }
         }
     }
@@ -1415,9 +1429,10 @@ mod tests {
 
         // Node A: start "counter/ref-target" (TestCounter, count=0)
         let config_a = test_config("node-a");
-        let system_a = ClusterSystem::start(config_a, extended_type_registry(), SpawnRegistry::new())
-            .await
-            .unwrap();
+        let system_a =
+            ClusterSystem::start(config_a, extended_type_registry(), SpawnRegistry::new())
+                .await
+                .unwrap();
         let addr_a = system_a.local_addr();
         let node_a_id = system_a.identity().node_id_string();
 
@@ -1429,9 +1444,10 @@ mod tests {
 
         // Node B: start "ref-receiver/main" (RefReceiver)
         let config_b = test_config_with_seed("node-b", addr_a);
-        let system_b = ClusterSystem::start(config_b, extended_type_registry(), SpawnRegistry::new())
-            .await
-            .unwrap();
+        let system_b =
+            ClusterSystem::start(config_b, extended_type_registry(), SpawnRegistry::new())
+                .await
+                .unwrap();
 
         system_b.start_actor("ref-receiver/main", RefReceiver, RefReceiverState);
 

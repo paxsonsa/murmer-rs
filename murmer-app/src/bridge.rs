@@ -12,8 +12,8 @@
 //! let handle = tokio::spawn(run_cluster_bridge(cluster_system, coordinator_ep));
 //! ```
 
-use murmer::cluster::membership::ClusterEvent;
 use murmer::cluster::ClusterSystem;
+use murmer::cluster::membership::ClusterEvent;
 use murmer::prelude::*;
 
 use crate::coordinator::{
@@ -25,10 +25,7 @@ use crate::coordinator::{
 /// Subscribes to `ClusterEvent`s from the cluster system and forwards
 /// them to the Coordinator actor. Returns when the event channel closes
 /// (i.e., the cluster system shuts down).
-pub async fn run_cluster_bridge(
-    cluster: &ClusterSystem,
-    coordinator: Endpoint<Coordinator>,
-) {
+pub async fn run_cluster_bridge(cluster: &ClusterSystem, coordinator: Endpoint<Coordinator>) {
     let mut events = cluster.subscribe_events();
     let node_registry = cluster.node_registry().clone();
 

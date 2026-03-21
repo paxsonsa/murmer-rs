@@ -36,7 +36,11 @@ pub struct NodeInfo {
 
 impl NodeInfo {
     /// Create a new NodeInfo for a node that just joined.
-    pub fn new(identity: NodeIdentity, class: NodeClass, metadata: HashMap<String, String>) -> Self {
+    pub fn new(
+        identity: NodeIdentity,
+        class: NodeClass,
+        metadata: HashMap<String, String>,
+    ) -> Self {
         Self {
             identity,
             class,
@@ -178,11 +182,7 @@ mod tests {
     #[test]
     fn test_cluster_view_upsert_and_query() {
         let mut view = ClusterView::new();
-        let node = NodeInfo::new(
-            test_identity("alpha", 1),
-            NodeClass::Worker,
-            HashMap::new(),
-        );
+        let node = NodeInfo::new(test_identity("alpha", 1), NodeClass::Worker, HashMap::new());
         let node_id = node.node_id();
         view.upsert_node(node);
 
@@ -194,11 +194,7 @@ mod tests {
     #[test]
     fn test_cluster_view_mark_failed() {
         let mut view = ClusterView::new();
-        let node = NodeInfo::new(
-            test_identity("alpha", 1),
-            NodeClass::Worker,
-            HashMap::new(),
-        );
+        let node = NodeInfo::new(test_identity("alpha", 1), NodeClass::Worker, HashMap::new());
         let node_id = node.node_id();
         view.upsert_node(node);
 
@@ -211,11 +207,7 @@ mod tests {
     #[test]
     fn test_cluster_view_actor_tracking() {
         let mut view = ClusterView::new();
-        let node = NodeInfo::new(
-            test_identity("alpha", 1),
-            NodeClass::Worker,
-            HashMap::new(),
-        );
+        let node = NodeInfo::new(test_identity("alpha", 1), NodeClass::Worker, HashMap::new());
         let node_id = node.node_id();
         view.upsert_node(node);
 

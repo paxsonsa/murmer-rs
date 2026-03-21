@@ -15,9 +15,11 @@
 //! 13. Blip avoidance skips transient actors in the oplog
 //! 14. Restart policies with limits and backoff
 //! 15. Router round-robin and broadcast
+//! 16. Auto-generated message structs from handler params
+//! 17. Extension trait for ergonomic endpoint usage
 
 use murmer::prelude::*;
-use murmer_macros::{Message, handlers};
+use murmer_macros::handlers;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -38,25 +40,8 @@ impl Actor for CounterActor {
 }
 
 // =============================================================================
-// MESSAGES — derive does the boilerplate
+// RESPONSE TYPES (complex types that can't be auto-generated)
 // =============================================================================
-
-/// Increment the counter by an amount. Returns the new total.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = i64, remote = "counter::Increment")]
-pub struct Increment {
-    pub amount: i64,
-}
-
-/// Query the current count.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = i64, remote = "counter::GetCount")]
-pub struct GetCount;
-
-/// Query the counter's name and count together.
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = CounterInfo, remote = "counter::GetInfo")]
-pub struct GetInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CounterInfo {
@@ -65,7 +50,7 @@ pub struct CounterInfo {
 }
 
 // =============================================================================
-// HANDLER IMPL — the proc macro generates everything from this
+// HANDLER IMPL — auto-generates message structs + extension trait
 // =============================================================================
 
 #[handlers]
@@ -75,29 +60,19 @@ impl CounterActor {
         &mut self,
         _ctx: &ActorContext<Self>,
         state: &mut CounterState,
-        msg: Increment,
+        amount: i64,
     ) -> i64 {
-        state.count += msg.amount;
+        state.count += amount;
         state.count
     }
 
     #[handler]
-    fn get_count(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut CounterState,
-        _msg: GetCount,
-    ) -> i64 {
+    fn get_count(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState) -> i64 {
         state.count
     }
 
     #[handler]
-    fn get_info(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut CounterState,
-        _msg: GetInfo,
-    ) -> CounterInfo {
+    fn get_info(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState) -> CounterInfo {
         CounterInfo {
             name: state.name.clone(),
             count: state.count,
@@ -132,7 +107,7 @@ mod tests {
     };
 
     // -------------------------------------------------------------------------
-    // Test 1: Local actor via receptionist
+    // Test 1: Local actor via receptionist (using extension trait)
     // -------------------------------------------------------------------------
     #[tokio::test]
     async fn test_local_actor_via_receptionist() {
@@ -155,13 +130,13 @@ mod tests {
         let event = events.recv().await.unwrap();
         assert!(matches!(event, ActorEvent::Registered { .. }));
 
-        // Send via the returned endpoint
-        let result = endpoint.send(Increment { amount: 5 }).await.unwrap();
+        // Send via extension trait
+        let result = endpoint.increment(5).await.unwrap();
         assert_eq!(result, 5);
 
         // Lookup the SAME actor from the receptionist — caller provides the type
         let looked_up = receptionist.lookup::<CounterActor>("counter/main").unwrap();
-        let result = looked_up.send(GetCount).await.unwrap();
+        let result = looked_up.get_count().await.unwrap();
         assert_eq!(result, 5);
 
         // Wrong type lookup returns None
@@ -232,20 +207,17 @@ mod tests {
             .lookup::<CounterActor>("counter/worker-0")
             .unwrap();
 
-        // Send messages — IDENTICAL API to local
-        let result = remote_endpoint
-            .send(Increment { amount: 10 })
-            .await
-            .unwrap();
+        // Send messages via extension trait — IDENTICAL API to local
+        let result = remote_endpoint.increment(10).await.unwrap();
         assert_eq!(result, 110);
 
-        let result = remote_endpoint.send(Increment { amount: 7 }).await.unwrap();
+        let result = remote_endpoint.increment(7).await.unwrap();
         assert_eq!(result, 117);
 
-        let result = remote_endpoint.send(GetCount).await.unwrap();
+        let result = remote_endpoint.get_count().await.unwrap();
         assert_eq!(result, 117);
 
-        let info = remote_endpoint.send(GetInfo).await.unwrap();
+        let info = remote_endpoint.get_info().await.unwrap();
         assert_eq!(
             info,
             CounterInfo {
@@ -305,7 +277,7 @@ mod tests {
 
         // Other actor still works
         let still_there = receptionist.lookup::<CounterActor>("counter/b").unwrap();
-        let result = still_there.send(GetCount).await.unwrap();
+        let result = still_there.get_count().await.unwrap();
         assert_eq!(result, 0);
     }
 
@@ -334,15 +306,15 @@ mod tests {
         );
 
         // They are independent
-        ep1.send(Increment { amount: 10 }).await.unwrap();
-        ep2.send(Increment { amount: 20 }).await.unwrap();
+        ep1.increment(10).await.unwrap();
+        ep2.increment(20).await.unwrap();
 
         // Lookup each independently
         let l1 = receptionist.lookup::<CounterActor>("counter/1").unwrap();
         let l2 = receptionist.lookup::<CounterActor>("counter/2").unwrap();
 
-        let c1 = l1.send(GetCount).await.unwrap();
-        let c2 = l2.send(GetCount).await.unwrap();
+        let c1 = l1.get_count().await.unwrap();
+        let c2 = l2.get_count().await.unwrap();
         assert_eq!(c1, 10);
         assert_eq!(c2, 20);
     }
@@ -383,8 +355,8 @@ mod tests {
         let ep_b = listing.next().await.unwrap();
 
         // Both should be accessible (order may vary, so collect counts)
-        let count_a = ep_a.send(GetCount).await.unwrap();
-        let count_b = ep_b.send(GetCount).await.unwrap();
+        let count_a = ep_a.get_count().await.unwrap();
+        let count_b = ep_b.get_count().await.unwrap();
         let mut counts = vec![count_a, count_b];
         counts.sort();
         assert_eq!(counts, vec![10, 20]);
@@ -401,7 +373,7 @@ mod tests {
         receptionist.check_in("counter/w3", worker_key.clone());
 
         let ep_c = listing.next().await.unwrap();
-        let count_c = ep_c.send(GetCount).await.unwrap();
+        let count_c = ep_c.get_count().await.unwrap();
         assert_eq!(count_c, 30);
 
         // Wrong type key doesn't match
@@ -437,7 +409,7 @@ mod tests {
         assert!(matches!(ev, ActorEvent::Registered { .. }));
 
         // Verify it's accessible
-        let result = endpoint.send(GetCount).await.unwrap();
+        let result = endpoint.get_count().await.unwrap();
         assert_eq!(result, 0);
 
         // Stop the actor — supervisor receives shutdown, guard triggers deregister
@@ -683,7 +655,7 @@ mod tests {
         // Now all 3 should arrive
         let mut received = Vec::new();
         while let Some(ep) = listing.try_next() {
-            let count = ep.send(GetCount).await.unwrap();
+            let count = ep.get_count().await.unwrap();
             received.push(count);
         }
         received.sort();
@@ -749,7 +721,7 @@ mod tests {
         assert_eq!(register_count, 1);
 
         // And the actor should still work
-        let result = ep.send(GetCount).await.unwrap();
+        let result = ep.get_count().await.unwrap();
         assert_eq!(result, 42);
     }
 
@@ -793,23 +765,25 @@ mod tests {
     }
 
     impl RemoteDispatch for PanicActor {
-        fn dispatch_remote(
-            &mut self,
-            ctx: &ActorContext<Self>,
-            state: &mut PanicActorState,
-            message_type: &str,
-            payload: &[u8],
-        ) -> Result<Vec<u8>, DispatchError> {
-            match message_type {
-                "test::PanicMsg" => {
-                    let (msg, _): (PanicMsg, _) =
-                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                    let result = <Self as Handler<PanicMsg>>::handle(self, ctx, state, msg);
-                    bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+        fn dispatch_remote<'a>(
+            &'a mut self,
+            ctx: &'a ActorContext<Self>,
+            state: &'a mut PanicActorState,
+            message_type: &'a str,
+            payload: &'a [u8],
+        ) -> impl std::future::Future<Output = Result<Vec<u8>, DispatchError>> + Send + 'a {
+            async move {
+                match message_type {
+                    "test::PanicMsg" => {
+                        let (msg, _): (PanicMsg, _) =
+                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                        let result = <Self as Handler<PanicMsg>>::handle(self, ctx, state, msg);
+                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
+                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+                    }
+                    other => Err(DispatchError::UnknownMessageType(other.to_string())),
                 }
-                other => Err(DispatchError::UnknownMessageType(other.to_string())),
             }
         }
     }
@@ -924,10 +898,10 @@ mod tests {
             router.send(Increment { amount: 1 }).await.unwrap();
         }
 
-        // Verify via GetCount on each endpoint
-        let c1 = ep1.send(GetCount).await.unwrap();
-        let c2 = ep2.send(GetCount).await.unwrap();
-        let c3 = ep3.send(GetCount).await.unwrap();
+        // Verify via extension trait on each endpoint
+        let c1 = ep1.get_count().await.unwrap();
+        let c2 = ep2.get_count().await.unwrap();
+        let c3 = ep3.get_count().await.unwrap();
         assert_eq!(c1, 2, "actor 1 should have received 2 increments");
         assert_eq!(c2, 2, "actor 2 should have received 2 increments");
         assert_eq!(c3, 2, "actor 3 should have received 2 increments");
@@ -1039,7 +1013,7 @@ mod tests {
         );
 
         // Verify the actor is working
-        let result = ep.send(GetCount).await.unwrap();
+        let result = ep.get_count().await.unwrap();
         assert_eq!(result, 42);
 
         // Create ActorRef
@@ -1062,11 +1036,822 @@ mod tests {
             .expect("resolve should return Some(endpoint)");
 
         // Send GetCount through resolved endpoint — should work
-        let result = resolved_ep.send(GetCount).await.unwrap();
+        let result = resolved_ep.get_count().await.unwrap();
         assert_eq!(result, 42, "resolved endpoint should access the same actor");
 
         // Also test that resolving a non-existent ref returns None
         let bad_ref = ActorRef::<CounterActor>::new("counter/nonexistent", "local");
         assert!(bad_ref.resolve(&receptionist).is_none());
+    }
+
+    // =========================================================================
+    // NEW MACRO SYSTEM TESTS
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // Test 16: Auto-generated message struct works with send()
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_auto_generated_message_struct() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start(
+            "counter/auto-gen",
+            CounterActor,
+            CounterState {
+                count: 0,
+                name: "auto-gen".to_string(),
+            },
+        );
+
+        // Increment is an auto-generated struct from the handler params
+        let result = ep.send(Increment { amount: 42 }).await.unwrap();
+        assert_eq!(result, 42);
+
+        // GetCount is an auto-generated unit struct
+        let count = ep.send(GetCount).await.unwrap();
+        assert_eq!(count, 42);
+
+        // GetInfo is also auto-generated (unit struct returning complex type)
+        let info = ep.send(GetInfo).await.unwrap();
+        assert_eq!(
+            info,
+            CounterInfo {
+                name: "auto-gen".to_string(),
+                count: 42
+            }
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 17: Extension trait methods work
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_extension_trait_methods() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start(
+            "counter/ext",
+            CounterActor,
+            CounterState {
+                count: 100,
+                name: "ext-test".to_string(),
+            },
+        );
+
+        // Extension trait: endpoint.increment(amount) instead of endpoint.send(Increment { amount })
+        let result = ep.increment(5).await.unwrap();
+        assert_eq!(result, 105);
+
+        let result = ep.increment(-10).await.unwrap();
+        assert_eq!(result, 95);
+
+        // Unit struct handler via extension trait
+        let count = ep.get_count().await.unwrap();
+        assert_eq!(count, 95);
+
+        let info = ep.get_info().await.unwrap();
+        assert_eq!(info.name, "ext-test");
+        assert_eq!(info.count, 95);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 18: ctx.spawn() fire-and-forget
+    // -------------------------------------------------------------------------
+    #[derive(Debug)]
+    struct SpawnTestActor;
+
+    struct SpawnTestState {
+        value: Arc<std::sync::atomic::AtomicI64>,
+    }
+
+    impl Actor for SpawnTestActor {
+        type State = SpawnTestState;
+    }
+
+    #[handlers]
+    impl SpawnTestActor {
+        #[handler]
+        fn trigger_spawn(&mut self, ctx: &ActorContext<Self>, state: &mut SpawnTestState) {
+            let value = state.value.clone();
+            ctx.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                value.store(42, Ordering::SeqCst);
+            });
+        }
+
+        #[handler]
+        fn get_value(&mut self, _ctx: &ActorContext<Self>, state: &mut SpawnTestState) -> i64 {
+            state.value.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ctx_spawn_fire_and_forget() {
+        let receptionist = Receptionist::new();
+        let value = Arc::new(std::sync::atomic::AtomicI64::new(0));
+
+        let ep = receptionist.start(
+            "spawn/test",
+            SpawnTestActor,
+            SpawnTestState {
+                value: value.clone(),
+            },
+        );
+
+        // Trigger the spawn
+        ep.trigger_spawn().await.unwrap();
+
+        // Value should still be 0 (spawn is async, hasn't completed yet)
+        assert_eq!(value.load(Ordering::SeqCst), 0);
+
+        // Wait for the spawned task to complete
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now it should be 42
+        assert_eq!(value.load(Ordering::SeqCst), 42);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 19: Async handler with .await inside
+    // -------------------------------------------------------------------------
+    #[derive(Debug)]
+    struct AsyncActor;
+
+    struct AsyncActorState {
+        data: String,
+    }
+
+    impl Actor for AsyncActor {
+        type State = AsyncActorState;
+    }
+
+    #[handlers]
+    impl AsyncActor {
+        #[handler]
+        async fn fetch_delayed(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            state: &mut AsyncActorState,
+            delay_ms: u64,
+        ) -> String {
+            // This .await yields the tokio thread — the whole point of async handlers
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            format!("fetched: {}", state.data)
+        }
+
+        #[handler]
+        fn get_data(&mut self, _ctx: &ActorContext<Self>, state: &mut AsyncActorState) -> String {
+            state.data.clone()
+        }
+
+        #[handler]
+        async fn set_data(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            state: &mut AsyncActorState,
+            new_data: String,
+        ) {
+            // Async handler that modifies state
+            tokio::task::yield_now().await;
+            state.data = new_data;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_handler_with_await() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start(
+            "async/test",
+            AsyncActor,
+            AsyncActorState {
+                data: "hello".to_string(),
+            },
+        );
+
+        // Async handler that sleeps
+        let result = ep.fetch_delayed(10).await.unwrap();
+        assert_eq!(result, "fetched: hello");
+
+        // Sync handler on same actor
+        let data = ep.get_data().await.unwrap();
+        assert_eq!(data, "hello");
+
+        // Async handler that modifies state
+        ep.set_data("world".to_string()).await.unwrap();
+        let data = ep.get_data().await.unwrap();
+        assert_eq!(data, "world");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 20: Mixed sync/async handlers on same actor
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_mixed_sync_async_handlers() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start(
+            "mixed/test",
+            AsyncActor,
+            AsyncActorState {
+                data: "initial".to_string(),
+            },
+        );
+
+        // Sync → async → sync → verify ordering preserved
+        let d1 = ep.get_data().await.unwrap();
+        assert_eq!(d1, "initial");
+
+        ep.set_data("updated".to_string()).await.unwrap();
+        let d2 = ep.get_data().await.unwrap();
+        assert_eq!(d2, "updated");
+
+        let result = ep.fetch_delayed(1).await.unwrap();
+        assert_eq!(result, "fetched: updated");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 21: Yield budget doesn't break message ordering
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_yield_budget_message_ordering() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start(
+            "counter/ordering",
+            CounterActor,
+            CounterState {
+                count: 0,
+                name: "ordering".to_string(),
+            },
+        );
+
+        // Send 200 increments (exceeds 64-message yield budget)
+        for i in 1..=200 {
+            let result = ep.increment(1).await.unwrap();
+            assert_eq!(result, i, "message {i} should produce count {i}");
+        }
+
+        let final_count = ep.get_count().await.unwrap();
+        assert_eq!(final_count, 200);
+    }
+
+    // =========================================================================
+    // Reply Control Tests (ctx.reply, ctx.reply_sender, ctx.forward)
+    // =========================================================================
+
+    // -- Test actors for reply control --
+
+    /// An actor that demonstrates ctx.reply() for early reply.
+    #[derive(Debug)]
+    struct ReplyControlActor;
+
+    struct ReplyControlState {
+        side_effect_done: bool,
+    }
+
+    impl Actor for ReplyControlActor {
+        type State = ReplyControlState;
+    }
+
+    // Messages for reply control tests
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct ReplyEarly;
+    impl Message for ReplyEarly {
+        type Result = String;
+    }
+    impl RemoteMessage for ReplyEarly {
+        const TYPE_ID: &'static str = "test::ReplyEarly";
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct DeferReply;
+    impl Message for DeferReply {
+        type Result = String;
+    }
+    impl RemoteMessage for DeferReply {
+        const TYPE_ID: &'static str = "test::DeferReply";
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct DoubleReply;
+    impl Message for DoubleReply {
+        type Result = String;
+    }
+    impl RemoteMessage for DoubleReply {
+        const TYPE_ID: &'static str = "test::DoubleReply";
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct NormalReply;
+    impl Message for NormalReply {
+        type Result = String;
+    }
+    impl RemoteMessage for NormalReply {
+        const TYPE_ID: &'static str = "test::NormalReply";
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CheckSideEffect;
+    impl Message for CheckSideEffect {
+        type Result = bool;
+    }
+    impl RemoteMessage for CheckSideEffect {
+        const TYPE_ID: &'static str = "test::CheckSideEffect";
+    }
+
+    impl Handler<ReplyEarly> for ReplyControlActor {
+        fn handle(
+            &mut self,
+            ctx: &ActorContext<Self>,
+            state: &mut ReplyControlState,
+            _msg: ReplyEarly,
+        ) -> String {
+            ctx.reply("early response".to_string());
+            state.side_effect_done = true;
+            String::new() // discarded
+        }
+    }
+
+    impl Handler<DeferReply> for ReplyControlActor {
+        fn handle(
+            &mut self,
+            ctx: &ActorContext<Self>,
+            _state: &mut ReplyControlState,
+            _msg: DeferReply,
+        ) -> String {
+            let sender = ctx.reply_sender::<String>();
+            ctx.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                sender.send("deferred!".to_string());
+            });
+            String::new() // discarded
+        }
+    }
+
+    impl Handler<DoubleReply> for ReplyControlActor {
+        fn handle(
+            &mut self,
+            ctx: &ActorContext<Self>,
+            _state: &mut ReplyControlState,
+            _msg: DoubleReply,
+        ) -> String {
+            let first = ctx.reply("first".to_string());
+            let second = ctx.reply("second".to_string());
+            assert!(first, "first reply should succeed");
+            assert!(!second, "second reply should be no-op");
+            String::new() // discarded
+        }
+    }
+
+    impl Handler<NormalReply> for ReplyControlActor {
+        fn handle(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            _state: &mut ReplyControlState,
+            _msg: NormalReply,
+        ) -> String {
+            "normal return value".to_string()
+        }
+    }
+
+    impl Handler<CheckSideEffect> for ReplyControlActor {
+        fn handle(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            state: &mut ReplyControlState,
+            _msg: CheckSideEffect,
+        ) -> bool {
+            state.side_effect_done
+        }
+    }
+
+    impl RemoteDispatch for ReplyControlActor {
+        async fn dispatch_remote(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            _state: &mut ReplyControlState,
+            _message_type: &str,
+            _payload: &[u8],
+        ) -> Result<Vec<u8>, DispatchError> {
+            Err(DispatchError::UnknownMessageType(
+                "not used in reply control tests".into(),
+            ))
+        }
+    }
+
+    // -- Forwarding target actor --
+
+    #[derive(Debug)]
+    struct ForwardTarget;
+
+    struct ForwardTargetState {
+        value: i64,
+    }
+
+    impl Actor for ForwardTarget {
+        type State = ForwardTargetState;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct AddAndReturn {
+        amount: i64,
+    }
+    impl Message for AddAndReturn {
+        type Result = i64;
+    }
+    impl RemoteMessage for AddAndReturn {
+        const TYPE_ID: &'static str = "test::AddAndReturn";
+    }
+
+    impl Handler<AddAndReturn> for ForwardTarget {
+        fn handle(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            state: &mut ForwardTargetState,
+            msg: AddAndReturn,
+        ) -> i64 {
+            state.value += msg.amount;
+            state.value
+        }
+    }
+
+    impl RemoteDispatch for ForwardTarget {
+        async fn dispatch_remote(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            _state: &mut ForwardTargetState,
+            _message_type: &str,
+            _payload: &[u8],
+        ) -> Result<Vec<u8>, DispatchError> {
+            Err(DispatchError::UnknownMessageType(
+                "not used in reply control tests".into(),
+            ))
+        }
+    }
+
+    // -- Forwarder actor that delegates to ForwardTarget --
+
+    #[derive(Debug)]
+    struct ForwarderActor;
+
+    struct ForwarderState {
+        target: Endpoint<ForwardTarget>,
+    }
+
+    impl Actor for ForwarderActor {
+        type State = ForwarderState;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct ForwardAdd {
+        amount: i64,
+    }
+    impl Message for ForwardAdd {
+        type Result = i64;
+    }
+    impl RemoteMessage for ForwardAdd {
+        const TYPE_ID: &'static str = "test::ForwardAdd";
+    }
+
+    impl Handler<ForwardAdd> for ForwarderActor {
+        fn handle(
+            &mut self,
+            ctx: &ActorContext<Self>,
+            state: &mut ForwarderState,
+            msg: ForwardAdd,
+        ) -> i64 {
+            ctx.forward(
+                &state.target,
+                AddAndReturn {
+                    amount: msg.amount,
+                },
+            );
+            0 // discarded — target's response goes to original caller
+        }
+    }
+
+    impl RemoteDispatch for ForwarderActor {
+        async fn dispatch_remote(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            _state: &mut ForwarderState,
+            _message_type: &str,
+            _payload: &[u8],
+        ) -> Result<Vec<u8>, DispatchError> {
+            Err(DispatchError::UnknownMessageType(
+                "not used in reply control tests".into(),
+            ))
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: ctx.reply() sends early response, handler continues
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_ctx_reply_early() {
+        let receptionist = Receptionist::new();
+
+        let ep = receptionist.start(
+            "reply-control/early",
+            ReplyControlActor,
+            ReplyControlState {
+                side_effect_done: false,
+            },
+        );
+
+        // reply() sends "early response" immediately
+        let resp = ep.send(ReplyEarly).await.unwrap();
+        assert_eq!(resp, "early response");
+
+        // Side effect should have completed (handler continues after reply)
+        let done = ep.send(CheckSideEffect).await.unwrap();
+        assert!(done, "side effect should be done after handler completes");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: ctx.reply_sender() extracts raw channel for deferred reply
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_ctx_reply_sender() {
+        let receptionist = Receptionist::new();
+
+        let ep = receptionist.start(
+            "reply-control/deferred",
+            ReplyControlActor,
+            ReplyControlState {
+                side_effect_done: false,
+            },
+        );
+
+        // Handler spawns a task that replies after 50ms
+        let resp = ep.send(DeferReply).await.unwrap();
+        assert_eq!(resp, "deferred!");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: ctx.forward() delegates reply to another actor
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_ctx_forward_local() {
+        let receptionist = Receptionist::new();
+
+        // Start the target actor
+        let target_ep = receptionist.start(
+            "forward/target",
+            ForwardTarget,
+            ForwardTargetState { value: 100 },
+        );
+
+        // Start the forwarder with a reference to the target
+        let forwarder_ep = receptionist.start(
+            "forward/router",
+            ForwarderActor,
+            ForwarderState {
+                target: target_ep.clone(),
+            },
+        );
+
+        // Send to forwarder — it forwards to target, we get target's response
+        let result = forwarder_ep.send(ForwardAdd { amount: 42 }).await.unwrap();
+        assert_eq!(result, 142, "should get target's response (100 + 42)");
+
+        // Target's state should be updated
+        let target_val = target_ep.send(AddAndReturn { amount: 0 }).await.unwrap();
+        assert_eq!(target_val, 142, "target's state should reflect the forwarded message");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: default behavior unchanged — handlers that don't use ctx.reply()
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_reply_default_behavior() {
+        let receptionist = Receptionist::new();
+
+        let ep = receptionist.start(
+            "reply-control/normal",
+            ReplyControlActor,
+            ReplyControlState {
+                side_effect_done: false,
+            },
+        );
+
+        // Handler returns normally without using ctx.reply()
+        let resp = ep.send(NormalReply).await.unwrap();
+        assert_eq!(resp, "normal return value");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: double reply — second ctx.reply() is a no-op
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_double_reply_ignored() {
+        let receptionist = Receptionist::new();
+
+        let ep = receptionist.start(
+            "reply-control/double",
+            ReplyControlActor,
+            ReplyControlState {
+                side_effect_done: false,
+            },
+        );
+
+        // Handler calls reply() twice — first wins, second is no-op
+        let resp = ep.send(DoubleReply).await.unwrap();
+        assert_eq!(resp, "first", "first reply should win");
+    }
+
+    // =========================================================================
+    // Pool Router Tests (reactive router with WatchedListing)
+    // =========================================================================
+
+    use murmer::{ListingEvent, PoolRouter};
+
+    // -------------------------------------------------------------------------
+    // Test: PoolRouter auto-populates from checked-in actors
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_pool_router_basic_routing() {
+        let receptionist = Receptionist::new();
+        let worker_key = ReceptionKey::<CounterActor>::new("pool-workers");
+
+        // Start actors and check them in
+        let _ep1 = receptionist.start(
+            "pool/w1",
+            CounterActor,
+            CounterState { count: 0, name: "w1".into() },
+        );
+        receptionist.check_in("pool/w1", worker_key.clone());
+
+        let _ep2 = receptionist.start(
+            "pool/w2",
+            CounterActor,
+            CounterState { count: 0, name: "w2".into() },
+        );
+        receptionist.check_in("pool/w2", worker_key.clone());
+
+        // Create pool router — should backfill with both workers
+        let pool = PoolRouter::new(&receptionist, worker_key, RoutingStrategy::RoundRobin);
+
+        // Give the background task a moment to process backfill
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(pool.len(), 2, "pool should have 2 workers");
+
+        // Round-robin send — both workers should get messages
+        pool.send(Increment { amount: 10 }).await.unwrap();
+        pool.send(Increment { amount: 10 }).await.unwrap();
+
+        // Verify both workers received a message
+        let ep1 = receptionist.lookup::<CounterActor>("pool/w1").unwrap();
+        let ep2 = receptionist.lookup::<CounterActor>("pool/w2").unwrap();
+        let c1 = ep1.get_count().await.unwrap();
+        let c2 = ep2.get_count().await.unwrap();
+        assert_eq!(c1 + c2, 20, "total increments should be 20");
+        assert!(c1 > 0 && c2 > 0, "round-robin should hit both workers");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: PoolRouter tracks new actors added after creation
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_pool_router_dynamic_add() {
+        let receptionist = Receptionist::new();
+        let worker_key = ReceptionKey::<CounterActor>::new("dynamic-workers");
+
+        // Create pool router first — empty
+        let pool = PoolRouter::new(&receptionist, worker_key.clone(), RoutingStrategy::RoundRobin);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(pool.len(), 0, "pool should start empty");
+
+        // Now start an actor and check it in
+        let _ep = receptionist.start(
+            "dynamic/w1",
+            CounterActor,
+            CounterState { count: 0, name: "w1".into() },
+        );
+        receptionist.check_in("dynamic/w1", worker_key.clone());
+
+        // Give the background watcher time to process
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(pool.len(), 1, "pool should now have 1 worker");
+
+        let result = pool.send(Increment { amount: 42 }).await.unwrap();
+        assert_eq!(result, 42);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: PoolRouter removes actors that deregister
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_pool_router_removal_on_stop() {
+        let receptionist = Receptionist::new();
+        let worker_key = ReceptionKey::<CounterActor>::new("removal-workers");
+
+        // Start two workers
+        let _ep1 = receptionist.start(
+            "removal/w1",
+            CounterActor,
+            CounterState { count: 0, name: "w1".into() },
+        );
+        receptionist.check_in("removal/w1", worker_key.clone());
+
+        let _ep2 = receptionist.start(
+            "removal/w2",
+            CounterActor,
+            CounterState { count: 0, name: "w2".into() },
+        );
+        receptionist.check_in("removal/w2", worker_key.clone());
+
+        let pool = PoolRouter::new(&receptionist, worker_key, RoutingStrategy::RoundRobin);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.len(), 2);
+
+        // Stop one worker
+        receptionist.stop("removal/w1");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(pool.len(), 1, "pool should shrink to 1 after stop");
+        assert_eq!(pool.labels(), vec!["removal/w2".to_string()]);
+
+        // Remaining worker still works
+        let result = pool.send(Increment { amount: 7 }).await.unwrap();
+        assert_eq!(result, 7);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: PoolRouter broadcast sends to all pool members
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_pool_router_broadcast() {
+        let receptionist = Receptionist::new();
+        let worker_key = ReceptionKey::<CounterActor>::new("broadcast-workers");
+
+        for i in 0..3 {
+            let label = format!("broadcast/w{i}");
+            receptionist.start(
+                &label,
+                CounterActor,
+                CounterState { count: 0, name: format!("w{i}") },
+            );
+            receptionist.check_in(&label, worker_key.clone());
+        }
+
+        let pool = PoolRouter::new(&receptionist, worker_key, RoutingStrategy::RoundRobin);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.len(), 3);
+
+        let results = pool.broadcast(Increment { amount: 5 }).await;
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert_eq!(*r.as_ref().unwrap(), 5);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: WatchedListing streams both adds and removes
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_watched_listing_events() {
+        let receptionist = Receptionist::new();
+        let worker_key = ReceptionKey::<CounterActor>::new("watched-workers");
+
+        // Start an actor first
+        receptionist.start(
+            "watched/w1",
+            CounterActor,
+            CounterState { count: 0, name: "w1".into() },
+        );
+        receptionist.check_in("watched/w1", worker_key.clone());
+
+        // Subscribe — should get backfill
+        let mut watched = receptionist.watched_listing(worker_key.clone());
+
+        let event = watched.next().await.unwrap();
+        match event {
+            ListingEvent::Added { label, .. } => assert_eq!(label, "watched/w1"),
+            ListingEvent::Removed { .. } => panic!("expected Added event"),
+        }
+
+        // Add another
+        receptionist.start(
+            "watched/w2",
+            CounterActor,
+            CounterState { count: 0, name: "w2".into() },
+        );
+        receptionist.check_in("watched/w2", worker_key.clone());
+
+        let event = watched.next().await.unwrap();
+        match event {
+            ListingEvent::Added { label, .. } => assert_eq!(label, "watched/w2"),
+            ListingEvent::Removed { .. } => panic!("expected Added event"),
+        }
+
+        // Stop one — should get Removed
+        receptionist.stop("watched/w1");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let event = watched.try_next().unwrap();
+        match event {
+            ListingEvent::Removed { label } => assert_eq!(label, "watched/w1"),
+            ListingEvent::Added { .. } => panic!("expected Removed event"),
+        }
     }
 }

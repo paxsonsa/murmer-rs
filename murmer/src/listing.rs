@@ -160,3 +160,113 @@ impl<A: Actor + 'static> ErasedListingSender for TypedListingSender<A> {
         self.tx.send(endpoint).is_ok()
     }
 }
+
+// =============================================================================
+// WATCHED LISTING — streams additions AND removals with labels
+// =============================================================================
+
+/// An event from a watched listing: an actor was added or removed from the group.
+pub enum ListingEvent<A: Actor> {
+    /// A new actor checked in with the matching key.
+    Added {
+        label: String,
+        endpoint: Endpoint<A>,
+    },
+    /// An actor was deregistered (stopped, crashed, or departed).
+    Removed { label: String },
+}
+
+/// A listing that streams both additions and removals, with labels.
+///
+/// Use this to build reactive pools that automatically track membership
+/// changes. Created via [`Receptionist::watched_listing`].
+pub struct WatchedListing<A: Actor> {
+    rx: mpsc::UnboundedReceiver<ListingEvent<A>>,
+}
+
+impl<A: Actor> WatchedListing<A> {
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<ListingEvent<A>>) -> Self {
+        Self { rx }
+    }
+
+    /// Await the next event. Returns None when the subscription is closed.
+    pub async fn next(&mut self) -> Option<ListingEvent<A>> {
+        self.rx.recv().await
+    }
+
+    /// Try to receive without blocking.
+    pub fn try_next(&mut self) -> Option<ListingEvent<A>> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Type-erased watched listing sender. Supports both add and remove events.
+pub(crate) trait ErasedWatchedListingSender: Send + Sync {
+    fn key_id(&self) -> &str;
+    fn actor_type_id(&self) -> TypeId;
+    /// Send an Added event from a registry entry.
+    fn try_send_added(&self, entry: &ActorEntry) -> bool;
+    /// Send a Removed event for the given label.
+    fn try_send_removed(&self, label: &str) -> bool;
+    fn is_closed(&self) -> bool;
+}
+
+pub(crate) struct TypedWatchedListingSender<A: Actor + 'static> {
+    pub(crate) key_id: String,
+    pub(crate) tx: mpsc::UnboundedSender<ListingEvent<A>>,
+}
+
+impl<A: Actor + 'static> ErasedWatchedListingSender for TypedWatchedListingSender<A> {
+    fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    fn actor_type_id(&self) -> TypeId {
+        TypeId::of::<A>()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    fn try_send_added(&self, entry: &ActorEntry) -> bool {
+        if entry.type_id != TypeId::of::<A>() {
+            return true; // wrong type, keep subscription alive
+        }
+
+        let endpoint = match &entry.location {
+            EntryLocation::Local {
+                endpoint_factory, ..
+            } => {
+                let any_ep = endpoint_factory.create_endpoint_any();
+                match any_ep.downcast::<Endpoint<A>>() {
+                    Ok(ep) => *ep,
+                    Err(_) => return true,
+                }
+            }
+            EntryLocation::Remote {
+                wire_tx,
+                response_registry,
+            } => Endpoint::remote(
+                entry.label.clone(),
+                wire_tx.clone(),
+                response_registry.clone(),
+            ),
+        };
+
+        self.tx
+            .send(ListingEvent::Added {
+                label: entry.label.clone(),
+                endpoint,
+            })
+            .is_ok()
+    }
+
+    fn try_send_removed(&self, label: &str) -> bool {
+        self.tx
+            .send(ListingEvent::Removed {
+                label: label.to_string(),
+            })
+            .is_ok()
+    }
+}

@@ -282,7 +282,9 @@ impl Coordinator {
         }
 
         // Remove from pending spawns
-        state.pending_spawns.retain(|_, ps| ps.spec_label != msg.label);
+        state
+            .pending_spawns
+            .retain(|_, ps| ps.spec_label != msg.label);
 
         // Remove from waiting
         state.waiting_for_return.remove(&msg.label);
@@ -614,7 +616,11 @@ impl CoordinatorState {
                 }
                 _ => {
                     // Redistribute (or WaitForReturn on graceful departure)
-                    let reason = if graceful { "graceful departure" } else { "failure" };
+                    let reason = if graceful {
+                        "graceful departure"
+                    } else {
+                        "failure"
+                    };
                     tracing::info!("Redistributing {label} (node {node_id} {reason})");
 
                     if let Some(decision) = placement::select_node(
@@ -622,8 +628,7 @@ impl CoordinatorState {
                         &spec,
                         &self.cluster_view,
                     ) {
-                        self.cluster_view
-                            .add_actor(&decision.node_id, &label);
+                        self.cluster_view.add_actor(&decision.node_id, &label);
                         tracing::info!(
                             "Re-placed {label} on {} ({})",
                             decision.node_id,
@@ -840,10 +845,9 @@ mod tests {
 
         let result = coordinator
             .send(SubmitSpec {
-                spec: ActorSpec::new("worker/0", "app::Worker")
-                    .with_crash_strategy(CrashStrategy::WaitForReturn(
-                        std::time::Duration::from_millis(50),
-                    )),
+                spec: ActorSpec::new("worker/0", "app::Worker").with_crash_strategy(
+                    CrashStrategy::WaitForReturn(std::time::Duration::from_millis(50)),
+                ),
             })
             .await
             .unwrap()
@@ -882,10 +886,9 @@ mod tests {
 
         let result = coordinator
             .send(SubmitSpec {
-                spec: ActorSpec::new("worker/0", "app::Worker")
-                    .with_crash_strategy(CrashStrategy::WaitForReturn(
-                        std::time::Duration::from_secs(60),
-                    )),
+                spec: ActorSpec::new("worker/0", "app::Worker").with_crash_strategy(
+                    CrashStrategy::WaitForReturn(std::time::Duration::from_secs(60)),
+                ),
             })
             .await
             .unwrap()

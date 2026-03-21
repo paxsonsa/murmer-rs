@@ -67,15 +67,14 @@ pub async fn run_actor_stream_writer(
         read_responses(recv, registry_clone, label_clone).await;
     });
 
-    // Write invocations to the stream
+    // Write invocations to the stream using the lean wire format.
+    // The payload bytes are written directly — no double-serialization.
     while let Some(invocation) = invocation_rx.recv().await {
-        let frame = match framing::encode_message(&invocation) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("Failed to encode invocation for {actor_label}: {e}");
-                continue;
-            }
-        };
+        let frame = framing::encode_invocation_frame(
+            invocation.call_id,
+            &invocation.message_type,
+            &invocation.payload,
+        );
         if let Err(e) = send.write_all(&frame).await {
             tracing::error!("Actor stream write failed for {actor_label}: {e} — closing stream");
             break;
@@ -109,8 +108,14 @@ async fn read_responses(
             Ok(Some(n)) => {
                 codec.push_data(&buf[..n]);
                 while let Ok(Some(frame)) = codec.next_frame() {
-                    match framing::decode_message::<RemoteResponse>(&frame) {
-                        Ok(response) => {
+                    match framing::decode_response_frame(&frame) {
+                        Ok(decoded) => {
+                            let response = RemoteResponse {
+                                call_id: decoded.call_id,
+                                result: decoded
+                                    .result
+                                    .map(|bytes| bytes.to_vec()),
+                            };
                             response_registry.complete(response);
                         }
                         Err(e) => {
@@ -178,48 +183,60 @@ pub async fn handle_actor_stream(
         Some(tx) => tx,
         None => {
             tracing::warn!("Actor stream for unknown actor: {actor_label}");
-            // Send error response for any pending invocations
-            let err_response = RemoteResponse {
-                call_id: 0,
-                result: Err(format!("actor not found: {actor_label}")),
-            };
-            if let Ok(frame) = framing::encode_message(&err_response) {
-                let _ = send.write_all(&frame).await;
-            }
+            let frame = framing::encode_response_frame(
+                0,
+                &Err(format!("actor not found: {actor_label}")),
+            );
+            let _ = send.write_all(&frame).await;
             return;
         }
     };
 
     tracing::debug!("Handling actor stream for {actor_label}");
 
-    // Step 3: Read invocations and dispatch
+    // Step 3: Read invocations and dispatch (lean wire format)
     loop {
         match recv.read(&mut buf).await {
             Ok(Some(n)) => {
                 codec.push_data(&buf[..n]);
                 while let Ok(Some(frame)) = codec.next_frame() {
-                    match framing::decode_message::<RemoteInvocation>(&frame) {
-                        Ok(invocation) => {
+                    match framing::decode_invocation_frame(&frame) {
+                        Ok(decoded) => {
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let request = DispatchRequest {
-                                invocation,
+                                invocation: RemoteInvocation {
+                                    call_id: decoded.call_id,
+                                    actor_label: actor_label.clone(),
+                                    message_type: decoded.message_type.to_string(),
+                                    payload: decoded.payload.to_vec(),
+                                },
                                 respond_to: resp_tx,
                             };
 
-                            if dispatch_tx.send(request).is_ok()
-                                && let Ok(response) = resp_rx.await
-                                && let Ok(frame) = framing::encode_message(&response)
-                                && let Err(e) = send.write_all(&frame).await
-                            {
-                                tracing::warn!("Failed to send response for {actor_label}: {e}");
+                            if dispatch_tx.send(request).is_err() {
+                                tracing::warn!(
+                                    "Dispatch channel closed for {actor_label}"
+                                );
                                 return;
-                            } else {
-                                tracing::warn!("Dispatch channel closed for {actor_label}");
-                                return;
+                            }
+
+                            if let Ok(response) = resp_rx.await {
+                                let frame = framing::encode_response_frame(
+                                    response.call_id,
+                                    &response.result,
+                                );
+                                if let Err(e) = send.write_all(&frame).await {
+                                    tracing::warn!(
+                                        "Failed to send response for {actor_label}: {e}"
+                                    );
+                                    return;
+                                }
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to decode invocation for {actor_label}: {e}");
+                            tracing::warn!(
+                                "Failed to decode invocation for {actor_label}: {e}"
+                            );
                         }
                     }
                 }

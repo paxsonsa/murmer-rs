@@ -156,11 +156,7 @@ mod tests {
     #[test]
     fn test_placement_constraints_empty_allows_all() {
         let constraints = PlacementConstraints::default();
-        assert!(constraints.is_satisfied_by(
-            &NodeClass::Worker,
-            &HashMap::new(),
-            &[],
-        ));
+        assert!(constraints.is_satisfied_by(&NodeClass::Worker, &HashMap::new(), &[],));
     }
 
     #[test]

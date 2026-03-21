@@ -7,7 +7,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::certs;
-use super::config::{NodeClass, NodeIdentity};
+use super::config::{NodeClass, NodeIdentity, TransportTuning};
 use super::error::ClusterError;
 use super::framing::{self, ControlMessage, FrameCodec, HandshakePayload, PROTOCOL_VERSION};
 
@@ -78,6 +78,7 @@ impl Transport {
         type_manifest: Vec<String>,
         node_class: NodeClass,
         node_metadata: HashMap<String, String>,
+        tuning: TransportTuning,
         shutdown: CancellationToken,
     ) -> Result<
         (
@@ -90,11 +91,33 @@ impl Transport {
         let (cert_chain, private_key) = certs::generate_self_signed_cert(&identity)?;
         let mut server_config = certs::create_server_config(cert_chain, private_key)?;
 
-        // Set QUIC idle timeout so dead peers are detected promptly.
+        // Apply QUIC transport parameters from TransportTuning.
+        // Defaults are optimized for LAN actor messaging (sub-ms RTT, many small messages).
         let mut transport_config = quinn::TransportConfig::default();
+
+        // Timing: fast loss detection on LAN, reasonable idle timeout
+        transport_config.initial_rtt(Duration::from_millis(tuning.initial_rtt_ms));
         transport_config.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(Duration::from_secs(10)).expect("valid idle timeout"),
+            quinn::IdleTimeout::try_from(Duration::from_secs(tuning.max_idle_timeout_secs))
+                .expect("valid idle timeout"),
         ));
+        if let Some(interval) = tuning.keep_alive_interval_secs {
+            transport_config.keep_alive_interval(Some(Duration::from_secs(interval)));
+        }
+
+        // Stream limits: each remote actor gets a stream
+        transport_config
+            .max_concurrent_bidi_streams(quinn::VarInt::from_u32(tuning.max_concurrent_bidi_streams));
+
+        // Flow control: sized for LAN (low RTT, less buffering needed)
+        transport_config
+            .stream_receive_window(quinn::VarInt::from_u32(tuning.stream_receive_window));
+        transport_config.receive_window(quinn::VarInt::from_u32(tuning.receive_window));
+        transport_config.send_window(tuning.send_window);
+
+        // MTU: start higher on LAN, let discovery probe further
+        transport_config.initial_mtu(tuning.initial_mtu);
+
         let transport_config = Arc::new(transport_config);
         server_config.transport_config(Arc::clone(&transport_config));
 

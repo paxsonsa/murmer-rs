@@ -24,9 +24,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::actor::{Actor, Handler, RemoteMessage};
+use crate::actor::{Actor, AsyncHandler, Handler, Message, RemoteMessage};
 use crate::wire::{
-    EnvelopeProxy, RemoteInvocation, ResponseRegistry, SendError, TypedEnvelope, next_call_id,
+    AsyncTypedEnvelope, EnvelopeProxy, ForwardedEnvelope, RemoteInvocation, ReplySender,
+    ResponseRegistry, SendError, TypedEnvelope, next_call_id,
 };
 
 // =============================================================================
@@ -151,6 +152,89 @@ impl<A: Actor + 'static> Endpoint<A> {
                     bincode::serde::decode_from_slice(&result_bytes, bincode::config::standard())
                         .map_err(|e| SendError::DeserializationFailed(e.to_string()))?;
                 Ok(result)
+            }
+        }
+    }
+
+    /// Send a message to an async handler. **Identical API for local and remote.**
+    ///
+    /// Like [`send`](Self::send) but dispatches through [`AsyncHandler<M>`] so the
+    /// handler can `.await` inside its body.
+    pub async fn send_async<M>(&self, message: M) -> Result<M::Result, SendError>
+    where
+        A: AsyncHandler<M>,
+        M: RemoteMessage,
+        M::Result: Serialize + DeserializeOwned,
+    {
+        match &self.inner {
+            EndpointInner::Local { mailbox_tx } => {
+                let (tx, rx) = oneshot::channel();
+                let envelope = AsyncTypedEnvelope {
+                    message,
+                    respond_to: tx,
+                };
+                mailbox_tx
+                    .send(Box::new(envelope))
+                    .map_err(|_| SendError::MailboxClosed)?;
+                rx.await.map_err(|_| SendError::ResponseDropped)
+            }
+            EndpointInner::Remote {
+                label,
+                wire_tx,
+                response_registry,
+            } => {
+                // Remote path is identical — serialization doesn't care about sync/async
+                let call_id = next_call_id();
+                let payload = bincode::serde::encode_to_vec(&message, bincode::config::standard())
+                    .map_err(|e| SendError::SerializationFailed(e.to_string()))?;
+
+                let (resp_tx, resp_rx) = oneshot::channel();
+                response_registry.register(call_id, resp_tx);
+
+                let invocation = RemoteInvocation {
+                    call_id,
+                    actor_label: label.clone(),
+                    message_type: M::TYPE_ID.to_string(),
+                    payload,
+                };
+
+                wire_tx
+                    .send(invocation)
+                    .map_err(|_| SendError::WireClosed)?;
+
+                let response = resp_rx.await.map_err(|_| SendError::ResponseDropped)?;
+                let result_bytes = response.result.map_err(SendError::RemoteError)?;
+                let (result, _): (M::Result, _) =
+                    bincode::serde::decode_from_slice(&result_bytes, bincode::config::standard())
+                        .map_err(|e| SendError::DeserializationFailed(e.to_string()))?;
+                Ok(result)
+            }
+        }
+    }
+
+    /// Internal: send a message using an existing `ReplySender` (for `ctx.forward()`).
+    /// Returns true if the envelope was queued successfully.
+    pub(crate) fn send_with_reply_sender<M>(
+        &self,
+        message: M,
+        reply_sender: ReplySender<M::Result>,
+    ) -> bool
+    where
+        A: Handler<M>,
+        M: Message + Send + 'static,
+        M::Result: Send + 'static,
+    {
+        match &self.inner {
+            EndpointInner::Local { mailbox_tx } => {
+                let envelope = ForwardedEnvelope {
+                    message,
+                    reply_sender,
+                };
+                mailbox_tx.send(Box::new(envelope)).is_ok()
+            }
+            EndpointInner::Remote { .. } => {
+                tracing::warn!("ctx.forward() to remote endpoint is not yet supported");
+                false
             }
         }
     }

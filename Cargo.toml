@@ -4,6 +4,7 @@ members = [
     "murmer-macros",
     "murmer-app",
     "murmer-monitor",
+    "murmer-cluster-tests",
     "examples"
 ]
 resolver = "2"

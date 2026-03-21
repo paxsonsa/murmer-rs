@@ -34,7 +34,7 @@
 //! ```
 
 use murmer::prelude::*;
-use murmer_macros::{Message, handlers};
+use murmer_macros::handlers;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{self, BufRead, Write as _};
@@ -63,33 +63,18 @@ impl Actor for ChatRoom {
 }
 
 // =============================================================================
-// MESSAGES
+// RESPONSE TYPES
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = usize, remote = "cluster_chat::PostMessage")]
-struct PostMessage {
-    from: String,
-    text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = Vec<String>, remote = "cluster_chat::GetHistory")]
-struct GetHistory;
-
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = RoomStatus, remote = "cluster_chat::GetStatus")]
-struct GetStatus;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RoomStatus {
+pub struct RoomStatus {
     room_name: String,
     message_count: usize,
     last_message: Option<String>,
 }
 
 // =============================================================================
-// HANDLERS
+// HANDLERS — auto-generates message structs + extension trait
 // =============================================================================
 
 #[handlers]
@@ -99,22 +84,15 @@ impl ChatRoom {
         &mut self,
         _ctx: &ActorContext<Self>,
         state: &mut ChatRoomState,
-        msg: PostMessage,
+        from: String,
+        text: String,
     ) -> usize {
-        state.messages.push(ChatEntry {
-            from: msg.from,
-            text: msg.text,
-        });
+        state.messages.push(ChatEntry { from, text });
         state.messages.len()
     }
 
     #[handler]
-    fn get_history(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut ChatRoomState,
-        _msg: GetHistory,
-    ) -> Vec<String> {
+    fn get_history(&mut self, _ctx: &ActorContext<Self>, state: &mut ChatRoomState) -> Vec<String> {
         state
             .messages
             .iter()
@@ -123,12 +101,7 @@ impl ChatRoom {
     }
 
     #[handler]
-    fn get_status(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut ChatRoomState,
-        _msg: GetStatus,
-    ) -> RoomStatus {
+    fn get_status(&mut self, _ctx: &ActorContext<Self>, state: &mut ChatRoomState) -> RoomStatus {
         RoomStatus {
             room_name: state.room_name.clone(),
             message_count: state.messages.len(),
@@ -200,15 +173,15 @@ async fn run_interactive(system: &System, default_rooms: &[&str]) {
                 match system.lookup::<ChatRoom>(&label) {
                     Some(ep) => {
                         let count = ep
-                            .send(PostMessage {
-                                from: parts[2].into(),
-                                text: parts[3].into(),
-                            })
+                            .post_message(parts[2].into(), parts[3].into())
                             .await
                             .unwrap();
                         println!("  [{} messages in #{}]", count, parts[1]);
                     }
-                    None => println!("  Room '{}' not found. Try 'rooms' to see available rooms.", parts[1]),
+                    None => println!(
+                        "  Room '{}' not found. Try 'rooms' to see available rooms.",
+                        parts[1]
+                    ),
                 }
             }
 
@@ -220,7 +193,7 @@ async fn run_interactive(system: &System, default_rooms: &[&str]) {
                 let label = format!("room/{}", parts[1]);
                 match system.lookup::<ChatRoom>(&label) {
                     Some(ep) => {
-                        let history = ep.send(GetHistory).await.unwrap();
+                        let history = ep.get_history().await.unwrap();
                         if history.is_empty() {
                             println!("  #{} has no messages yet.", parts[1]);
                         } else {
@@ -239,7 +212,7 @@ async fn run_interactive(system: &System, default_rooms: &[&str]) {
                     let label = format!("room/{}", parts[1]);
                     match system.lookup::<ChatRoom>(&label) {
                         Some(ep) => {
-                            let s = ep.send(GetStatus).await.unwrap();
+                            let s = ep.get_status().await.unwrap();
                             println!(
                                 "  #{}: {} messages (last: {})",
                                 s.room_name,
@@ -262,7 +235,7 @@ async fn run_interactive(system: &System, default_rooms: &[&str]) {
                 for name in default_rooms {
                     let label = format!("room/{name}");
                     if let Some(ep) = system.lookup::<ChatRoom>(&label) {
-                        let s = ep.send(GetStatus).await.unwrap();
+                        let s = ep.get_status().await.unwrap();
                         println!("    #{name} — {} messages", s.message_count);
                     }
                 }
@@ -369,7 +342,7 @@ async fn main() {
 
         println!("=== murmer cluster_chat (cluster mode: {node_name} on :{port}) ===\n");
 
-        let system = System::clustered(config, TypeRegistry::new(), SpawnRegistry::new())
+        let system = System::clustered(config, TypeRegistry::from_auto(), SpawnRegistry::new())
             .await
             .expect("failed to start cluster");
 
@@ -401,15 +374,12 @@ mod tests {
         );
 
         let count = room
-            .send(PostMessage {
-                from: "alice".into(),
-                text: "hello".into(),
-            })
+            .post_message("alice".into(), "hello".into())
             .await
             .unwrap();
         assert_eq!(count, 1);
 
-        let status = room.send(GetStatus).await.unwrap();
+        let status = room.get_status().await.unwrap();
         assert_eq!(status.room_name, "test");
         assert_eq!(status.message_count, 1);
     }
@@ -430,7 +400,7 @@ mod tests {
 
         // Lookup by label
         let ep = system.lookup::<ChatRoom>("room/lobby").unwrap();
-        let status = ep.send(GetStatus).await.unwrap();
+        let status = ep.get_status().await.unwrap();
         assert_eq!(status.room_name, "lobby");
 
         // Missing label returns None
@@ -442,15 +412,29 @@ mod tests {
     async fn test_system_multiple_rooms() {
         let system = System::local();
 
-        let a = system.start("room/a", ChatRoom, ChatRoomState { room_name: "a".into(), messages: vec![] });
-        let b = system.start("room/b", ChatRoom, ChatRoomState { room_name: "b".into(), messages: vec![] });
+        let a = system.start(
+            "room/a",
+            ChatRoom,
+            ChatRoomState {
+                room_name: "a".into(),
+                messages: vec![],
+            },
+        );
+        let b = system.start(
+            "room/b",
+            ChatRoom,
+            ChatRoomState {
+                room_name: "b".into(),
+                messages: vec![],
+            },
+        );
 
-        a.send(PostMessage { from: "x".into(), text: "in a".into() }).await.unwrap();
-        b.send(PostMessage { from: "y".into(), text: "in b".into() }).await.unwrap();
-        b.send(PostMessage { from: "z".into(), text: "also b".into() }).await.unwrap();
+        a.post_message("x".into(), "in a".into()).await.unwrap();
+        b.post_message("y".into(), "in b".into()).await.unwrap();
+        b.post_message("z".into(), "also b".into()).await.unwrap();
 
-        assert_eq!(a.send(GetStatus).await.unwrap().message_count, 1);
-        assert_eq!(b.send(GetStatus).await.unwrap().message_count, 2);
+        assert_eq!(a.get_status().await.unwrap().message_count, 1);
+        assert_eq!(b.get_status().await.unwrap().message_count, 2);
     }
 
     /// System::local() + simulated remote wire — proving the same actor code
@@ -474,10 +458,14 @@ mod tests {
 
         // Wire channels simulate the QUIC stream
         let remote_receptionist = Arc::new(Receptionist::new());
-        remote_receptionist.start("room/remote", ChatRoom, ChatRoomState {
-            room_name: "remote".into(),
-            messages: vec![],
-        });
+        remote_receptionist.start(
+            "room/remote",
+            ChatRoom,
+            ChatRoomState {
+                room_name: "remote".into(),
+                messages: vec![],
+            },
+        );
 
         let (wire_tx, wire_rx) = mpsc::unbounded_channel::<RemoteInvocation>();
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<RemoteResponse>();
@@ -502,10 +490,7 @@ mod tests {
         // Same API — caller doesn't know it's remote
         let ep = local_system.lookup::<ChatRoom>("room/remote").unwrap();
         let count = ep
-            .send(PostMessage {
-                from: "user".into(),
-                text: "hello over the wire!".into(),
-            })
+            .post_message("user".into(), "hello over the wire!".into())
             .await
             .unwrap();
         assert_eq!(count, 1);
@@ -515,7 +500,14 @@ mod tests {
     #[tokio::test]
     async fn test_system_shutdown() {
         let system = System::local();
-        system.start("room/temp", ChatRoom, ChatRoomState { room_name: "temp".into(), messages: vec![] });
+        system.start(
+            "room/temp",
+            ChatRoom,
+            ChatRoomState {
+                room_name: "temp".into(),
+                messages: vec![],
+            },
+        );
         system.shutdown().await; // no-op for local, but should not panic
     }
 }

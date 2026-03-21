@@ -14,8 +14,10 @@
 //! On exit, the [`DeregisterGuard`] RAII type automatically removes the actor
 //! from the receptionist and fires any registered watches.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{Actor, ActorContext, RemoteDispatch};
@@ -43,18 +45,23 @@ pub(crate) async fn run_supervisor<A>(
 where
     A: Actor + RemoteDispatch + 'static,
 {
+    let mut msg_count: u64 = 0;
+
     loop {
         tokio::select! {
             msg = mailbox_rx.recv() => {
                 match msg {
                     Some(envelope) => {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            envelope.handle(&ctx, &mut actor, &mut state);
-                        }));
+                        let fut = envelope.handle(&ctx, &mut actor, &mut state);
+                        let result = AssertUnwindSafe(fut).catch_unwind().await;
                         if let Err(panic_info) = result {
                             let msg = extract_panic_message(&panic_info);
                             *exit_reason.lock().unwrap() = TerminationReason::Panicked(msg);
                             break;
+                        }
+                        msg_count += 1;
+                        if msg_count.is_multiple_of(64) {
+                            tokio::task::yield_now().await;
                         }
                     }
                     None => break,
@@ -63,14 +70,13 @@ where
             req = dispatch_rx.recv() => {
                 match req {
                     Some(request) => {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            actor.dispatch_remote(
-                                &ctx,
-                                &mut state,
-                                &request.invocation.message_type,
-                                &request.invocation.payload,
-                            )
-                        }));
+                        let fut = actor.dispatch_remote(
+                            &ctx,
+                            &mut state,
+                            &request.invocation.message_type,
+                            &request.invocation.payload,
+                        );
+                        let result = AssertUnwindSafe(fut).catch_unwind().await;
                         match result {
                             Ok(dispatch_result) => {
                                 let response = RemoteResponse {
@@ -90,6 +96,10 @@ where
                                 *exit_reason.lock().unwrap() = TerminationReason::Panicked(msg);
                                 break;
                             }
+                        }
+                        msg_count += 1;
+                        if msg_count.is_multiple_of(64) {
+                            tokio::task::yield_now().await;
                         }
                     }
                     None => break,
