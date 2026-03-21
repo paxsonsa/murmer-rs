@@ -33,10 +33,13 @@ use murmer::prelude::*;
 use murmer_macros::{Message, handlers};
 use serde::{Deserialize, Serialize};
 
+use murmer::cluster::framing::SpawnRequest;
+
 use crate::election::LeaderElection;
 use crate::error::OrchestratorError;
 use crate::node_info::{ClusterView, NodeInfo};
 use crate::placement::{self, PlacementDecision, PlacementStrategy};
+use crate::spawn_sender::SpawnSender;
 use crate::spec::{ActorSpec, CrashStrategy};
 
 // =============================================================================
@@ -65,6 +68,8 @@ pub struct CoordinatorState {
     pub waiting_for_return: HashMap<String, WaitingSpec>,
     /// Monotonic counter for generating unique request IDs.
     next_request_id: u64,
+    /// Channel for sending spawn requests to the transport layer.
+    spawn_sender: Option<SpawnSender>,
 }
 
 /// A spawn request that's been sent but not yet acknowledged.
@@ -248,7 +253,7 @@ impl Coordinator {
         );
 
         // Track the spec
-        state.specs.insert(label.clone(), msg.spec);
+        state.specs.insert(label.clone(), msg.spec.clone());
 
         // Record as pending — actual placement happens on spawn ack
         let request_id = state.next_request_id();
@@ -259,6 +264,9 @@ impl Coordinator {
                 target_node_id: decision.node_id.clone(),
             },
         );
+
+        // Send the spawn request to the target node
+        state.send_spawn(&decision.node_id, request_id, &msg.spec);
 
         Ok(decision)
     }
@@ -394,15 +402,15 @@ impl Coordinator {
                     msg.node_id,
                     ws.spec.label
                 );
-                // Create a pending spawn rather than phantom-placing
                 let request_id = state.next_request_id();
                 state.pending_spawns.insert(
                     request_id,
                     PendingSpawn {
-                        spec_label: ws.spec.label,
+                        spec_label: ws.spec.label.clone(),
                         target_node_id: msg.node_id.clone(),
                     },
                 );
+                state.send_spawn(&msg.node_id, request_id, &ws.spec);
             }
         }
     }
@@ -496,6 +504,7 @@ impl Coordinator {
                         target_node_id: decision.node_id.clone(),
                     },
                 );
+                state.send_spawn(&decision.node_id, request_id, &ws.spec);
                 tracing::info!(
                     "Re-placed {} on {} after timeout ({})",
                     msg.label,
@@ -533,7 +542,14 @@ impl CoordinatorState {
             pending_spawns: HashMap::new(),
             waiting_for_return: HashMap::new(),
             next_request_id: 0,
+            spawn_sender: None,
         }
+    }
+
+    /// Set the spawn sender for sending spawn requests to the transport layer.
+    pub(crate) fn with_spawn_sender(mut self, sender: SpawnSender) -> Self {
+        self.spawn_sender = Some(sender);
+        self
     }
 
     /// Generate a unique request ID.
@@ -548,6 +564,26 @@ impl CoordinatorState {
         self.election
             .elect(&self.cluster_view)
             .is_some_and(|leader| leader == self.local_node_id)
+    }
+
+    /// Send a spawn request to the target node via the spawn sender channel.
+    fn send_spawn(&self, target_node_id: &str, request_id: u64, spec: &ActorSpec) {
+        if let Some(sender) = &self.spawn_sender {
+            sender.send_spawn(
+                target_node_id,
+                SpawnRequest {
+                    request_id,
+                    label: spec.label.clone(),
+                    actor_type_name: spec.actor_type_name.clone(),
+                    initial_state: spec.initial_state.clone(),
+                },
+            );
+        } else {
+            tracing::warn!(
+                "No spawn sender configured — spawn request for {} dropped",
+                spec.label
+            );
+        }
     }
 
     /// Handle a node departure — shared logic for both failure and graceful leave.
@@ -628,7 +664,15 @@ impl CoordinatorState {
                         &spec,
                         &self.cluster_view,
                     ) {
-                        self.cluster_view.add_actor(&decision.node_id, &label);
+                        let request_id = self.next_request_id();
+                        self.pending_spawns.insert(
+                            request_id,
+                            PendingSpawn {
+                                spec_label: label.clone(),
+                                target_node_id: decision.node_id.clone(),
+                            },
+                        );
+                        self.send_spawn(&decision.node_id, request_id, &spec);
                         tracing::info!(
                             "Re-placed {label} on {} ({})",
                             decision.node_id,
@@ -796,7 +840,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Check specs — should still exist but on a different node
+        // Check specs — should still exist, pending spawn on a different node
+        let specs = coordinator.send(GetSpecs).await.unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(matches!(specs[0].state, SpecState::Pending));
+
+        // Simulate the spawn ack from the new node
+        // Find the pending spawn's request_id (it's the second one, id=1)
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 1,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 1);
         assert!(matches!(specs[0].state, SpecState::Running));

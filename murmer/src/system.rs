@@ -205,6 +205,17 @@ impl System {
         matches!(self.inner, SystemInner::Clustered { .. })
     }
 
+    /// Access the underlying `ClusterSystem`, if this is a clustered system.
+    ///
+    /// Returns `None` for local systems. Used by orchestration (`murmer-app`)
+    /// to access the transport and event bus.
+    pub fn cluster_system(&self) -> Option<&ClusterSystem> {
+        match &self.inner {
+            SystemInner::Local { .. } => None,
+            SystemInner::Clustered { cluster } => Some(cluster),
+        }
+    }
+
     /// Returns the local QUIC address if this is a clustered system.
     ///
     /// Useful for reading the OS-assigned port after binding to `127.0.0.1:0`,

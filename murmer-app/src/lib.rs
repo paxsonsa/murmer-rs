@@ -21,3 +21,4 @@ pub mod error;
 pub mod node_info;
 pub mod placement;
 pub mod spec;
+pub(crate) mod spawn_sender;

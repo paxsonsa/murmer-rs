@@ -211,6 +211,11 @@ impl ClusterSystem {
         &self.node_registry
     }
 
+    /// Access the underlying transport (for orchestration integration).
+    pub fn transport(&self) -> &Arc<Transport> {
+        &self.transport
+    }
+
     /// Get the actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.transport.local_addr()
@@ -490,13 +495,19 @@ fn spawn_event_loop(
                             tracing::info!(
                                 "SpawnAckOk from {node_id}: request_id={request_id}, label={label}"
                             );
-                            // Coordinator should be subscribed to ClusterEvents
-                            // and will handle this via its own mechanism
+                            let _ = event_tx.send(ClusterEvent::SpawnAckOk {
+                                request_id,
+                                label: label.clone(),
+                            });
                         }
                         ControlMessage::SpawnAckErr { request_id, ref error } => {
                             tracing::warn!(
                                 "SpawnAckErr from {node_id}: request_id={request_id}, error={error}"
                             );
+                            let _ = event_tx.send(ClusterEvent::SpawnAckErr {
+                                request_id,
+                                error: error.clone(),
+                            });
                         }
                         ControlMessage::Handshake(_) => {
                             tracing::warn!("Unexpected handshake from {node_id}");

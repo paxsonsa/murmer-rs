@@ -32,6 +32,16 @@ pub enum ClusterEvent {
         label: String,
         node_id: String,
     },
+    /// A remote spawn succeeded (forwarded from SpawnAckOk control message).
+    SpawnAckOk {
+        request_id: u64,
+        label: String,
+    },
+    /// A remote spawn failed (forwarded from SpawnAckErr control message).
+    SpawnAckErr {
+        request_id: u64,
+        error: String,
+    },
 }
 
 // =============================================================================
