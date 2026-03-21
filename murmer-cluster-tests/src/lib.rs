@@ -38,7 +38,6 @@ struct SimNode {
 /// Builder for constructing a `ClusterSim` topology.
 pub struct ClusterSimBuilder {
     nodes: Vec<NodeSpec>,
-    type_registry_fn: Option<fn() -> TypeRegistry>,
 }
 
 struct NodeSpec {
@@ -68,10 +67,7 @@ impl NodeBuilder {
 impl ClusterSimBuilder {
     /// Create a new builder.
     pub fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            type_registry_fn: None,
-        }
+        Self { nodes: Vec::new() }
     }
 
     /// Add a node to the topology.
@@ -90,19 +86,13 @@ impl ClusterSimBuilder {
         self
     }
 
-    /// Provide a function that builds the `TypeRegistry` for all nodes.
-    pub fn type_registry(mut self, f: fn() -> TypeRegistry) -> Self {
-        self.type_registry_fn = Some(f);
-        self
-    }
-
     /// Build the simulation: starts all nodes in dependency order.
     ///
     /// Seed nodes start first so their addresses are available to joiners.
-    /// Uses `TypeRegistry::from_auto()` by default — all `#[handlers]` actors
-    /// are auto-registered. Override with `.type_registry()` if needed.
+    /// Uses `TypeRegistry::from_auto()` — all `#[handlers]` actors
+    /// are auto-registered via linkme.
     pub async fn build(self) -> ClusterSim {
-        let registry_fn = self.type_registry_fn.unwrap_or(TypeRegistry::from_auto);
+        let registry_fn = TypeRegistry::from_auto;
 
         // Partition into seed nodes (no seed_from) and joiners.
         let mut seed_specs: Vec<NodeSpec> = Vec::new();
@@ -194,17 +184,15 @@ impl ClusterSim {
 
     /// Get a reference to a node's `System`.
     pub fn system(&self, node: &str) -> &System {
-        &self.nodes.get(node).unwrap_or_else(|| panic!("node '{}' not found", node)).system
+        &self
+            .nodes
+            .get(node)
+            .unwrap_or_else(|| panic!("node '{}' not found", node))
+            .system
     }
 
     /// Start an actor on a specific node.
-    pub fn start_actor<A>(
-        &self,
-        node: &str,
-        label: &str,
-        actor: A,
-        state: A::State,
-    ) -> Endpoint<A>
+    pub fn start_actor<A>(&self, node: &str, label: &str, actor: A, state: A::State) -> Endpoint<A>
     where
         A: Actor + RemoteDispatch + 'static,
     {
@@ -217,11 +205,7 @@ impl ClusterSim {
     }
 
     /// Wait until an actor is discoverable from a node (default 10s timeout).
-    pub async fn wait_discovery<A: Actor + 'static>(
-        &self,
-        node: &str,
-        label: &str,
-    ) -> Endpoint<A> {
+    pub async fn wait_discovery<A: Actor + 'static>(&self, node: &str, label: &str) -> Endpoint<A> {
         self.wait_discovery_timeout::<A>(node, label, Duration::from_secs(10))
             .await
     }

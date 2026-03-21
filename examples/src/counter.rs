@@ -765,25 +765,23 @@ mod tests {
     }
 
     impl RemoteDispatch for PanicActor {
-        fn dispatch_remote<'a>(
+        async fn dispatch_remote<'a>(
             &'a mut self,
             ctx: &'a ActorContext<Self>,
             state: &'a mut PanicActorState,
             message_type: &'a str,
             payload: &'a [u8],
-        ) -> impl std::future::Future<Output = Result<Vec<u8>, DispatchError>> + Send + 'a {
-            async move {
-                match message_type {
-                    "test::PanicMsg" => {
-                        let (msg, _): (PanicMsg, _) =
-                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                        let result = <Self as Handler<PanicMsg>>::handle(self, ctx, state, msg);
-                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
-                    }
-                    other => Err(DispatchError::UnknownMessageType(other.to_string())),
+        ) -> Result<Vec<u8>, DispatchError> {
+            match message_type {
+                "test::PanicMsg" => {
+                    let (msg, _): (PanicMsg, _) =
+                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                    <Self as Handler<PanicMsg>>::handle(self, ctx, state, msg);
+                    bincode::serde::encode_to_vec((), bincode::config::standard())
+                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
                 }
+                other => Err(DispatchError::UnknownMessageType(other.to_string())),
             }
         }
     }
@@ -1517,12 +1515,7 @@ mod tests {
             state: &mut ForwarderState,
             msg: ForwardAdd,
         ) -> i64 {
-            ctx.forward(
-                &state.target,
-                AddAndReturn {
-                    amount: msg.amount,
-                },
-            );
+            ctx.forward(&state.target, AddAndReturn { amount: msg.amount });
             0 // discarded — target's response goes to original caller
         }
     }
@@ -1614,7 +1607,10 @@ mod tests {
 
         // Target's state should be updated
         let target_val = target_ep.send(AddAndReturn { amount: 0 }).await.unwrap();
-        assert_eq!(target_val, 142, "target's state should reflect the forwarded message");
+        assert_eq!(
+            target_val, 142,
+            "target's state should reflect the forwarded message"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1675,14 +1671,20 @@ mod tests {
         let _ep1 = receptionist.start(
             "pool/w1",
             CounterActor,
-            CounterState { count: 0, name: "w1".into() },
+            CounterState {
+                count: 0,
+                name: "w1".into(),
+            },
         );
         receptionist.check_in("pool/w1", worker_key.clone());
 
         let _ep2 = receptionist.start(
             "pool/w2",
             CounterActor,
-            CounterState { count: 0, name: "w2".into() },
+            CounterState {
+                count: 0,
+                name: "w2".into(),
+            },
         );
         receptionist.check_in("pool/w2", worker_key.clone());
 
@@ -1716,7 +1718,11 @@ mod tests {
         let worker_key = ReceptionKey::<CounterActor>::new("dynamic-workers");
 
         // Create pool router first — empty
-        let pool = PoolRouter::new(&receptionist, worker_key.clone(), RoutingStrategy::RoundRobin);
+        let pool = PoolRouter::new(
+            &receptionist,
+            worker_key.clone(),
+            RoutingStrategy::RoundRobin,
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(pool.len(), 0, "pool should start empty");
 
@@ -1724,7 +1730,10 @@ mod tests {
         let _ep = receptionist.start(
             "dynamic/w1",
             CounterActor,
-            CounterState { count: 0, name: "w1".into() },
+            CounterState {
+                count: 0,
+                name: "w1".into(),
+            },
         );
         receptionist.check_in("dynamic/w1", worker_key.clone());
 
@@ -1749,14 +1758,20 @@ mod tests {
         let _ep1 = receptionist.start(
             "removal/w1",
             CounterActor,
-            CounterState { count: 0, name: "w1".into() },
+            CounterState {
+                count: 0,
+                name: "w1".into(),
+            },
         );
         receptionist.check_in("removal/w1", worker_key.clone());
 
         let _ep2 = receptionist.start(
             "removal/w2",
             CounterActor,
-            CounterState { count: 0, name: "w2".into() },
+            CounterState {
+                count: 0,
+                name: "w2".into(),
+            },
         );
         receptionist.check_in("removal/w2", worker_key.clone());
 
@@ -1789,7 +1804,10 @@ mod tests {
             receptionist.start(
                 &label,
                 CounterActor,
-                CounterState { count: 0, name: format!("w{i}") },
+                CounterState {
+                    count: 0,
+                    name: format!("w{i}"),
+                },
             );
             receptionist.check_in(&label, worker_key.clone());
         }
@@ -1817,7 +1835,10 @@ mod tests {
         receptionist.start(
             "watched/w1",
             CounterActor,
-            CounterState { count: 0, name: "w1".into() },
+            CounterState {
+                count: 0,
+                name: "w1".into(),
+            },
         );
         receptionist.check_in("watched/w1", worker_key.clone());
 
@@ -1834,7 +1855,10 @@ mod tests {
         receptionist.start(
             "watched/w2",
             CounterActor,
-            CounterState { count: 0, name: "w2".into() },
+            CounterState {
+                count: 0,
+                name: "w2".into(),
+            },
         );
         receptionist.check_in("watched/w2", worker_key.clone());
 

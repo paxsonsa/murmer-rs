@@ -36,8 +36,6 @@ use crate::actor::{Actor, RemoteDispatch};
 pub enum TerminationReason {
     /// Clean shutdown (receptionist.stop() or channel close)
     Stopped,
-    /// Handler returned error (future use)
-    Failed(String),
     /// catch_unwind caught a panic
     Panicked(String),
     /// Restart limit exceeded within the configured time window

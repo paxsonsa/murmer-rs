@@ -61,23 +61,21 @@ pub struct DispatchRequest {
 // SEND ERROR
 // =============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SendError {
+    #[error("actor mailbox closed")]
     MailboxClosed,
+    #[error("response channel dropped")]
     ResponseDropped,
+    #[error("wire connection closed")]
     WireClosed,
+    #[error("serialization failed: {0}")]
     SerializationFailed(String),
+    #[error("deserialization failed: {0}")]
     DeserializationFailed(String),
+    #[error("remote error: {0}")]
     RemoteError(String),
 }
-
-impl std::fmt::Display for SendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for SendError {}
 
 // =============================================================================
 // REPLY SENDER — shared, consumable reply channel

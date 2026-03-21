@@ -112,9 +112,7 @@ async fn read_responses(
                         Ok(decoded) => {
                             let response = RemoteResponse {
                                 call_id: decoded.call_id,
-                                result: decoded
-                                    .result
-                                    .map(|bytes| bytes.to_vec()),
+                                result: decoded.result.map(|bytes| bytes.to_vec()),
                             };
                             response_registry.complete(response);
                         }
@@ -183,10 +181,8 @@ pub async fn handle_actor_stream(
         Some(tx) => tx,
         None => {
             tracing::warn!("Actor stream for unknown actor: {actor_label}");
-            let frame = framing::encode_response_frame(
-                0,
-                &Err(format!("actor not found: {actor_label}")),
-            );
+            let frame =
+                framing::encode_response_frame(0, &Err(format!("actor not found: {actor_label}")));
             let _ = send.write_all(&frame).await;
             return;
         }
@@ -214,9 +210,7 @@ pub async fn handle_actor_stream(
                             };
 
                             if dispatch_tx.send(request).is_err() {
-                                tracing::warn!(
-                                    "Dispatch channel closed for {actor_label}"
-                                );
+                                tracing::warn!("Dispatch channel closed for {actor_label}");
                                 return;
                             }
 
@@ -234,9 +228,7 @@ pub async fn handle_actor_stream(
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "Failed to decode invocation for {actor_label}: {e}"
-                            );
+                            tracing::warn!("Failed to decode invocation for {actor_label}: {e}");
                         }
                     }
                 }

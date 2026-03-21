@@ -7,11 +7,11 @@ publish = false
 [dependencies]
 murmer = { workspace = true }
 murmer-macros = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-bincode = { version = "2.0.1", features = ["serde"] }
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
+serde = { workspace = true }
+bincode = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
+tracing-subscriber = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }

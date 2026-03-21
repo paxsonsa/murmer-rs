@@ -312,10 +312,7 @@ impl<A: Actor + 'static> PoolRouter<A> {
     }
 
     /// Create a pool router from an already-obtained watched listing.
-    pub fn from_watched_listing(
-        watched: WatchedListing<A>,
-        strategy: RoutingStrategy,
-    ) -> Self {
+    pub fn from_watched_listing(watched: WatchedListing<A>, strategy: RoutingStrategy) -> Self {
         let pool: Pool<A> = Arc::new(RwLock::new(Vec::new()));
 
         // Spawn background task to consume the watched listing

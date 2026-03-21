@@ -690,10 +690,8 @@ async fn handle_actor_stream_after_init(
         Some(tx) => tx,
         None => {
             tracing::warn!("Actor stream for unknown actor: {actor_label}");
-            let frame = framing::encode_response_frame(
-                0,
-                &Err(format!("actor not found: {actor_label}")),
-            );
+            let frame =
+                framing::encode_response_frame(0, &Err(format!("actor not found: {actor_label}")));
             let _ = send.write_all(&frame).await;
             return;
         }
@@ -854,33 +852,31 @@ mod tests {
     }
 
     impl RemoteDispatch for TestCounter {
-        fn dispatch_remote<'a>(
+        async fn dispatch_remote<'a>(
             &'a mut self,
             ctx: &'a ActorContext<Self>,
             state: &'a mut TestCounterState,
             message_type: &'a str,
             payload: &'a [u8],
-        ) -> impl std::future::Future<Output = Result<Vec<u8>, DispatchError>> + Send + 'a {
-            async move {
-                match message_type {
-                    "test::Increment" => {
-                        let (msg, _): (Increment, _) =
-                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                        let result = <Self as Handler<Increment>>::handle(self, ctx, state, msg);
-                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
-                    }
-                    "test::GetCount" => {
-                        let (msg, _): (GetCount, _) =
-                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                        let result = <Self as Handler<GetCount>>::handle(self, ctx, state, msg);
-                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
-                    }
-                    other => Err(DispatchError::UnknownMessageType(other.to_string())),
+        ) -> Result<Vec<u8>, DispatchError> {
+            match message_type {
+                "test::Increment" => {
+                    let (msg, _): (Increment, _) =
+                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                    let result = <Self as Handler<Increment>>::handle(self, ctx, state, msg);
+                    bincode::serde::encode_to_vec(result, bincode::config::standard())
+                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
                 }
+                "test::GetCount" => {
+                    let (msg, _): (GetCount, _) =
+                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                    let result = <Self as Handler<GetCount>>::handle(self, ctx, state, msg);
+                    bincode::serde::encode_to_vec(result, bincode::config::standard())
+                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
+                }
+                other => Err(DispatchError::UnknownMessageType(other.to_string())),
             }
         }
     }
@@ -1306,25 +1302,23 @@ mod tests {
     }
 
     impl RemoteDispatch for RefReceiver {
-        fn dispatch_remote<'a>(
+        async fn dispatch_remote<'a>(
             &'a mut self,
             ctx: &'a ActorContext<Self>,
             state: &'a mut RefReceiverState,
             message_type: &'a str,
             payload: &'a [u8],
-        ) -> impl std::future::Future<Output = Result<Vec<u8>, DispatchError>> + Send + 'a {
-            async move {
-                match message_type {
-                    "test::SendRef" => {
-                        let (msg, _): (SendRef, _) =
-                            bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                                .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
-                        let result = <Self as Handler<SendRef>>::handle(self, ctx, state, msg);
-                        bincode::serde::encode_to_vec(&result, bincode::config::standard())
-                            .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
-                    }
-                    other => Err(DispatchError::UnknownMessageType(other.to_string())),
+        ) -> Result<Vec<u8>, DispatchError> {
+            match message_type {
+                "test::SendRef" => {
+                    let (msg, _): (SendRef, _) =
+                        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                            .map_err(|e| DispatchError::DeserializeFailed(e.to_string()))?;
+                    let result = <Self as Handler<SendRef>>::handle(self, ctx, state, msg);
+                    bincode::serde::encode_to_vec(result, bincode::config::standard())
+                        .map_err(|e| DispatchError::SerializeFailed(e.to_string()))
                 }
+                other => Err(DispatchError::UnknownMessageType(other.to_string())),
             }
         }
     }

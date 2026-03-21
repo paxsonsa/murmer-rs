@@ -644,8 +644,7 @@ impl Receptionist {
 
             // Notify watched listing subscribers of removal
             if !entry.keys.is_empty() {
-                let mut watched_subs =
-                    self.inner.watched_listing_subscribers.lock().unwrap();
+                let mut watched_subs = self.inner.watched_listing_subscribers.lock().unwrap();
                 watched_subs.retain(|sub| !sub.is_closed());
                 for sub in watched_subs.iter() {
                     // Only notify if the entry had a matching key
@@ -894,10 +893,7 @@ impl Receptionist {
     /// removals. Use this to build reactive pools that auto-track membership.
     ///
     /// Backfills existing matches as `Added` events, then streams live updates.
-    pub fn watched_listing<A: Actor + 'static>(
-        &self,
-        key: ReceptionKey<A>,
-    ) -> WatchedListing<A> {
+    pub fn watched_listing<A: Actor + 'static>(&self, key: ReceptionKey<A>) -> WatchedListing<A> {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Lock atomically: entries → watched_listing_subscribers

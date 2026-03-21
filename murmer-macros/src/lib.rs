@@ -395,15 +395,15 @@ pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let handler_call = if h.is_async {
             quote! {
-                let result = <Self as murmer::AsyncHandler<#msg_type>>::handle(
+                <Self as murmer::AsyncHandler<#msg_type>>::handle(
                     self, ctx, state, msg,
-                ).await;
+                ).await
             }
         } else {
             quote! {
-                let result = <Self as murmer::Handler<#msg_type>>::handle(
+                <Self as murmer::Handler<#msg_type>>::handle(
                     self, ctx, state, msg,
-                );
+                )
             }
         };
 
@@ -417,9 +417,9 @@ pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| murmer::DispatchError::DeserializeFailed(
                         e.to_string(),
                     ))?;
-                #handler_call
+                let result = #handler_call;
                 murmer::__reexport::bincode::serde::encode_to_vec(
-                    &result,
+                    result,
                     murmer::__reexport::bincode::config::standard(),
                 )
                 .map_err(|e| murmer::DispatchError::SerializeFailed(
@@ -431,20 +431,18 @@ pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let remote_dispatch = quote! {
         impl murmer::RemoteDispatch for #self_ty {
-            fn dispatch_remote<'a>(
+            async fn dispatch_remote<'a>(
                 &'a mut self,
                 ctx: &'a murmer::ActorContext<Self>,
                 state: &'a mut <Self as murmer::Actor>::State,
                 message_type: &'a str,
                 payload: &'a [u8],
-            ) -> impl ::core::future::Future<Output = Result<Vec<u8>, murmer::DispatchError>> + Send + 'a {
-                async move {
-                    match message_type {
-                        #(#match_arms)*
-                        __other => Err(murmer::DispatchError::UnknownMessageType(
-                            __other.to_string(),
-                        )),
-                    }
+            ) -> Result<Vec<u8>, murmer::DispatchError> {
+                match message_type {
+                    #(#match_arms)*
+                    __other => Err(murmer::DispatchError::UnknownMessageType(
+                        __other.to_string(),
+                    )),
                 }
             }
         }

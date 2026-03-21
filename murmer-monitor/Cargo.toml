@@ -11,10 +11,8 @@ keywords = ["actor", "distributed", "monitoring", "tracing"]
 categories = ["asynchronous", "network-programming"]
 
 [dependencies]
-murmer = { path = "../murmer" }
-murmer-macros = { path = "../murmer-macros" }
-murmer-app = { path = "../murmer-app" }
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+murmer = { workspace = true }
+murmer-macros = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }

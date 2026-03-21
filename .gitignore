@@ -3,3 +3,4 @@ target/
 CLAUDE.md
 .llm/
 thoughts/
+nohup.out

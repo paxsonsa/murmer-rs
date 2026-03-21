@@ -3,8 +3,8 @@
 //! Each test builds a topology, starts actors, and asserts on cross-node
 //! discovery and messaging through the public `System` API.
 
-use murmer_cluster_tests::actors::*;
 use murmer_cluster_tests::ClusterSim;
+use murmer_cluster_tests::actors::*;
 
 fn init() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
@@ -22,7 +22,6 @@ async fn test_two_node_ping_pong() {
     let mut sim = ClusterSim::builder()
         .node("alpha", |n| n.seed_node())
         .node("beta", |n| n.seed_from("alpha"))
-
         .build()
         .await;
 
@@ -64,18 +63,12 @@ async fn test_three_node_mesh() {
         .node("alpha", |n| n.seed_node())
         .node("beta", |n| n.seed_from("alpha"))
         .node("gamma", |n| n.seed_from("alpha"))
-
         .build()
         .await;
 
     sim.start_actor("alpha", "ping/alpha", PingPong, PingPongState::new("alpha"));
     sim.start_actor("beta", "ping/beta", PingPong, PingPongState::new("beta"));
-    sim.start_actor(
-        "gamma",
-        "ping/gamma",
-        PingPong,
-        PingPongState::new("gamma"),
-    );
+    sim.start_actor("gamma", "ping/gamma", PingPong, PingPongState::new("gamma"));
 
     // All nodes discover all actors (including transitively)
     for observer in &["alpha", "beta", "gamma"] {
@@ -141,7 +134,6 @@ async fn test_transitive_discovery() {
         .node("a", |n| n.seed_node())
         .node("b", |n| n.seed_from("a"))
         .node("c", |n| n.seed_from("b"))
-
         .build()
         .await;
 
@@ -164,7 +156,6 @@ async fn test_cross_node_chat_room() {
     let mut sim = ClusterSim::builder()
         .node("alpha", |n| n.seed_node())
         .node("beta", |n| n.seed_from("alpha"))
-
         .build()
         .await;
 
@@ -217,11 +208,15 @@ async fn test_graceful_departure() {
     let mut sim = ClusterSim::builder()
         .node("alpha", |n| n.seed_node())
         .node("beta", |n| n.seed_from("alpha"))
-
         .build()
         .await;
 
-    sim.start_actor("alpha", "ping/depart", PingPong, PingPongState::new("alpha"));
+    sim.start_actor(
+        "alpha",
+        "ping/depart",
+        PingPong,
+        PingPongState::new("alpha"),
+    );
 
     // Beta sees it
     sim.wait_discovery::<PingPong>("beta", "ping/depart").await;
@@ -244,7 +239,6 @@ async fn test_actor_survives_peer_departure() {
     let mut sim = ClusterSim::builder()
         .node("alpha", |n| n.seed_node())
         .node("beta", |n| n.seed_from("alpha"))
-
         .build()
         .await;
 
@@ -275,7 +269,10 @@ async fn test_actor_survives_peer_departure() {
 
     // Beta's own local actor still works perfectly
     let count = beta_ep.send(Increment { amount: 10 }).await.unwrap();
-    assert_eq!(count, 15, "beta's local actor should still work after peer departure");
+    assert_eq!(
+        count, 15,
+        "beta's local actor should still work after peer departure"
+    );
 
     let count = beta_ep.send(GetCount).await.unwrap();
     assert_eq!(count, 15);
@@ -294,7 +291,6 @@ async fn test_counter_state_isolation() {
     let mut sim = ClusterSim::builder()
         .node("alpha", |n| n.seed_node())
         .node("beta", |n| n.seed_from("alpha"))
-
         .build()
         .await;
 
@@ -335,7 +331,6 @@ async fn test_multi_actor_multi_node() {
         .node("alpha", |n| n.seed_node())
         .node("beta", |n| n.seed_from("alpha"))
         .node("gamma", |n| n.seed_from("alpha"))
-
         .build()
         .await;
 

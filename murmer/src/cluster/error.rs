@@ -31,9 +31,6 @@ pub enum ClusterError {
     #[error("node not found: {0}")]
     NodeNotFound(String),
 
-    #[error("cluster already started")]
-    AlreadyStarted,
-
     #[error("serialization error: {0}")]
     Serialization(String),
 

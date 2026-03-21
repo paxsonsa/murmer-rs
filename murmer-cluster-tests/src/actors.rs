@@ -43,37 +43,11 @@ impl RemoteMessage for Ping {
     const TYPE_ID: &'static str = "cluster_test::Ping";
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetName;
-
-impl Message for GetName {
-    type Result = String;
-}
-
-impl RemoteMessage for GetName {
-    const TYPE_ID: &'static str = "cluster_test::GetName";
-}
-
 #[handlers]
 impl PingPong {
     #[handler]
-    fn ping(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut PingPongState,
-        msg: Ping,
-    ) -> String {
+    fn ping(&mut self, _ctx: &ActorContext<Self>, state: &mut PingPongState, msg: Ping) -> String {
         format!("pong from {} (pinged by {})", state.name, msg.from)
-    }
-
-    #[handler]
-    fn get_name(
-        &mut self,
-        _ctx: &ActorContext<Self>,
-        state: &mut PingPongState,
-        _msg: GetName,
-    ) -> String {
-        state.name.clone()
     }
 }
 

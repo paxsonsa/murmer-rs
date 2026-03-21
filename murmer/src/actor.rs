@@ -444,24 +444,12 @@ pub trait RemoteDispatch: Actor + Sized {
 }
 
 /// Errors from remote message dispatch.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
-    /// The `message_type` string didn't match any registered handler.
+    #[error("unknown message type: {0}")]
     UnknownMessageType(String),
-    /// Failed to deserialize the message payload.
+    #[error("deserialize failed: {0}")]
     DeserializeFailed(String),
-    /// Failed to serialize the handler's return value.
+    #[error("serialize failed: {0}")]
     SerializeFailed(String),
 }
-
-impl std::fmt::Display for DispatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownMessageType(t) => write!(f, "unknown message type: {t}"),
-            Self::DeserializeFailed(e) => write!(f, "deserialize failed: {e}"),
-            Self::SerializeFailed(e) => write!(f, "serialize failed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for DispatchError {}

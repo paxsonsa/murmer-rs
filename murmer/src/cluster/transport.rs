@@ -106,8 +106,9 @@ impl Transport {
         }
 
         // Stream limits: each remote actor gets a stream
-        transport_config
-            .max_concurrent_bidi_streams(quinn::VarInt::from_u32(tuning.max_concurrent_bidi_streams));
+        transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(
+            tuning.max_concurrent_bidi_streams,
+        ));
 
         // Flow control: sized for LAN (low RTT, less buffering needed)
         transport_config

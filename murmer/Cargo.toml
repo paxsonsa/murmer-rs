@@ -12,9 +12,9 @@ keywords = ["actor", "distributed", "async", "network"]
 categories = ["asynchronous", "network-programming", "concurrency"]
 
 [dependencies]
-bincode = { version = "2.0.1", features = ["serde"] }
-serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+bincode = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
 
 # Networking & clustering
 quinn = { version = "0.11", features = ["rustls"] }
@@ -23,13 +23,13 @@ rustls-pemfile = "2.0"
 rcgen = "0.13"
 foca = { version = "0.19", features = ["bincode-codec"] }
 mdns-sd = "0.18"
-rand = "0.9"
+rand = { workspace = true }
 bytes = "1"
 futures-util = "0.3"
-tracing = "0.1"
-thiserror = "2"
+tracing = { workspace = true }
+thiserror = { workspace = true }
 tokio-util = { version = "0.7", features = ["full"] }
 linkme = "0.3"
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
+tracing-subscriber = { workspace = true }

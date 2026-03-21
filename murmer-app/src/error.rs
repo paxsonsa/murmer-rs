@@ -12,9 +12,6 @@ pub enum OrchestratorError {
     #[error("spec not found: {label}")]
     SpecNotFound { label: String },
 
-    #[error("spawn failed on node {node_id}: {error}")]
-    SpawnFailed { node_id: String, error: String },
-
     #[error("not the current leader")]
     NotLeader,
 }

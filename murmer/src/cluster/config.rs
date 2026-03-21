@@ -250,9 +250,9 @@ impl Default for TransportTuning {
             max_idle_timeout_secs: 30,
             keep_alive_interval_secs: Some(5),
             max_concurrent_bidi_streams: 1024,
-            stream_receive_window: 256 * 1024,  // 256 KiB
-            receive_window: 2 * 1024 * 1024,    // 2 MiB
-            send_window: 2 * 1024 * 1024,       // 2 MiB
+            stream_receive_window: 256 * 1024, // 256 KiB
+            receive_window: 2 * 1024 * 1024,   // 2 MiB
+            send_window: 2 * 1024 * 1024,      // 2 MiB
             initial_mtu: 1452,
         }
     }
