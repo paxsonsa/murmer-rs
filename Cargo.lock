@@ -493,9 +493,12 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "murmer",
+ "murmer-app",
  "murmer-macros",
+ "rustls",
  "serde",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

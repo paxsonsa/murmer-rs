@@ -18,12 +18,19 @@ path = "src/chat.rs"
 name = "cluster_chat"
 path = "src/cluster_chat.rs"
 
+[[bin]]
+name = "orchestrator"
+path = "src/orchestrator.rs"
+
 [dependencies]
 murmer = { workspace = true }
 murmer-macros = { workspace = true }
+murmer-app = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 bincode = { workspace = true }
+rustls = { version = "0.23", features = ["ring"] }
