@@ -113,13 +113,13 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
+    use murmer::System;
     use murmer::cluster::config::{ClusterConfigBuilder, Discovery, NodeClass};
     use murmer::cluster::sync::{SpawnRegistry, TypeRegistry};
-    use murmer::System;
     use murmer_app::bridge;
     use murmer_app::coordinator::{
-        CoordinatorState, GetClusterView, GetSpecs, NotifyNodeJoined,
-        SerializableNodeInfo, SubmitSpec,
+        CoordinatorState, GetClusterView, GetSpecs, NotifyNodeJoined, SerializableNodeInfo,
+        SubmitSpec,
     };
     use murmer_app::election::OldestNode;
     use murmer_app::placement::LeastLoaded;
@@ -139,11 +139,11 @@ mod tests {
         reg.register(
             "orchestrator::StorageAgent",
             Box::new(|receptionist, label, state_bytes| {
-                let (state, _): (StorageState, _) = bincode::serde::decode_from_slice(
-                    state_bytes,
-                    bincode::config::standard(),
-                )
-                .map_err(|e| murmer::cluster::sync::SpawnError::DeserializeFailed(e.to_string()))?;
+                let (state, _): (StorageState, _) =
+                    bincode::serde::decode_from_slice(state_bytes, bincode::config::standard())
+                        .map_err(|e| {
+                            murmer::cluster::sync::SpawnError::DeserializeFailed(e.to_string())
+                        })?;
                 receptionist.start(label, StorageAgent, state);
                 Ok(())
             }),
@@ -350,10 +350,7 @@ mod tests {
             root_name: "docs".into(),
             dirs: [
                 ("/".into(), vec!["reports".into(), "notes".into()]),
-                (
-                    "/reports".into(),
-                    vec!["q1.pdf".into(), "q2.pdf".into()],
-                ),
+                ("/reports".into(), vec!["q1.pdf".into(), "q2.pdf".into()]),
             ]
             .into(),
         };
@@ -386,18 +383,12 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // 7. Verify actors are running by querying them from the gateway
-        let photos_ep: Endpoint<StorageAgent> =
-            wait_for(&gateway, "storage/photos").await;
+        let photos_ep: Endpoint<StorageAgent> = wait_for(&gateway, "storage/photos").await;
 
         let root = photos_ep.send(GetRoot).await.unwrap();
         assert_eq!(root, "photos");
 
-        let entries = photos_ep
-            .send(ListDir {
-                path: "/".into(),
-            })
-            .await
-            .unwrap();
+        let entries = photos_ep.send(ListDir { path: "/".into() }).await.unwrap();
         assert_eq!(entries, vec!["vacation", "family"]);
 
         let file = photos_ep
@@ -409,8 +400,7 @@ mod tests {
         assert_eq!(file, Some("photos//vacation/beach.jpg".into()));
 
         // Query docs storage
-        let docs_ep: Endpoint<StorageAgent> =
-            wait_for(&gateway, "storage/docs").await;
+        let docs_ep: Endpoint<StorageAgent> = wait_for(&gateway, "storage/docs").await;
 
         let root = docs_ep.send(GetRoot).await.unwrap();
         assert_eq!(root, "docs");
@@ -431,17 +421,13 @@ mod tests {
         // 9. Verify placement decisions respected constraints
         // Photos should be on store-a (volume=photos)
         assert!(
-            photos_decision
-                .node_id
-                .contains("store-a"),
+            photos_decision.node_id.contains("store-a"),
             "Photos should be placed on store-a, got: {}",
             photos_decision.node_id
         );
         // Docs should be on store-b (volume=docs)
         assert!(
-            docs_decision
-                .node_id
-                .contains("store-b"),
+            docs_decision.node_id.contains("store-b"),
             "Docs should be placed on store-b, got: {}",
             docs_decision.node_id
         );

@@ -21,11 +21,7 @@ impl SpawnSender {
 
     /// Queue a spawn request for the given target node.
     pub fn send_spawn(&self, target_node_id: &str, request: SpawnRequest) {
-        if self
-            .tx
-            .send((target_node_id.to_string(), request))
-            .is_err()
-        {
+        if self.tx.send((target_node_id.to_string(), request)).is_err() {
             tracing::warn!("Spawn sender channel closed — spawn request dropped");
         }
     }

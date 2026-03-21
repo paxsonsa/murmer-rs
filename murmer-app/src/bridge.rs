@@ -39,7 +39,10 @@ use crate::spawn_sender::SpawnSender;
 /// 4. Spawns the spawn drain loop (SpawnRequests → transport.send_control)
 ///
 /// Returns the Coordinator endpoint for submitting specs.
-pub fn start_coordinator(cluster: &ClusterSystem, state: CoordinatorState) -> Endpoint<Coordinator> {
+pub fn start_coordinator(
+    cluster: &ClusterSystem,
+    state: CoordinatorState,
+) -> Endpoint<Coordinator> {
     let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
     let state = state.with_spawn_sender(SpawnSender::new(spawn_tx));
 
