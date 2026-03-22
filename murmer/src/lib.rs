@@ -21,8 +21,7 @@
 //!
 //! ```rust,ignore
 //! use murmer::prelude::*;
-//! use murmer_macros::{Message, handlers};
-//! use serde::{Serialize, Deserialize};
+//! use murmer_macros::handlers;
 //!
 //! // 1. Define your actor
 //! #[derive(Debug)]
@@ -34,29 +33,26 @@
 //!     type State = GreeterState;
 //! }
 //!
-//! // 2. Define messages — derive does the boilerplate
-//! #[derive(Debug, Clone, Serialize, Deserialize, Message)]
-//! #[message(result = String, remote = "greeter::Greet")]
-//! struct Greet { name: String }
-//!
-//! // 3. Implement handlers
+//! // 2. Implement handlers — macro auto-generates message structs,
+//! //    Handler impls, RemoteDispatch, and a GreeterExt extension trait
 //! #[handlers]
 //! impl Greeter {
 //!     #[handler]
-//!     fn greet(&mut self, _ctx: &ActorContext<Self>, state: &mut GreeterState, msg: Greet) -> String {
-//!         format!("{}, {}!", state.greeting, msg.name)
+//!     fn greet(&mut self, _ctx: &ActorContext<Self>, state: &mut GreeterState, name: String) -> String {
+//!         format!("{}, {}!", state.greeting, name)
 //!     }
 //! }
 //!
-//! // 4. Start and use
+//! // 3. Start and use
 //! #[tokio::main]
 //! async fn main() {
-//!     let receptionist = Receptionist::new();
-//!     let endpoint = receptionist.start("greeter/main", Greeter, GreeterState {
+//!     let system = System::local();
+//!     let endpoint = system.start("greeter/main", Greeter, GreeterState {
 //!         greeting: "Hello".into(),
 //!     });
 //!
-//!     let reply = endpoint.send(Greet { name: "world".into() }).await.unwrap();
+//!     // Call via auto-generated extension trait
+//!     let reply = endpoint.greet("world".into()).await.unwrap();
 //!     assert_eq!(reply, "Hello, world!");
 //! }
 //! ```

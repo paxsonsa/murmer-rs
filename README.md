@@ -23,7 +23,7 @@ The design draws heavy inspiration from Beam OTP's supervision and process model
 
 - **Send messages without caring where the actor lives.** Local and remote actors use the same `Endpoint<A>` API — your code doesn't change when an actor moves to another node.
 - **Test distributed systems from a single process.** Spin up multiple nodes in-memory and verify clustering, replication, and failover without any network infrastructure.
-- **Define actors with minimal boilerplate.** `#[derive(Message)]` and `#[handlers]` generate the dispatch tables, serialization, and trait impls so you write handlers as plain methods.
+- **Define actors with minimal boilerplate.** `#[handlers]` auto-generates message structs, dispatch tables, serialization, and ergonomic extension traits from plain method signatures — no manual message types needed.
 - **Get networking and encryption handled for you.** QUIC transport with automatic TLS, SWIM-based cluster membership, and mDNS discovery — all configured, not hand-rolled.
 - **Supervise actors like OTP.** Restart policies (Temporary, Transient, Permanent) with configurable limits and exponential backoff keep your system running through failures.
 
@@ -43,8 +43,7 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use murmer::prelude::*;
-use murmer_macros::{Message, handlers};
-use serde::{Serialize, Deserialize};
+use murmer_macros::handlers;
 
 // 1. Actor struct + state
 #[derive(Debug)]
@@ -56,30 +55,28 @@ impl Actor for Counter {
     type State = CounterState;
 }
 
-// 2. Messages — derive does the boilerplate
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = i64, remote = "counter::Increment")]
-struct Increment { amount: i64 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = i64, remote = "counter::GetCount")]
-struct GetCount;
-
-// 3. Handlers — macro generates Handler + RemoteDispatch impls
+// 2. Handlers — macro auto-generates message structs, Handler impls,
+//    RemoteDispatch, and an extension trait on Endpoint<Counter>
 #[handlers]
 impl Counter {
     #[handler]
-    fn increment(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState, msg: Increment) -> i64 {
-        state.count += msg.amount;
+    fn increment(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState, amount: i64) -> i64 {
+        state.count += amount;
         state.count
     }
 
     #[handler]
-    fn get_count(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState, _msg: GetCount) -> i64 {
+    fn get_count(&mut self, _ctx: &ActorContext<Self>, state: &mut CounterState) -> i64 {
         state.count
     }
 }
 ```
+
+The `#[handlers]` macro generates:
+- **Message structs** — `Increment { pub amount: i64 }` and `GetCount` (from method names and params)
+- **Handler trait impls** — `Handler<Increment>` and `Handler<GetCount>` for `Counter`
+- **RemoteDispatch** — wire-format dispatch table for cross-node messaging
+- **Extension trait** — `CounterExt` on `Endpoint<Counter>` for ergonomic sends
 
 ### Use it
 
@@ -92,13 +89,13 @@ async fn main() {
     // Start an actor — returns a typed endpoint
     let counter = system.start("counter/main", Counter, CounterState { count: 0 });
 
-    // Send messages
-    let result = counter.send(Increment { amount: 5 }).await.unwrap();
+    // Send messages via the auto-generated extension trait
+    let result = counter.increment(5).await.unwrap();
     assert_eq!(result, 5);
 
     // Lookup by label — works for local and remote actors
     let looked_up = system.lookup::<Counter>("counter/main").unwrap();
-    let count = looked_up.send(GetCount).await.unwrap();
+    let count = looked_up.get_count().await.unwrap();
     assert_eq!(count, 5);
 }
 ```
@@ -141,40 +138,69 @@ async fn main() {
 
 ## Proc Macros
 
-### `#[derive(Message)]`
-
-Eliminates the boilerplate of implementing `Message` and `RemoteMessage`:
-
-```rust
-// Before: 12 lines per message
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Increment { amount: i64 }
-impl Message for Increment { type Result = i64; }
-impl RemoteMessage for Increment { const TYPE_ID: &'static str = "counter::Increment"; }
-
-// After: 3 lines per message
-#[derive(Debug, Clone, Serialize, Deserialize, Message)]
-#[message(result = i64, remote = "counter::Increment")]
-struct Increment { amount: i64 }
-```
-
-The `remote = "..."` parameter is optional — omit it for local-only messages that don't need wire serialization.
-
 ### `#[handlers]` + `#[handler]`
 
-Generates `Handler<M>` trait implementations and the `RemoteDispatch` dispatch table from natural method signatures:
+The `#[handlers]` attribute on an `impl` block auto-generates everything from plain method signatures:
 
 ```rust
 #[handlers]
 impl MyActor {
     #[handler]
-    fn do_thing(&mut self, ctx: &ActorContext<Self>, state: &mut MyState, msg: DoThing) -> String {
-        // Your handler logic here
+    fn do_thing(&mut self, ctx: &ActorContext<Self>, state: &mut MyState, name: String, count: u32) -> String {
+        format!("{name}: {count}")
+    }
+
+    #[handler]
+    fn get_status(&mut self, _ctx: &ActorContext<Self>, state: &mut MyState) -> bool {
+        state.is_active
+    }
+
+    #[handler]
+    async fn fetch_data(&mut self, ctx: &ActorContext<Self>, state: &mut MyState, url: String) -> Vec<u8> {
+        some_async_call(&url).await
     }
 }
 ```
 
-Each `#[handler]` method must follow the signature: `(&mut self, ctx: &ActorContext<Self>, state: &mut State, msg: MsgType) -> MsgType::Result`
+This generates:
+- **Message structs** — `DoThing { pub name: String, pub count: u32 }`, `GetStatus`, `FetchData { pub url: String }` (PascalCase from method name)
+- **Handler/AsyncHandler impls** — dispatches the message fields as method arguments
+- **RemoteDispatch** — routes serialized messages by type ID for cross-node delivery
+- **Extension trait** — `MyActorExt` on `Endpoint<MyActor>`:
+
+```rust
+// Auto-generated — call handlers directly on the endpoint
+let result = endpoint.do_thing("hello".into(), 42).await?;
+let status = endpoint.get_status().await?;
+let data = endpoint.fetch_data("https://...".into()).await?;
+```
+
+Each `#[handler]` method must start with `(&mut self, ctx: &ActorContext<Self>, state: &mut State, ...)`. Remaining parameters become message struct fields. Use `async fn` for async handlers.
+
+### `#[derive(Message)]` (explicit messages)
+
+For cases where you want to define message structs manually (e.g., shared across multiple actors), use `#[derive(Message)]`:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = i64, remote = "counter::Increment")]
+struct Increment { amount: i64 }
+```
+
+Then reference it in a handler with the `msg` parameter name:
+
+```rust
+#[handlers]
+impl MyActor {
+    #[handler]
+    fn increment(&mut self, ctx: &ActorContext<Self>, state: &mut MyState, msg: Increment) -> i64 {
+        state.count += msg.amount;
+        state.count
+    }
+}
+```
+
+The `remote = "..."` parameter is optional — omit it for local-only messages that don't need wire serialization.
 
 ## Supervision
 
@@ -292,12 +318,12 @@ let room = system.start("room/general", ChatRoom, ChatRoomState {
     messages: vec![],
 });
 
-// Send messages — works instantly
-room.send(PostMessage { from: "alice".into(), text: "Hello!".into() }).await?;
+// Send messages via extension trait — works instantly
+room.post_message("alice".into(), "Hello!".into()).await?;
 
 // Look up actors by label
 let ep = system.lookup::<ChatRoom>("room/general").unwrap();
-let history = ep.send(GetHistory).await?;
+let history = ep.get_history().await?;
 ```
 
 ### Step 2: Go distributed
@@ -306,8 +332,7 @@ When you're ready for real networking, swap `System::local()` for `System::clust
 
 ```rust
 use murmer::prelude::*;
-use murmer::cluster::config::{ClusterConfig, Discovery};
-use murmer::cluster::sync::TypeRegistry;
+use murmer::cluster::config::ClusterConfig;
 
 let config = ClusterConfig::builder()
     .name("alpha")
@@ -317,15 +342,16 @@ let config = ClusterConfig::builder()
     .seed_nodes(["192.168.1.1:7100".parse()?])
     .build()?;
 
-let system = System::clustered(config, TypeRegistry::new()).await?;
+// clustered_auto() discovers all #[handlers]-annotated actor types automatically
+let system = System::clustered_auto(config).await?;
 
 // Same API as local — start, lookup, send
 let room = system.start("room/alpha", ChatRoom, state);
-room.send(PostMessage { from: "alice".into(), text: "Hello!".into() }).await?;
+room.post_message("alice".into(), "Hello!".into()).await?;
 
 // Actors on other nodes appear automatically via registry replication
 let remote_room = system.lookup::<ChatRoom>("room/beta").unwrap();
-remote_room.send(GetHistory).await?;  // transparently serialized over QUIC
+remote_room.get_history().await?;  // transparently serialized over QUIC
 ```
 
 Each node gets a single QUIC connection to every peer, multiplexed over per-actor streams. The OpLog replication protocol uses version vectors for efficient, idempotent sync.
@@ -413,10 +439,10 @@ See [`examples/src/cluster_chat.rs`](examples/src/cluster_chat.rs) for the full 
 Erlang-style actor monitoring — get notified when a watched actor terminates:
 
 ```rust
-impl Actor for Supervisor {
-    type State = SupervisorState;
+impl Actor for Monitor {
+    type State = MonitorState;
 
-    fn on_actor_terminated(&mut self, state: &mut SupervisorState, terminated: &ActorTerminated) {
+    fn on_actor_terminated(&mut self, state: &mut MonitorState, terminated: &ActorTerminated) {
         match &terminated.reason {
             TerminationReason::Panicked(msg) => {
                 tracing::error!("{} panicked: {}", terminated.label, msg);
@@ -426,9 +452,12 @@ impl Actor for Supervisor {
     }
 }
 
-// Inside a handler:
-fn handle_start(&mut self, ctx: &ActorContext<Self>, state: &mut SupervisorState, msg: StartWorker) {
-    ctx.watch("worker/0");  // Watch for termination
+#[handlers]
+impl Monitor {
+    #[handler]
+    fn watch_actor(&mut self, ctx: &ActorContext<Self>, _state: &mut MonitorState, label: String) {
+        ctx.watch(&label);  // Watch for termination
+    }
 }
 ```
 

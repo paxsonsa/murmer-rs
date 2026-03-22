@@ -37,33 +37,29 @@ Transparent network proxies that handle marshaling and transport.
 
 The system ensures type safety through a multi-layered approach:
 
-#### 1. Unique Receptionist Keys
+#### 1. Actor Type Identity
 ```rust
-impl Actor for MyActor {
-    const ACTOR_TYPE_KEY: &'static str = "MyActor";
-}
+// The #[handlers] macro registers each actor type via linkme distributed slice.
+// Type identity comes from std::any::type_name::<A>() — no manual keys needed.
 ```
-- Each actor type has a unique string identifier
-- Macro validation ensures no collisions at compile time
-- Keys are used for registration and lookup operations
+- Each actor type is identified by its Rust type name
+- `#[handlers]` auto-registers into a `linkme` distributed slice (`ACTOR_TYPE_ENTRIES`)
+- `TypeRegistry::from_auto()` collects entries at startup for cluster-aware dispatch
 
-#### 2. ActorPath Integration
+#### 2. Label-Based Routing
 ```rust
-struct ActorPath {
-    node_id: String,     // Which node owns this actor
-    type_id: String,     // The receptionist key
-    // ... other fields
-}
+// Actors are identified by path-like labels
+let ep = receptionist.start("cache/user", MyCacheActor, state);
+let ep = receptionist.lookup::<MyCacheActor>("cache/user");
 ```
-- Contains the receptionist key as `type_id`
+- Labels are path-like strings used for registration and lookup
 - Used for routing and type verification
 - Transformed when crossing node boundaries
 
 #### 3. Typed Lookup API
 ```rust
-// Type-safe lookup with compile-time guarantees
-let endpoint: Endpoint<MyActor> = receptionist
-    .lookup_one_typed("MyActor").await?;
+// Type-safe lookup — returns None if label not found or type mismatch
+let endpoint: Option<Endpoint<MyActor>> = receptionist.lookup::<MyActor>("my/label");
 ```
 
 ### Lazy Endpoint Creation
@@ -103,7 +99,7 @@ NodeActors subscribe to local receptionist changes and broadcast them to the clu
 
 ```rust
 impl NodeActor {
-    async fn started(&mut self, ctx: &mut Context<Self>) {
+    async fn started(&mut self, ctx: &ActorContext<Self>) {
         // 1. Establish network connection
         self.setup_connection().await;
         
@@ -121,7 +117,7 @@ impl NodeActor {
         self.start_registry_sync_task(subscription, ctx).await;
     }
     
-    async fn start_registry_sync_task(&mut self, subscription: Subscription, ctx: &mut Context<Self>) {
+    async fn start_registry_sync_task(&mut self, subscription: Subscription, ctx: &ActorContext<Self>) {
         let endpoint = ctx.endpoint();
         ctx.spawn(async move {
             while let Some(event) = subscription.next().await {
@@ -154,7 +150,7 @@ NodeActors handle incoming `ActorAdd`/`ActorRemove` messages by directly registe
 
 ```rust
 impl Handler<RecvFrame> for NodeActor {
-    async fn handle(&mut self, ctx: &mut Context<Self>, msg: RecvFrame) {
+    async fn handle(&mut self, ctx: &ActorContext<Self>, msg: RecvFrame) {
         match msg.frame.body.payload {
             Payload::ActorAdd(remote_path) => {
                 // Transform path to reflect remote origin
@@ -274,27 +270,25 @@ The key insight is that **type safety is enforced by the receptionist key system
 3. **Lookup Contract**: When a client looks up `"MyActor"` and casts to `Endpoint<MyActor>`, the registry guarantees that the remote actor can handle the same messages as `MyActor`
 
 ```rust
-// Compile-time registry ensures this mapping is valid
-inventory::submit! {
-    ActorHandlerRegistration {
-        actor_key: "MyActor",
-        message_types: &["MyMessage", "AnotherMessage"],
-        serialization_support: true,
-    }
-}
+// Compile-time registry via linkme distributed slice (emitted by #[handlers] macro)
+#[::murmer::__reexport::linkme::distributed_slice(::murmer::ACTOR_TYPE_ENTRIES)]
+static _MURMER_AUTO_REG: ::murmer::TypeRegistryEntry = ::murmer::TypeRegistryEntry {
+    actor_type_name: || std::any::type_name::<MyActor>(),
+    register: |receptionist, label, wire_tx, response_registry, node_id| {
+        receptionist.register_remote_from_node::<MyActor>(
+            label, wire_tx, response_registry, node_id,
+        );
+    },
+};
 
 impl DynamicEndpointSender for RemoteEndpointSender {
     async fn send_message<M>(&self, msg: M) -> Result<M::Result, SendError> {
         // This is safe because:
-        // 1. Client obtained this endpoint by looking up a specific actor key
-        // 2. Compile-time registry guarantees the actor can handle message M
+        // 1. Client obtained this endpoint by looking up a specific actor type
+        // 2. The #[handlers] macro ensures the actor can handle message M
         // 3. Remote node has the same actor type with same capabilities
-        
-        debug_assert!(
-            ActorRegistry::can_handle(&self.actor_key, std::any::type_name::<M>()),
-            "Message type not registered for actor - compile-time registry bug"
-        );
-        
+        // 4. TypeRegistry (from linkme auto-registration) maps types for deserialization
+
         self.send_marshaled(msg).await
     }
 }
@@ -309,10 +303,10 @@ This approach provides the same type safety as local endpoints, but with differe
 
 The safety guarantee chain:
 1. **Compile-time**: `MyActor` implements `Handler<MyMessage>` (verified by compiler)
-2. **Registration**: Actor registered under key "MyActor" (enforced by macro/registry)  
-3. **Lookup**: Client requests "MyActor" and gets typed `Endpoint<MyActor>`
+2. **Registration**: `#[handlers]` macro emits a `linkme` distributed slice entry for auto-registration
+3. **Lookup**: Client calls `receptionist.lookup::<MyActor>("label")` and gets typed `Endpoint<MyActor>`
 4. **Usage**: Client can only send messages that `MyActor` handles (phantom type constraint)
-5. **Runtime**: Remote sender validates message type against registry (debug assertion)
+5. **Runtime**: `RemoteDispatch::dispatch_remote()` routes by `TYPE_ID` and deserializes correctly
 
 #### Implementation Strategy
 
@@ -487,7 +481,7 @@ The remote actor is now discoverable locally but connection is deferred until fi
 ### Local Actor Access
 ```rust
 // 1. Lookup (immediate)
-let endpoint = receptionist.lookup_one_typed::<MyActor>("MyActor").await?;
+let endpoint = receptionist.lookup::<MyActor>("my/label").unwrap();
 
 // 2. Send message (direct in-memory)
 let response = endpoint.send(MyMessage).await?;
@@ -496,7 +490,7 @@ let response = endpoint.send(MyMessage).await?;
 ### Remote Actor Access (First Time)
 ```rust
 // 1. Lookup (triggers lazy creation)
-let endpoint = receptionist.lookup_one_typed::<MyActor>("MyActor").await?;
+let endpoint = receptionist.lookup::<MyActor>("my/label").unwrap();
 // - EndpointFactory.create() called
 // - ActorProxy spawned
 // - Stream opened to remote node
@@ -513,7 +507,7 @@ let response = endpoint.send(MyMessage).await?;
 ### Remote Actor Access (Subsequent)
 ```rust
 // 1. Lookup (returns cached endpoint)
-let endpoint = receptionist.lookup_one_typed::<MyActor>("MyActor").await?;
+let endpoint = receptionist.lookup::<MyActor>("my/label").unwrap();
 
 // 2. Send message (reuses existing stream)
 let response = endpoint.send(MyMessage).await?;
