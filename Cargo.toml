@@ -10,9 +10,9 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-murmer = { path = "murmer", version = "0.1.0" }
-murmer-macros = { path = "murmer-macros", version = "0.1.0" }
-murmer-app = { path = "murmer-app", version = "0.1.0" }
+murmer = { path = "murmer", version = "0.1.1" }
+murmer-macros = { path = "murmer-macros", version = "0.1.1" }
+murmer-app = { path = "murmer-app", version = "0.1.1" }
 bincode = { version = "2.0.1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -22,7 +22,7 @@ rand = "0.9"
 tracing-subscriber = "0.3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Andrew Paxson"]
 keywords = ["actor", "distributed", "actor-model", "async"]
