@@ -10,7 +10,6 @@
 //! - Auto-generated message structs and extension traits
 
 use murmer::prelude::*;
-use murmer_macros::handlers;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================

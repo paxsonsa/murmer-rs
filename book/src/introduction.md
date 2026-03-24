@@ -30,7 +30,6 @@ The design draws heavy inspiration from BEAM OTP's supervision and process model
 ```toml
 [dependencies]
 murmer = "0.1"
-murmer-macros = "0.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -39,7 +38,6 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust,ignore
 use murmer::prelude::*;
-use murmer_macros::handlers;
 
 // ① Define your actor — state lives separately
 #[derive(Debug)]

@@ -446,6 +446,7 @@ dependencies = [
  "futures-util",
  "linkme",
  "mdns-sd",
+ "murmer-macros",
  "quinn",
  "rand",
  "rcgen",
@@ -465,7 +466,6 @@ version = "0.1.1"
 dependencies = [
  "bincode",
  "murmer",
- "murmer-macros",
  "rand",
  "serde",
  "thiserror 2.0.18",
@@ -479,7 +479,6 @@ version = "0.1.1"
 dependencies = [
  "bincode",
  "murmer",
- "murmer-macros",
  "rustls",
  "serde",
  "tokio",
@@ -494,7 +493,6 @@ dependencies = [
  "bincode",
  "murmer",
  "murmer-app",
- "murmer-macros",
  "rustls",
  "serde",
  "tokio",
@@ -516,7 +514,6 @@ name = "murmer-monitor"
 version = "0.1.1"
 dependencies = [
  "murmer",
- "murmer-macros",
  "serde",
  "tokio",
  "tracing",

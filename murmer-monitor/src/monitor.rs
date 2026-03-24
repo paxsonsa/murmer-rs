@@ -10,7 +10,6 @@ use std::time::Instant;
 use murmer::cluster::ClusterSystem;
 use murmer::cluster::membership::ClusterEvent;
 use murmer::prelude::*;
-use murmer_macros::{Message, handlers};
 use serde::{Deserialize, Serialize};
 
 use crate::events;

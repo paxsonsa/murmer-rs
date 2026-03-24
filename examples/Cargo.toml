@@ -25,7 +25,6 @@ path = "src/orchestrator.rs"
 
 [dependencies]
 murmer = { workspace = true }
-murmer-macros = { workspace = true }
 murmer-app = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

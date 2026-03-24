@@ -21,7 +21,6 @@
 //!
 //! ```rust,ignore
 //! use murmer::prelude::*;
-//! use murmer_macros::handlers;
 //!
 //! // 1. Define your actor
 //! #[derive(Debug)]
@@ -154,6 +153,16 @@ unsafe impl Sync for TypeRegistryEntry {}
 #[__reexport::linkme::distributed_slice]
 pub static ACTOR_TYPE_ENTRIES: [TypeRegistryEntry];
 
+// =============================================================================
+// FEATURE RE-EXPORTS
+// =============================================================================
+
+/// Re-export proc macros from `murmer-macros` (enabled by the `macros` feature, on by default).
+///
+/// This lets users write `use murmer::handlers;` instead of depending on `murmer-macros` directly.
+#[cfg(feature = "macros")]
+pub use murmer_macros::{handlers, Message};
+
 /// Convenience prelude — import everything you need for typical actor definitions.
 ///
 /// ```rust,ignore
@@ -176,6 +185,10 @@ pub mod prelude {
     pub use crate::router::{PoolRouter, Router, RoutingStrategy};
     pub use crate::system::System;
     pub use crate::wire::{ReplySender, SendError};
+
+    // Re-export macros into the prelude so `use murmer::prelude::*` brings them in
+    #[cfg(feature = "macros")]
+    pub use murmer_macros::{handlers, Message};
 }
 
 // Re-export core types for convenience

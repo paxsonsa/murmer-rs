@@ -30,7 +30,6 @@
 use std::collections::HashMap;
 
 use murmer::prelude::*;
-use murmer_macros::{Message, handlers};
 use serde::{Deserialize, Serialize};
 
 use murmer::cluster::framing::SpawnRequest;

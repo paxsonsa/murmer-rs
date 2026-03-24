@@ -72,7 +72,7 @@ This generates `PostMessage { pub from: String, pub text: String }` and `GetHist
 For messages shared across multiple actors, define them manually with `#[derive(Message)]`:
 
 ```rust,ignore
-use murmer_macros::Message;
+use murmer::Message;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]

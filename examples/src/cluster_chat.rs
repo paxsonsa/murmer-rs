@@ -34,7 +34,6 @@
 //! ```
 
 use murmer::prelude::*;
-use murmer_macros::handlers;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{self, BufRead, Write as _};

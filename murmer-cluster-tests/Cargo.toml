@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 murmer = { workspace = true }
-murmer-macros = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 tokio = { workspace = true }

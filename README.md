@@ -40,7 +40,6 @@ Your Code → Endpoint<A> ──┤
 ```toml
 [dependencies]
 murmer = "0.1"
-murmer-macros = "0.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -49,7 +48,6 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use murmer::prelude::*;
-use murmer_macros::handlers;
 
 #[derive(Debug)]
 struct Counter;

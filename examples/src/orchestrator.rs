@@ -22,7 +22,6 @@ fn main() {
 use std::collections::HashMap;
 
 use murmer::prelude::*;
-use murmer_macros::{Message, handlers};
 use serde::{Deserialize, Serialize};
 
 /// A storage agent that owns a named root directory with in-memory files.

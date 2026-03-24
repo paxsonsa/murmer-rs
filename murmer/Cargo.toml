@@ -11,10 +11,17 @@ description = "A distributed actor framework for Rust"
 keywords = ["actor", "distributed", "async", "network"]
 categories = ["asynchronous", "network-programming", "concurrency"]
 
+[features]
+default = ["macros"]
+macros = ["dep:murmer-macros"]
+
 [dependencies]
 bincode = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+
+# Optional re-exports
+murmer-macros = { workspace = true, optional = true }
 
 # Networking & clustering
 quinn = { version = "0.11", features = ["rustls"] }

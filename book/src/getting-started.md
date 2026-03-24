@@ -7,12 +7,11 @@ This chapter goes deeper into the components you saw in the [introduction](./int
 ```toml
 [dependencies]
 murmer = "0.1"
-murmer-macros = "0.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
-`murmer` is the core framework. `murmer-macros` provides the `#[handlers]`, `#[handler]`, and `#[derive(Message)]` proc macros. Both serde and tokio are required — serde for message serialization (even in local mode, the types need to be `Serialize + Deserialize` for remote readiness), and tokio as the async runtime.
+`murmer` is the core framework. The `macros` feature (on by default) re-exports `#[handlers]`, `#[handler]`, and `#[derive(Message)]` from `murmer-macros` — no separate dependency needed. Both serde and tokio are required — serde for message serialization (even in local mode, the types need to be `Serialize + Deserialize` for remote readiness), and tokio as the async runtime.
 
 ## The Actor trait
 
@@ -199,7 +198,7 @@ Async handlers generate `AsyncHandler<FetchAndStore>` instead of `Handler<FetchA
 The auto-generated messages from `#[handlers]` cover most cases, but sometimes you want to define a message type explicitly — for example, when multiple actors handle the same message:
 
 ```rust,ignore
-use murmer_macros::Message;
+use murmer::Message;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]

@@ -4,7 +4,6 @@
 //! `RemoteDispatch`, and a linkme auto-registration entry for the `TypeRegistry`.
 
 use murmer::prelude::*;
-use murmer_macros::handlers;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================

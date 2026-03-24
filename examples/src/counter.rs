@@ -19,7 +19,6 @@
 //! 17. Extension trait for ergonomic endpoint usage
 
 use murmer::prelude::*;
-use murmer_macros::handlers;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
