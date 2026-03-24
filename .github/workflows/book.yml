@@ -24,14 +24,15 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: peaceiris/actions-mdbook@v2
-        with:
-          mdbook-version: 'latest'
+      - uses: actions/checkout@v5
+      - name: Install mdBook
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/latest/download/mdbook-v0.4.44-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+          echo "$PWD" >> $GITHUB_PATH
       - run: mdbook build book
       - name: Upload artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: book/build
 
