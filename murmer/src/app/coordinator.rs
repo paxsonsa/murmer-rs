@@ -29,17 +29,17 @@
 
 use std::collections::HashMap;
 
-use murmer::prelude::*;
+use crate::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use murmer::cluster::framing::SpawnRequest;
+use crate::cluster::framing::SpawnRequest;
 
-use crate::election::LeaderElection;
-use crate::error::OrchestratorError;
-use crate::node_info::{ClusterView, NodeInfo};
-use crate::placement::{self, PlacementDecision, PlacementStrategy};
-use crate::spawn_sender::SpawnSender;
-use crate::spec::{ActorSpec, CrashStrategy};
+use crate::app::election::LeaderElection;
+use crate::app::error::OrchestratorError;
+use crate::app::node_info::{ClusterView, NodeInfo};
+use crate::app::placement::{self, PlacementDecision, PlacementStrategy};
+use crate::app::spawn_sender::SpawnSender;
+use crate::app::spec::{ActorSpec, CrashStrategy};
 
 // =============================================================================
 // COORDINATOR ACTOR
@@ -204,7 +204,7 @@ pub struct SerializableNodeInfo {
     pub host: String,
     pub port: u16,
     pub incarnation: u64,
-    pub class: murmer::cluster::config::NodeClass,
+    pub class: crate::cluster::config::NodeClass,
     pub metadata: HashMap<String, String>,
 }
 
@@ -372,7 +372,7 @@ impl Coordinator {
         msg: NotifyNodeJoined,
     ) {
         let info = NodeInfo::new(
-            murmer::cluster::config::NodeIdentity {
+            crate::cluster::config::NodeIdentity {
                 name: msg.info.name,
                 host: msg.info.host,
                 port: msg.info.port,
@@ -691,15 +691,13 @@ impl CoordinatorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::election::OldestNode;
-    use crate::placement::LeastLoaded;
-    use murmer::cluster::config::{NodeClass, NodeIdentity};
+    use crate::app::election::OldestNode;
+    use crate::app::placement::LeastLoaded;
+    use crate::cluster::config::{NodeClass, NodeIdentity};
 
-    fn make_system_and_coordinator() -> (murmer::System, Endpoint<Coordinator>) {
-        let system = murmer::System::local();
+    fn make_system_and_coordinator() -> (crate::System, Endpoint<Coordinator>) {
+        let system = crate::System::local();
 
-        // "alpha" has the lowest incarnation, so OldestNode will elect it leader.
-        // We set local_node_id to alpha's node_id_string so is_leader() returns true.
         let alpha_identity = NodeIdentity {
             name: "alpha".into(),
             host: "127.0.0.1".into(),
@@ -714,7 +712,6 @@ mod tests {
             Box::new(OldestNode::any()),
         );
 
-        // Add a couple nodes to the view
         state.cluster_view.upsert_node(NodeInfo::new(
             alpha_identity,
             NodeClass::Worker,
@@ -819,7 +816,6 @@ mod tests {
     async fn test_node_failure_redistributes() {
         let (_system, coordinator) = make_system_and_coordinator();
 
-        // Place a worker — it'll go to alpha (least loaded, lowest incarnation)
         let result = coordinator
             .send(SubmitSpec {
                 spec: ActorSpec::new("worker/0", "app::Worker")
@@ -831,7 +827,6 @@ mod tests {
 
         let original_node = result.node_id.clone();
 
-        // Fail the node it was placed on
         coordinator
             .send(NotifyNodeFailed {
                 node_id: original_node.clone(),
@@ -839,13 +834,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Check specs — should still exist, pending spawn on a different node
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 1);
         assert!(matches!(specs[0].state, SpecState::Pending));
 
-        // Simulate the spawn ack from the new node
-        // Find the pending spawn's request_id (it's the second one, id=1)
         coordinator
             .send(NotifySpawnAck {
                 request_id: 1,
@@ -858,7 +850,6 @@ mod tests {
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 1);
         assert!(matches!(specs[0].state, SpecState::Running));
-        // Should now be on a different node
         assert_ne!(specs[0].placed_on.as_deref(), Some(original_node.as_str()));
     }
 
@@ -882,7 +873,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Spec should be gone
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 0);
     }
@@ -913,7 +903,6 @@ mod tests {
 
         let original_node = result.node_id.clone();
 
-        // Fail the node — spec enters WaitForReturn state
         coordinator
             .send(NotifyNodeFailed {
                 node_id: original_node.clone(),
@@ -924,7 +913,6 @@ mod tests {
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert!(matches!(specs[0].state, SpecState::WaitingForReturn));
 
-        // Simulate the timeout firing (rather than waiting for real timer)
         coordinator
             .send(WaitForReturnTimeout {
                 label: "worker/0".into(),
@@ -932,7 +920,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Should now be pending/running on a different node
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 1);
         assert!(!matches!(specs[0].state, SpecState::WaitingForReturn));
@@ -954,7 +941,6 @@ mod tests {
 
         let original_node = result.node_id.clone();
 
-        // Fail the node
         coordinator
             .send(NotifyNodeFailed {
                 node_id: original_node.clone(),
@@ -962,7 +948,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Node rejoins — spec should be re-spawned on it
         coordinator
             .send(NotifyNodeJoined {
                 node_id: original_node.clone(),
@@ -980,7 +965,6 @@ mod tests {
 
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 1);
-        // Should be pending (re-spawn in progress), not WaitingForReturn
         assert!(matches!(specs[0].state, SpecState::Pending));
     }
 }

@@ -1,8 +1,10 @@
-//! murmer-app — orchestration layer for murmer actor systems.
+//! Application orchestration — placement, leader election, and crash recovery.
 //!
-//! This crate provides the application-level abstractions for managing actors
+//! This module provides the application-level abstractions for managing actors
 //! across a cluster: placement strategies, leader election, crash recovery,
 //! and the Coordinator actor that ties them together.
+//!
+//! Enable with `murmer = { features = ["app"] }`.
 //!
 //! # Modules
 //!

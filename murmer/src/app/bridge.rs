@@ -17,18 +17,18 @@
 
 use std::sync::Arc;
 
-use murmer::cluster::ClusterSystem;
-use murmer::cluster::framing::ControlMessage;
-use murmer::cluster::membership::ClusterEvent;
-use murmer::cluster::transport::Transport;
-use murmer::prelude::*;
+use crate::cluster::ClusterSystem;
+use crate::cluster::framing::ControlMessage;
+use crate::cluster::membership::ClusterEvent;
+use crate::cluster::transport::Transport;
+use crate::prelude::*;
 use tokio::sync::mpsc;
 
-use crate::coordinator::{
+use crate::app::coordinator::{
     Coordinator, CoordinatorState, NotifyNodeFailed, NotifyNodeJoined, NotifyNodeLeft,
     NotifySpawnAck, SerializableNodeInfo,
 };
-use crate::spawn_sender::SpawnSender;
+use crate::app::spawn_sender::SpawnSender;
 
 /// Start the Coordinator actor and the cluster bridge.
 ///
@@ -66,7 +66,7 @@ pub fn start_coordinator(
 /// Bridge loop: reads ClusterEvents and forwards them to the Coordinator.
 async fn run_bridge_loop(
     events: &mut tokio::sync::broadcast::Receiver<ClusterEvent>,
-    node_registry: &murmer::cluster::NodeRegistry,
+    node_registry: &crate::cluster::NodeRegistry,
     coordinator: &Endpoint<Coordinator>,
 ) {
     loop {
@@ -83,7 +83,7 @@ async fn run_bridge_loop(
                                 node_id
                             );
                             (
-                                murmer::cluster::config::NodeClass::Worker,
+                                crate::cluster::config::NodeClass::Worker,
                                 std::collections::HashMap::new(),
                             )
                         }
@@ -154,7 +154,7 @@ async fn run_bridge_loop(
 /// SpawnActor control messages via the transport.
 async fn run_spawn_drain_loop(
     transport: Arc<Transport>,
-    mut rx: mpsc::UnboundedReceiver<(String, murmer::cluster::framing::SpawnRequest)>,
+    mut rx: mpsc::UnboundedReceiver<(String, crate::cluster::framing::SpawnRequest)>,
 ) {
     while let Some((node_id, request)) = rx.recv().await {
         tracing::debug!(

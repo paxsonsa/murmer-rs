@@ -1,8 +1,15 @@
 # Application Orchestration
 
-Murmer's core gives you actors, messages, and clustering primitives. The `murmer-app` crate builds on top of these to provide the application-level abstractions you need for real, working distributed applications: **placement strategies**, **leader election**, **crash recovery**, and a **Coordinator** actor that ties them all together.
+Murmer's core gives you actors, messages, and clustering primitives. The `app` module (enabled via the `app` feature flag) builds on top of these to provide the application-level abstractions you need for real, working distributed applications: **placement strategies**, **leader election**, **crash recovery**, and a **Coordinator** actor that ties them all together.
 
-Think of it this way: murmer gives you the building blocks, and `murmer-app` helps you assemble them into a running system that manages actor lifecycles across a cluster automatically.
+Think of it this way: murmer gives you the building blocks, and the `app` module helps you assemble them into a running system that manages actor lifecycles across a cluster automatically.
+
+Enable the feature in your `Cargo.toml`:
+
+```toml
+[dependencies]
+murmer = { version = "0.1", features = ["app"] }
+```
 
 ## Overview
 
@@ -21,7 +28,7 @@ The orchestration layer answers three questions:
 An `ActorSpec` describes an actor that the orchestrator should place and manage. It captures *what* to run, *how* to recover from crashes, and *where* to place it.
 
 ```rust,ignore
-use murmer_app::spec::{ActorSpec, CrashStrategy, PlacementConstraints};
+use murmer::app::spec::{ActorSpec, CrashStrategy, PlacementConstraints};
 use murmer::cluster::config::NodeClass;
 use std::time::Duration;
 
@@ -105,7 +112,7 @@ trait LeaderElection {
 The default implementation, `OldestNode`, picks the node with the lowest incarnation counter. This is **deterministic** — all nodes independently compute the same answer without a consensus round.
 
 ```rust,ignore
-use murmer_app::election::OldestNode;
+use murmer::app::election::OldestNode;
 use murmer::cluster::config::NodeClass;
 
 // Any alive node can be leader
@@ -129,15 +136,15 @@ The Coordinator is itself a murmer actor (dogfooding the framework). It maintain
 
 ### The cluster event bridge
 
-The bridge (`murmer_app::bridge`) connects the raw cluster machinery to the Coordinator. It subscribes to `ClusterEvents` and translates them into Coordinator messages (`NotifyNodeJoined`, `NotifyNodeFailed`, `NotifyNodeLeft`, `NotifySpawnAck`). This keeps the Coordinator decoupled from the transport layer.
+The bridge (`murmer::app::bridge`) connects the raw cluster machinery to the Coordinator. It subscribes to `ClusterEvents` and translates them into Coordinator messages (`NotifyNodeJoined`, `NotifyNodeFailed`, `NotifyNodeLeft`, `NotifySpawnAck`). This keeps the Coordinator decoupled from the transport layer.
 
 The recommended setup uses `bridge::start_coordinator()`:
 
 ```rust,ignore
-use murmer_app::bridge;
-use murmer_app::coordinator::CoordinatorState;
-use murmer_app::placement::LeastLoaded;
-use murmer_app::election::OldestNode;
+use murmer::app::bridge;
+use murmer::app::coordinator::CoordinatorState;
+use murmer::app::placement::LeastLoaded;
+use murmer::app::election::OldestNode;
 
 let cluster = system.cluster_system().unwrap();
 let state = CoordinatorState::new(

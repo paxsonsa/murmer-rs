@@ -104,7 +104,7 @@ That's it — a complete, working actor system. The rest of this page explains *
 - **Define actors with minimal boilerplate.** The `#[handlers]` macro (line ②) auto-generates message structs (`Increment`, `GetCount`), dispatch tables, serialization, and the extension methods you call on line ⑤.
 - **Get networking and encryption handled for you.** QUIC transport with automatic TLS, SWIM-based cluster membership, and mDNS discovery — all configured, not hand-rolled.
 - **Supervise actors like OTP.** Restart policies (Temporary, Transient, Permanent) with configurable limits and exponential backoff keep your system running through failures.
-- **Orchestrate applications across a cluster.** The [`murmer-app`](./murmer-app.md) layer adds placement strategies, leader election, and crash recovery — so you can declare *what* should run and *where*, and the framework handles the rest.
+- **Orchestrate applications across a cluster.** The [`app` module](./murmer-app.md) adds placement strategies, leader election, and crash recovery — so you can declare *what* should run and *where*, and the framework handles the rest.
 
 ## What's happening: line by line
 
@@ -167,7 +167,7 @@ Murmer works at two levels:
 **The application layer** ([Application Orchestration](./murmer-app.md)) builds on top of the core to manage real, running applications across a cluster. You declare *what* actors should run, *where* they should be placed (with constraints like "must have GPU" or "must be a Worker node"), and *what happens when a node fails* — and the Coordinator handles placement, spawning, and crash recovery automatically.
 
 <p align="center">
-  <img src="diagram-core-app.svg" alt="murmer core primitives flowing into murmer-app orchestration" style="width:100%">
+  <img src="diagram-core-app.svg" alt="murmer core primitives flowing into app module orchestration" style="width:100%">
 </p>
 
 ## Learn more

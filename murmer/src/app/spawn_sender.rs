@@ -4,12 +4,12 @@
 //! `(node_id, SpawnRequest)` pairs into it, and the bridge drain loop
 //! translates them into `transport.send_control()` calls.
 
-use murmer::cluster::framing::SpawnRequest;
+use crate::cluster::framing::SpawnRequest;
 use tokio::sync::mpsc;
 
 /// A channel-based handle the Coordinator uses to request remote spawns.
 ///
-/// Not public — created internally by [`crate::bridge::start_coordinator`].
+/// Not public — created internally by [`crate::app::bridge::start_coordinator`].
 pub(crate) struct SpawnSender {
     tx: mpsc::UnboundedSender<(String, SpawnRequest)>,
 }

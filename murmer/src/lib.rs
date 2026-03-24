@@ -99,7 +99,13 @@
 //! - **OpLog replication** with version vectors for consistent registry views
 //! - **Per-actor QUIC streams** — one multiplexed connection per node pair
 
+// Allow proc-macro-generated code (e.g. `#[handlers]`) to reference `murmer::`
+// and `::murmer::` when used inside this crate — same pattern as serde.
+extern crate self as murmer;
+
 pub mod actor;
+#[cfg(feature = "app")]
+pub mod app;
 pub mod cluster;
 pub mod endpoint;
 pub mod lifecycle;

@@ -1,6 +1,6 @@
 //! Orchestrator Example — Filesystem RPC with Coordinator-driven Placement
 //!
-//! Demonstrates the murmer-app orchestration loop:
+//! Demonstrates the murmer::app orchestration loop:
 //!
 //! 1. Three nodes form a cluster: gateway (Edge), store-a & store-b (Workers)
 //! 2. Each worker node advertises capabilities via metadata ("volume" tag)
@@ -115,14 +115,14 @@ mod tests {
     use murmer::System;
     use murmer::cluster::config::{ClusterConfigBuilder, Discovery, NodeClass};
     use murmer::cluster::sync::{SpawnRegistry, TypeRegistry};
-    use murmer_app::bridge;
-    use murmer_app::coordinator::{
+    use murmer::app::bridge;
+    use murmer::app::coordinator::{
         CoordinatorState, GetClusterView, GetSpecs, NotifyNodeJoined, SerializableNodeInfo,
         SubmitSpec,
     };
-    use murmer_app::election::OldestNode;
-    use murmer_app::placement::LeastLoaded;
-    use murmer_app::spec::{ActorSpec, CrashStrategy, PlacementConstraints};
+    use murmer::app::election::OldestNode;
+    use murmer::app::placement::LeastLoaded;
+    use murmer::app::spec::{ActorSpec, CrashStrategy, PlacementConstraints};
 
     fn init_tracing() {
         let _ = rustls::crypto::ring::default_provider().install_default();

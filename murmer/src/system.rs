@@ -226,7 +226,7 @@ impl System {
 
     /// Access the underlying `ClusterSystem`, if this is a clustered system.
     ///
-    /// Returns `None` for local systems. Used by orchestration (`murmer-app`)
+    /// Returns `None` for local systems. Used by orchestration (`app` module)
     /// to access the transport and event bus.
     pub fn cluster_system(&self) -> Option<&ClusterSystem> {
         match &self.inner {

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use murmer::cluster::config::NodeClass;
+use crate::cluster::config::NodeClass;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================

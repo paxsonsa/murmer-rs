@@ -2,7 +2,6 @@
 members = [
     "murmer",
     "murmer-macros",
-    "murmer-app",
     "murmer-monitor",
     "murmer-cluster-tests",
     "examples"
@@ -12,7 +11,6 @@ resolver = "2"
 [workspace.dependencies]
 murmer = { path = "murmer", version = "0.1.1" }
 murmer-macros = { path = "murmer-macros", version = "0.1.1" }
-murmer-app = { path = "murmer-app", version = "0.1.1" }
 bincode = { version = "2.0.1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

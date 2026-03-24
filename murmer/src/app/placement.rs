@@ -32,8 +32,8 @@
 //! }
 //! ```
 
-use crate::node_info::{ClusterView, NodeInfo};
-use crate::spec::ActorSpec;
+use crate::app::node_info::{ClusterView, NodeInfo};
+use crate::app::spec::ActorSpec;
 
 // =============================================================================
 // PLACEMENT DECISION
@@ -177,7 +177,7 @@ impl PlacementStrategy for Pinned {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use murmer::cluster::config::{NodeClass, NodeIdentity};
+    use crate::cluster::config::{NodeClass, NodeIdentity};
     use std::collections::HashMap;
 
     fn make_node(name: &str, incarnation: u64, actors: Vec<String>) -> NodeInfo {
@@ -243,7 +243,7 @@ mod tests {
 
         // Require Coordinator class, but only Worker nodes exist
         let spec = ActorSpec::new("coord/0", "app::Coordinator").with_constraints(
-            crate::spec::PlacementConstraints {
+            crate::app::spec::PlacementConstraints {
                 required_classes: vec![NodeClass::Coordinator],
                 ..Default::default()
             },

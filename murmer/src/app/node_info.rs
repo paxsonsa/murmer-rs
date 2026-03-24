@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use murmer::cluster::config::{NodeClass, NodeIdentity};
+use crate::cluster::config::{NodeClass, NodeIdentity};
 
 // =============================================================================
 // NODE INFO

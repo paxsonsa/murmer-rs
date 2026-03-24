@@ -461,19 +461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "murmer-app"
-version = "0.1.1"
-dependencies = [
- "bincode",
- "murmer",
- "rand",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "murmer-cluster-tests"
 version = "0.1.1"
 dependencies = [
@@ -492,7 +479,6 @@ version = "0.1.1"
 dependencies = [
  "bincode",
  "murmer",
- "murmer-app",
  "rustls",
  "serde",
  "tokio",

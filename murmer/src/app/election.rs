@@ -19,9 +19,9 @@
 //! }
 //! ```
 
-use murmer::cluster::config::NodeClass;
+use crate::cluster::config::NodeClass;
 
-use crate::node_info::ClusterView;
+use crate::app::node_info::ClusterView;
 
 // =============================================================================
 // LEADER ELECTION TRAIT
@@ -100,8 +100,8 @@ impl LeaderElection for OldestNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_info::NodeInfo;
-    use murmer::cluster::config::NodeIdentity;
+    use crate::app::node_info::NodeInfo;
+    use crate::cluster::config::NodeIdentity;
     use std::collections::HashMap;
 
     fn make_node(name: &str, incarnation: u64, class: NodeClass) -> NodeInfo {
