@@ -107,6 +107,7 @@ pub mod lifecycle;
 pub mod listing;
 pub mod node;
 pub mod oplog;
+pub mod ready;
 pub mod receptionist;
 pub mod router;
 pub mod supervisor;
@@ -170,6 +171,7 @@ pub mod prelude {
         TerminationReason,
     };
     pub use crate::listing::{Listing, ListingEvent, ReceptionKey, WatchedListing};
+    pub use crate::ready::ReadyHandle;
     pub use crate::receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
     pub use crate::router::{PoolRouter, Router, RoutingStrategy};
     pub use crate::system::System;
@@ -188,6 +190,7 @@ pub use lifecycle::{
 pub use listing::{Listing, ListingEvent, ReceptionKey, WatchedListing};
 pub use node::run_node_receiver;
 pub use oplog::{Op, OpType, VersionVector};
+pub use ready::ReadyHandle;
 pub use receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
 pub use router::{PoolRouter, Router, RoutingStrategy};
 pub use system::System;

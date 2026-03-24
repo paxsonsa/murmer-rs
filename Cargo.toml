@@ -10,9 +10,9 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-murmer = { path = "murmer" }
-murmer-macros = { path = "murmer-macros" }
-murmer-app = { path = "murmer-app" }
+murmer = { path = "murmer", version = "0.1.0" }
+murmer-macros = { path = "murmer-macros", version = "0.1.0" }
+murmer-app = { path = "murmer-app", version = "0.1.0" }
 bincode = { version = "2.0.1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -24,7 +24,7 @@ tracing-subscriber = "0.3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Andrew Paxson <andrew.paxson@icloud.com>"]
+authors = ["Andrew Paxson"]
 keywords = ["actor", "distributed", "actor-model", "async"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paxsonsa/murmer-rs"

@@ -34,6 +34,7 @@ use crate::cluster::error::ClusterError;
 use crate::cluster::sync::{SpawnRegistry, TypeRegistry};
 use crate::lifecycle::{ActorFactory, RestartConfig, RestartPolicy};
 use crate::listing::{Listing, ReceptionKey};
+use crate::ready::ReadyHandle;
 use crate::receptionist::{ActorEvent, Receptionist};
 use crate::{Actor, Endpoint, RemoteDispatch};
 
@@ -108,6 +109,24 @@ impl System {
         A: Actor + RemoteDispatch + 'static,
     {
         self.receptionist().start(label, actor, state)
+    }
+
+    /// Prepare an actor for deferred start.
+    ///
+    /// Returns an `Endpoint<A>` that can immediately queue messages, and a
+    /// [`ReadyHandle`] whose `start()` method spawns the supervisor.
+    /// If the `ReadyHandle` is dropped without calling `start()`, the actor
+    /// is automatically deregistered.
+    pub fn prepare<A>(
+        &self,
+        label: &str,
+        actor: A,
+        state: A::State,
+    ) -> (Endpoint<A>, ReadyHandle<A>)
+    where
+        A: Actor + RemoteDispatch + 'static,
+    {
+        self.receptionist().prepare(label, actor, state)
     }
 
     /// Start an actor with a simple restart policy.

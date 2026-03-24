@@ -161,6 +161,19 @@ impl<A: Actor + 'static> ActorContext<A> {
             .add_watch(label, &self.label, self.system_tx.clone());
     }
 
+    /// Request this actor to stop itself.
+    ///
+    /// The stop is asynchronous: the current handler completes normally,
+    /// and the supervisor exits on its next loop iteration. The actor
+    /// terminates with [`TerminationReason::Stopped`] — a `Transient`
+    /// restart policy will *not* restart it, but `Permanent` will.
+    ///
+    /// Idempotent: calling `stop()` multiple times is harmless (the
+    /// channel may already be closed).
+    pub fn stop(&self) {
+        let _ = self.system_tx.send(SystemSignal::Stop);
+    }
+
     /// Spawn a fire-and-forget task on the tokio runtime.
     ///
     /// Use this for background work that doesn't need to block the handler.

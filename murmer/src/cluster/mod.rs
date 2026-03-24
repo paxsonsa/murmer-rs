@@ -24,7 +24,7 @@ use crate::{
 use config::{ClusterConfig, NodeClass, NodeIdentity};
 use error::ClusterError;
 use framing::ControlMessage;
-use membership::{ClusterEvent, ClusterMembership, FocaRuntime, TimerEvent};
+use membership::{ClusterEvent, ClusterMembership, FocaRuntime, TimerEvent, spawn_timer_manager};
 use sync::{SpawnRegistry, TypeRegistry};
 use transport::{ConnectionEvent, Transport};
 
@@ -271,7 +271,10 @@ fn spawn_event_loop(
     // Subscribe to cluster events for NodeLeft pruning
     let mut cluster_event_rx = event_tx.subscribe();
 
-    let mut runtime = FocaRuntime::new(identity.clone(), event_tx.clone(), swim_tx, timer_tx);
+    // Spawn centralized timer manager — replaces per-timer tokio::spawn
+    let timer_cmd_tx = spawn_timer_manager(timer_tx);
+
+    let mut runtime = FocaRuntime::new(identity.clone(), event_tx.clone(), swim_tx, timer_cmd_tx);
 
     // Periodic sync interval
     let mut sync_interval = tokio::time::interval(Duration::from_secs(5));

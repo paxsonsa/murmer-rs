@@ -1878,4 +1878,191 @@ mod tests {
             ListingEvent::Added { .. } => panic!("expected Removed event"),
         }
     }
+
+    // =========================================================================
+    // prepare() — deferred start tests
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // Test: prepare() — queue messages before start
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_prepare_queue_before_start() {
+        use murmer::System;
+
+        let system = System::local();
+
+        let (endpoint, ready) = system.prepare(
+            "counter/prepared",
+            CounterActor,
+            CounterState {
+                count: 0,
+                name: "prepared".to_string(),
+            },
+        );
+
+        // Actor is registered but supervisor hasn't started — lookup works
+        assert!(system.lookup::<CounterActor>("counter/prepared").is_some());
+
+        // Queue messages (they sit in the unbounded channel)
+        // endpoint.send() returns a future — spawn it so it can complete after start
+        let ep = endpoint.clone();
+        let send_handle = tokio::spawn(async move { ep.increment(10).await.unwrap() });
+
+        // Start the supervisor — queued messages get processed
+        ready.start();
+
+        let result = send_handle.await.unwrap();
+        assert_eq!(result, 10);
+
+        // Further messages work normally
+        let count = endpoint.get_count().await.unwrap();
+        assert_eq!(count, 10);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: prepare() — drop without start auto-deregisters
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_prepare_drop_without_start() {
+        use murmer::System;
+
+        let system = System::local();
+        let mut events = system.subscribe_events();
+
+        let (_endpoint, ready) = system.prepare(
+            "counter/will-drop",
+            CounterActor,
+            CounterState {
+                count: 0,
+                name: "drop-me".to_string(),
+            },
+        );
+
+        // Registered event
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, ActorEvent::Registered { .. }));
+
+        // Actor is registered
+        assert!(system.lookup::<CounterActor>("counter/will-drop").is_some());
+
+        // Drop without start
+        drop(ready);
+
+        // Should be deregistered
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, ActorEvent::Deregistered { .. }));
+
+        assert!(system.lookup::<CounterActor>("counter/will-drop").is_none());
+    }
+
+    // =========================================================================
+    // ctx.stop() — self-shutdown tests
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // Test actor for ctx.stop() tests
+    // -------------------------------------------------------------------------
+    #[derive(Debug)]
+    struct StopTestActor;
+
+    struct StopTestState;
+
+    impl Actor for StopTestActor {
+        type State = StopTestState;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct StopYourself;
+
+    impl Message for StopYourself {
+        type Result = ();
+    }
+
+    impl RemoteMessage for StopYourself {
+        const TYPE_ID: &'static str = "test::StopYourself";
+    }
+
+    impl RemoteDispatch for StopTestActor {
+        async fn dispatch_remote(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            _state: &mut Self::State,
+            _message_type: &str,
+            _payload: &[u8],
+        ) -> Result<Vec<u8>, DispatchError> {
+            Err(DispatchError::UnknownMessageType("none".into()))
+        }
+    }
+
+    impl Handler<StopYourself> for StopTestActor {
+        fn handle(
+            &mut self,
+            ctx: &ActorContext<Self>,
+            _state: &mut StopTestState,
+            _msg: StopYourself,
+        ) {
+            ctx.stop();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: ctx.stop() — self-stop from handler
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_ctx_stop_self_shutdown() {
+        let receptionist = Receptionist::new();
+        let endpoint = receptionist.start("stop-test/main", StopTestActor, StopTestState);
+
+        // Send stop message — handler calls ctx.stop()
+        endpoint.send(StopYourself).await.unwrap();
+
+        // Give the supervisor time to process the stop signal
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Subsequent sends should fail (mailbox closed)
+        let result = endpoint.send(StopYourself).await;
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: ctx.stop() — watcher receives deregistration event
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_ctx_stop_deregistration_event() {
+        let receptionist = Receptionist::new();
+
+        // Subscribe to lifecycle events
+        let mut events = receptionist.subscribe_events();
+
+        // Start the actor that will stop itself
+        let endpoint = receptionist.start("stop-watch/target", StopTestActor, StopTestState);
+
+        // Consume the registration event
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, ActorEvent::Registered { .. }));
+
+        // Trigger self-stop
+        endpoint.send(StopYourself).await.unwrap();
+
+        // Wait for deregistration event
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(ActorEvent::Deregistered { label, .. }))
+                    if label == "stop-watch/target" =>
+                {
+                    break; // Got the deregistration — test passes
+                }
+                Ok(Some(_)) => continue, // Skip other events
+                _ => panic!("Timed out waiting for deregistration event"),
+            }
+        }
+
+        // Actor should be gone from receptionist
+        assert!(
+            receptionist
+                .lookup::<StopTestActor>("stop-watch/target")
+                .is_none()
+        );
+    }
 }

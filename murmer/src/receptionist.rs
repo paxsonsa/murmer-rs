@@ -38,6 +38,7 @@ use crate::listing::{
     TypedListingSender, TypedWatchedListingSender, WatchedListing,
 };
 use crate::oplog::{Op, OpLog, OpType, VersionVector};
+use crate::ready::ReadyHandle;
 use crate::supervisor::{run_supervisor, should_restart};
 use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegistry};
 
@@ -317,6 +318,96 @@ impl Receptionist {
         });
 
         endpoint
+    }
+
+    /// Prepare a local actor for deferred start.
+    ///
+    /// Like [`start()`](Self::start), this creates channels, registers the actor
+    /// in the receptionist, and returns a typed `Endpoint<A>`. However, instead
+    /// of spawning the supervisor immediately, it returns a [`ReadyHandle`] that
+    /// the caller can use to spawn the supervisor later.
+    ///
+    /// Messages sent to the endpoint queue in the unbounded mailbox until
+    /// [`ReadyHandle::start()`] is called. If the `ReadyHandle` is dropped
+    /// without calling `start()`, the actor is automatically deregistered.
+    pub fn prepare<A>(
+        &self,
+        label: &str,
+        actor: A,
+        state: A::State,
+    ) -> (Endpoint<A>, ReadyHandle<A>)
+    where
+        A: Actor + RemoteDispatch + 'static,
+    {
+        let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel::<Box<dyn EnvelopeProxy<A>>>();
+        let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchRequest>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (system_tx, system_rx) = mpsc::unbounded_channel::<SystemSignal>();
+
+        let exit_reason = Arc::new(Mutex::new(TerminationReason::Stopped));
+
+        // Create deregister guard — owned by ReadyHandle initially.
+        // If ReadyHandle is dropped without start(), this fires and deregisters.
+        // If start() is called, ownership transfers to the supervisor task.
+        let guard = DeregisterGuard {
+            receptionist: self.clone(),
+            label: label.to_string(),
+            reason: exit_reason.clone(),
+        };
+
+        // Build the actor context
+        let ctx = ActorContext {
+            label: label.to_string(),
+            node_id: self.inner.config.node_id.clone(),
+            mailbox_tx: mailbox_tx.clone(),
+            receptionist: self.clone(),
+            system_tx,
+            reply_token: std::sync::Mutex::new(None),
+        };
+
+        // Create the user's endpoint
+        let endpoint = Endpoint::local(mailbox_tx.clone());
+
+        // Register in the receptionist (same as start())
+        let entry = ActorEntry {
+            label: label.to_string(),
+            type_id: TypeId::of::<A>(),
+            actor_type_name: std::any::type_name::<A>().to_string(),
+            location: EntryLocation::Local {
+                endpoint_factory: Box::new(LocalEndpointFactory { mailbox_tx }),
+                dispatch_tx,
+                shutdown_tx: Some(shutdown_tx),
+            },
+            keys: Vec::new(),
+            node_id: self.inner.config.node_id.clone(),
+        };
+        self.inner
+            .entries
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), entry);
+
+        // Record in oplog (respects blip window if configured)
+        self.record_register_op(label, std::any::type_name::<A>(), &[]);
+
+        self.emit(ActorEvent::Registered {
+            label: label.to_string(),
+            actor_type: std::any::type_name::<A>().to_string(),
+        });
+
+        let ready = ReadyHandle::new(
+            actor,
+            state,
+            ctx,
+            mailbox_rx,
+            dispatch_rx,
+            shutdown_rx,
+            system_rx,
+            exit_reason,
+            guard,
+        );
+
+        (endpoint, ready)
     }
 
     /// Start an actor with a restart policy and factory.

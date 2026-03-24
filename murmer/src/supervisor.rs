@@ -110,6 +110,9 @@ where
                     Some(SystemSignal::ActorTerminated(terminated)) => {
                         actor.on_actor_terminated(&mut state, &terminated);
                     }
+                    Some(SystemSignal::Stop) => {
+                        break;
+                    }
                     None => {} // system channel closed, ignore
                 }
             }

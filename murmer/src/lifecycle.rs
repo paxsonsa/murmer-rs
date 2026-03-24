@@ -114,6 +114,8 @@ pub trait ActorFactory: Send + 'static {
 /// Internal: signals delivered to actors from the system.
 pub(crate) enum SystemSignal {
     ActorTerminated(ActorTerminated),
+    /// Self-stop request from the actor (via ctx.stop())
+    Stop,
 }
 
 /// Internal: a watch entry stored in the receptionist.
