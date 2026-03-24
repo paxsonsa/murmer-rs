@@ -2,7 +2,6 @@
 members = [
     "murmer",
     "murmer-macros",
-    "murmer-monitor",
     "murmer-cluster-tests",
     "examples"
 ]

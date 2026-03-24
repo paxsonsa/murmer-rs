@@ -496,16 +496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "murmer-monitor"
-version = "0.1.2"
-dependencies = [
- "murmer",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use murmer::cluster::ClusterSystem;
-use murmer::cluster::membership::ClusterEvent;
-use murmer::prelude::*;
+use crate::cluster::ClusterSystem;
+use crate::cluster::membership::ClusterEvent;
+use crate::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::events;
+use crate::monitor::events;
 
 // =============================================================================
 // MONITOR ACTOR
@@ -267,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_monitor_tracks_nodes() {
-        let system = murmer::System::local();
+        let system = crate::System::local();
         let monitor = system.start("murmer/monitor", ClusterMonitor, ClusterMonitorState::new());
 
         // Simulate nodes joining
@@ -297,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_monitor_tracks_failures() {
-        let system = murmer::System::local();
+        let system = crate::System::local();
         let monitor = system.start("murmer/monitor", ClusterMonitor, ClusterMonitorState::new());
 
         monitor
@@ -324,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_monitor_tracks_departures() {
-        let system = murmer::System::local();
+        let system = crate::System::local();
         let monitor = system.start("murmer/monitor", ClusterMonitor, ClusterMonitorState::new());
 
         monitor

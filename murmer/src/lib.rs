@@ -110,6 +110,8 @@ pub mod cluster;
 pub mod endpoint;
 pub mod lifecycle;
 pub mod listing;
+#[cfg(feature = "monitor")]
+pub mod monitor;
 pub mod node;
 pub mod oplog;
 pub mod ready;

@@ -15,6 +15,7 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 default = ["macros"]
 macros = ["dep:murmer-macros"]
 app = []
+monitor = []
 
 [dependencies]
 bincode = { workspace = true }

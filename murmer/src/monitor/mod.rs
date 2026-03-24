@@ -1,14 +1,16 @@
-//! murmer-monitor — cluster monitoring and observability for murmer.
+//! Cluster monitoring and observability.
 //!
-//! This crate provides a [`ClusterMonitor`] actor that subscribes to cluster
+//! This module provides a [`ClusterMonitor`] actor that subscribes to cluster
 //! events and maintains real-time metrics about the cluster. It emits
 //! structured tracing events for each lifecycle transition, making it easy
 //! to integrate with any tracing subscriber (stdout, JSON, OpenTelemetry, etc.).
 //!
+//! Enable with `murmer = { features = ["monitor"] }`.
+//!
 //! # Quick start
 //!
 //! ```rust,ignore
-//! use murmer_monitor::{ClusterMonitor, ClusterMonitorState, run_monitor_bridge};
+//! use murmer::monitor::{ClusterMonitor, ClusterMonitorState, run_monitor_bridge};
 //!
 //! // Start the monitor on your system
 //! let monitor = system.start(
