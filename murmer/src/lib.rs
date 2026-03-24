@@ -167,7 +167,7 @@ pub static ACTOR_TYPE_ENTRIES: [TypeRegistryEntry];
 ///
 /// This lets users write `use murmer::handlers;` instead of depending on `murmer-macros` directly.
 #[cfg(feature = "macros")]
-pub use murmer_macros::{handlers, Message};
+pub use murmer_macros::{Message, handlers};
 
 /// Convenience prelude — import everything you need for typical actor definitions.
 ///
@@ -194,7 +194,7 @@ pub mod prelude {
 
     // Re-export macros into the prelude so `use murmer::prelude::*` brings them in
     #[cfg(feature = "macros")]
-    pub use murmer_macros::{handlers, Message};
+    pub use murmer_macros::{Message, handlers};
 }
 
 // Re-export core types for convenience

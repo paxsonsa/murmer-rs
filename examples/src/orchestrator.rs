@@ -113,8 +113,6 @@ mod tests {
     use std::time::Duration;
 
     use murmer::System;
-    use murmer::cluster::config::{ClusterConfigBuilder, Discovery, NodeClass};
-    use murmer::cluster::sync::{SpawnRegistry, TypeRegistry};
     use murmer::app::bridge;
     use murmer::app::coordinator::{
         CoordinatorState, GetClusterView, GetSpecs, NotifyNodeJoined, SerializableNodeInfo,
@@ -123,6 +121,8 @@ mod tests {
     use murmer::app::election::OldestNode;
     use murmer::app::placement::LeastLoaded;
     use murmer::app::spec::{ActorSpec, CrashStrategy, PlacementConstraints};
+    use murmer::cluster::config::{ClusterConfigBuilder, Discovery, NodeClass};
+    use murmer::cluster::sync::{SpawnRegistry, TypeRegistry};
 
     fn init_tracing() {
         let _ = rustls::crypto::ring::default_provider().install_default();
