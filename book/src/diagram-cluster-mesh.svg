@@ -1,0 +1,65 @@
+<svg viewBox="0 0 560 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#f59e42"/>
+    </marker>
+    <marker id="arr-ret" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arr-teal" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#2dd4bf"/>
+    </marker>
+  </defs>
+
+  <!-- Participants -->
+  <rect x="45" y="10" width="120" height="40" rx="6" fill="#f59e42" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="105" y="27" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600" fill="#0a0e17">Node Alpha</text>
+  <text x="105" y="41" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#0a0e17" opacity="0.6">seed</text>
+
+  <rect x="220" y="10" width="120" height="40" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="280" y="35" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Node Beta</text>
+
+  <rect x="395" y="10" width="120" height="40" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="455" y="35" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Node Gamma</text>
+
+  <!-- Lifelines -->
+  <line x1="105" y1="50" x2="105" y2="390" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="280" y1="50" x2="280" y2="390" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="455" y1="50" x2="455" y2="390" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+
+  <!-- Note: starts listening -->
+  <rect x="30" y="64" width="150" height="22" rx="4" fill="#1a2235" stroke="#2a3650" stroke-width="1"/>
+  <text x="105" y="79" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">listening on :7100</text>
+
+  <!-- Beta → Alpha: QUIC connect -->
+  <line x1="280" y1="110" x2="113" y2="110" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="196" y="104" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f1f5f9">QUIC connect (seed)</text>
+
+  <!-- Alpha → Beta: handshake -->
+  <line x1="105" y1="140" x2="272" y2="140" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-ret)"/>
+  <text x="188" y="134" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">handshake + actor list</text>
+
+  <!-- Gamma → Alpha: QUIC connect -->
+  <line x1="455" y1="175" x2="113" y2="175" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="284" y="169" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f1f5f9">QUIC connect (seed)</text>
+
+  <!-- Alpha → Gamma: handshake -->
+  <line x1="105" y1="205" x2="447" y2="205" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-ret)"/>
+  <text x="276" y="199" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">handshake + actor list</text>
+
+  <!-- Alpha → Beta: gossip Gamma -->
+  <line x1="105" y1="250" x2="272" y2="250" stroke="#2dd4bf" stroke-width="1.5" marker-end="url(#arr-teal)"/>
+  <text x="188" y="244" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#2dd4bf">gossip: Gamma joined</text>
+
+  <!-- Alpha → Gamma: gossip Beta -->
+  <line x1="105" y1="280" x2="447" y2="280" stroke="#2dd4bf" stroke-width="1.5" marker-end="url(#arr-teal)"/>
+  <text x="276" y="274" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#2dd4bf">gossip: Beta joined</text>
+
+  <!-- Beta → Gamma: direct connect -->
+  <line x1="280" y1="320" x2="447" y2="320" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="363" y="314" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f1f5f9">QUIC connect (gossip)</text>
+
+  <!-- Final note -->
+  <rect x="170" y="356" width="220" height="24" rx="6" fill="#1a2235" stroke="#f59e42" stroke-width="1" opacity="0.6"/>
+  <text x="280" y="372" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#f59e42" opacity="0.8">cluster meshed — all nodes see all actors</text>
+</svg>

@@ -1,0 +1,40 @@
+<svg viewBox="0 0 520 430" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#f59e42"/>
+    </marker>
+  </defs>
+
+  <!-- System -->
+  <rect x="20" y="10" width="480" height="54" rx="8" fill="#f59e42" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="260" y="31" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="14" font-weight="700" fill="#1a2235">System</text>
+  <text x="260" y="49" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#5c3400">local()  ·  clustered(config)</text>
+
+  <line x1="260" y1="64" x2="260" y2="86" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Receptionist -->
+  <rect x="20" y="92" width="480" height="54" rx="8" fill="#ef6443" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="260" y="113" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="14" font-weight="700" fill="#fff">Receptionist</text>
+  <text x="260" y="131" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#ffd9c4">Local Actors  ·  Remote Actors  ·  Listings / Keys</text>
+
+  <line x1="260" y1="146" x2="260" y2="168" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Supervisor Layer -->
+  <rect x="20" y="174" width="480" height="54" rx="8" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="260" y="195" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="14" font-weight="600" fill="#f1f5f9">Supervisor Layer</text>
+  <text x="260" y="213" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="#94a3b8">lifecycle  ·  restart policies  ·  crash recovery</text>
+
+  <line x1="260" y1="228" x2="260" y2="250" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Endpoint -->
+  <rect x="20" y="256" width="480" height="54" rx="8" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="260" y="277" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="14" font-weight="600" fill="#f1f5f9">Endpoint‹A›</text>
+  <text x="260" y="295" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="#94a3b8">local: envelope  ·  remote: bincode → QUIC → bincode</text>
+
+  <line x1="260" y1="310" x2="260" y2="332" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Cluster Layer -->
+  <rect x="20" y="338" width="480" height="54" rx="8" fill="#1a2235" stroke="#64748b" stroke-width="1"/>
+  <text x="260" y="359" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="14" font-weight="600" fill="#cbd5e1">Cluster Layer</text>
+  <text x="260" y="377" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="#64748b">SWIM membership  ·  mDNS discovery  ·  OpLog  ·  QUIC transport</text>
+</svg>

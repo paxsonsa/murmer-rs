@@ -1,0 +1,72 @@
+<svg viewBox="0 0 720 420" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#f59e42"/>
+    </marker>
+    <marker id="arr-ret" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <!-- Participants -->
+  <rect x="20" y="10" width="90" height="36" rx="6" fill="#2a3650" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="65" y="33" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600" fill="#f1f5f9">Actor</text>
+
+  <rect x="160" y="10" width="120" height="36" rx="6" fill="#f59e42" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="220" y="26" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="600" fill="#0a0e17">Receptionist</text>
+  <text x="220" y="38" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#0a0e17" opacity="0.6">Node A</text>
+
+  <rect x="330" y="10" width="100" height="36" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="380" y="33" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">NodeActor</text>
+
+  <rect x="480" y="10" width="120" height="36" rx="6" fill="#ef6443" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="540" y="26" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="600" fill="#fff">Receptionist</text>
+  <text x="540" y="38" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#fff" opacity="0.7">Node B</text>
+
+  <rect x="640" y="10" width="70" height="36" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="675" y="33" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Client</text>
+
+  <!-- Lifelines -->
+  <line x1="65" y1="46" x2="65" y2="410" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="220" y1="46" x2="220" y2="410" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="380" y1="46" x2="380" y2="410" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="540" y1="46" x2="540" y2="410" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="675" y1="46" x2="675" y2="410" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+
+  <!-- 1: Actor → R1: register -->
+  <line x1="65" y1="80" x2="212" y2="80" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="138" y="74" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f1f5f9">register("cache/user")</text>
+
+  <!-- 2: R1 → NA: RegistryEvent -->
+  <line x1="220" y1="115" x2="372" y2="115" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="296" y="109" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f1f5f9">RegistryEvent::Added</text>
+
+  <!-- 3: NA → R2: ActorAdd -->
+  <line x1="380" y1="150" x2="532" y2="150" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="456" y="144" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f1f5f9">ActorAdd("cache/user")</text>
+
+  <!-- 4: R2 self-arrow: store -->
+  <path d="M540 175 L570 175 L570 195 L548 195" stroke="#94a3b8" stroke-width="1" fill="none" marker-end="url(#arr-ret)"/>
+  <text x="590" y="189" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">store lazy endpoint</text>
+
+  <!-- Divider: "Later..." -->
+  <line x1="30" y1="230" x2="710" y2="230" stroke="#2a3650" stroke-width="1" stroke-dasharray="8 4"/>
+  <rect x="330" y="220" width="60" height="20" rx="4" fill="#0a0e17"/>
+  <text x="360" y="234" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#64748b">Later</text>
+
+  <!-- 5: Client → R2: lookup -->
+  <line x1="675" y1="270" x2="548" y2="270" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="607" y="264" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f1f5f9">lookup‹CacheActor›</text>
+
+  <!-- 6: R2 → Client: Endpoint -->
+  <line x1="540" y1="305" x2="667" y2="305" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-ret)"/>
+  <text x="603" y="299" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">Endpoint‹CacheActor› (proxy)</text>
+
+  <!-- 7: Client → Actor: send -->
+  <line x1="675" y1="345" x2="73" y2="345" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="375" y="339" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f59e42">.send(msg) → QUIC → Actor</text>
+
+  <!-- 8: Actor → Client: response -->
+  <line x1="65" y1="380" x2="667" y2="380" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-ret)"/>
+  <text x="375" y="374" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">response</text>
+</svg>

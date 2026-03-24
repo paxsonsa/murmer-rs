@@ -1,0 +1,47 @@
+<svg viewBox="0 0 660 240" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#f59e42"/>
+    </marker>
+    <marker id="arr-lg" viewBox="0 0 12 8" refX="11" refY="4" markerWidth="12" markerHeight="8" orient="auto">
+      <path d="M0 0 L12 4 L0 8z" fill="#f59e42"/>
+    </marker>
+  </defs>
+
+  <!-- Core group -->
+  <rect x="10" y="10" width="280" height="220" rx="12" fill="none" stroke="#f59e42" stroke-width="1" stroke-dasharray="4 3" opacity="0.4"/>
+  <text x="24" y="32" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" letter-spacing="0.12em" fill="#f59e42" opacity="0.8">MURMER CORE</text>
+
+  <rect x="30" y="48" width="240" height="40" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="150" y="73" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="500" fill="#f1f5f9">Actors &amp; Messages</text>
+
+  <line x1="150" y1="88" x2="150" y2="106" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="30" y="112" width="240" height="40" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="150" y="137" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="500" fill="#f1f5f9">Discovery &amp; Clustering</text>
+
+  <line x1="150" y1="152" x2="150" y2="170" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="30" y="176" width="240" height="40" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="150" y="201" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="500" fill="#f1f5f9">Supervision</text>
+
+  <!-- Arrow between groups -->
+  <line x1="300" y1="120" x2="358" y2="120" stroke="#f59e42" stroke-width="2" marker-end="url(#arr-lg)"/>
+
+  <!-- App group -->
+  <rect x="370" y="10" width="280" height="220" rx="12" fill="none" stroke="#ef6443" stroke-width="1" stroke-dasharray="4 3" opacity="0.4"/>
+  <text x="384" y="32" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" letter-spacing="0.12em" fill="#ef6443" opacity="0.8">MURMER-APP</text>
+
+  <rect x="390" y="48" width="240" height="40" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="510" y="73" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="500" fill="#f1f5f9">Actor Specs</text>
+
+  <line x1="510" y1="88" x2="510" y2="106" stroke="#ef6443" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="390" y="112" width="240" height="40" rx="6" fill="#f59e42" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="510" y="137" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600" fill="#0a0e17">Coordinator</text>
+
+  <line x1="510" y1="152" x2="510" y2="170" stroke="#ef6443" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="390" y="176" width="240" height="40" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="510" y="201" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="500" fill="#f1f5f9">Placement &amp; Recovery</text>
+</svg>

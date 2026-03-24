@@ -1,0 +1,76 @@
+<svg viewBox="0 0 480 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#f59e42"/>
+    </marker>
+    <marker id="arr-coral" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#ef6443"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <!-- User submits -->
+  <rect x="160" y="10" width="160" height="38" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="240" y="34" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">User submits ActorSpec</text>
+
+  <line x1="240" y1="48" x2="240" y2="66" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Coordinator -->
+  <rect x="150" y="72" width="180" height="42" rx="6" fill="#f59e42" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="240" y="98" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" font-weight="600" fill="#0a0e17">Coordinator</text>
+
+  <line x1="240" y1="114" x2="240" y2="132" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Filter -->
+  <rect x="145" y="138" width="190" height="38" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="240" y="154" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Filter by</text>
+  <text x="240" y="168" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">PlacementConstraints</text>
+
+  <line x1="240" y1="176" x2="240" y2="194" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Score -->
+  <rect x="145" y="200" width="190" height="38" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="240" y="216" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Score with</text>
+  <text x="240" y="230" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">PlacementStrategy</text>
+
+  <line x1="240" y1="238" x2="240" y2="256" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Spawn -->
+  <rect x="160" y="262" width="160" height="38" rx="6" fill="#2a3650" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="240" y="278" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">SpawnActor</text>
+  <text x="240" y="292" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">→ target node</text>
+
+  <line x1="240" y1="300" x2="240" y2="318" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Running -->
+  <rect x="175" y="324" width="130" height="38" rx="6" fill="#2a3650" stroke="#2dd4bf" stroke-width="1.5"/>
+  <text x="240" y="348" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600" fill="#2dd4bf">Running</text>
+
+  <!-- Failure arrow -->
+  <line x1="240" y1="362" x2="240" y2="382" stroke="#ef6443" stroke-width="1.5" marker-end="url(#arr-coral)"/>
+  <text x="255" y="376" font-family="JetBrains Mono, monospace" font-size="7" fill="#ef6443">node failure</text>
+
+  <!-- CrashStrategy diamond -->
+  <polygon points="240,388 300,418 240,448 180,418" fill="#ef6443" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="240" y="415" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="600" fill="#fff">Crash</text>
+  <text x="240" y="427" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="600" fill="#fff">Strategy?</text>
+
+  <!-- Redistribute (left) — loops back to Filter -->
+  <line x1="180" y1="418" x2="50" y2="418" stroke="#f59e42" stroke-width="1.5"/>
+  <line x1="50" y1="418" x2="50" y2="157" stroke="#f59e42" stroke-width="1.5"/>
+  <line x1="50" y1="157" x2="137" y2="157" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="42" y="300" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#f59e42" transform="rotate(-90 42 300)">Redistribute</text>
+
+  <!-- WaitForReturn (center-left) -->
+  <line x1="220" y1="448" x2="220" y2="475" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="150" y="481" width="140" height="34" rx="6" fill="#2a3650" stroke="#f59e42" stroke-width="1"/>
+  <text x="220" y="497" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#f1f5f9">WaitForReturn</text>
+  <text x="220" y="510" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7" fill="#94a3b8">timeout → redistribute</text>
+
+  <!-- Abandon (right) -->
+  <line x1="300" y1="418" x2="400" y2="418" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr-g)"/>
+  <rect x="408" y="401" width="60" height="34" rx="6" fill="#1a2235" stroke="#64748b" stroke-width="1"/>
+  <text x="438" y="422" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#64748b">Abandon</text>
+</svg>

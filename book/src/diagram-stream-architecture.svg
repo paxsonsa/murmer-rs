@@ -1,0 +1,73 @@
+<svg viewBox="0 0 700 240" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#f59e42"/>
+    </marker>
+  </defs>
+
+  <!-- Node Alpha group -->
+  <rect x="10" y="10" width="170" height="220" rx="10" fill="none" stroke="#f59e42" stroke-width="1" stroke-dasharray="4 3" opacity="0.4"/>
+  <text x="22" y="28" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" letter-spacing="0.1em" fill="#f59e42" opacity="0.8">NODE ALPHA</text>
+
+  <rect x="30" y="42" width="130" height="34" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="95" y="64" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Client Code</text>
+
+  <line x1="95" y1="76" x2="95" y2="92" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="30" y="98" width="130" height="34" rx="6" fill="#f59e42" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="95" y="120" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600" fill="#0a0e17">Endpoint‹A›</text>
+
+  <line x1="95" y1="132" x2="95" y2="148" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="30" y="154" width="130" height="34" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="95" y="176" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">ActorProxy</text>
+
+  <!-- QUIC Connection group -->
+  <rect x="220" y="10" width="260" height="220" rx="10" fill="none" stroke="#ef6443" stroke-width="1.5" opacity="0.5"/>
+  <text x="234" y="28" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" letter-spacing="0.1em" fill="#ef6443" opacity="0.8">QUIC CONNECTION</text>
+  <text x="464" y="28" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="7" fill="#64748b">single conn, multiplexed</text>
+
+  <!-- Stream 1 -->
+  <rect x="240" y="50" width="220" height="36" rx="6" fill="#1a2235" stroke="#ef6443" stroke-width="1"/>
+  <text x="350" y="65" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#ef6443">Stream 1</text>
+  <text x="350" y="78" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#64748b">actor/cache</text>
+
+  <!-- Stream 2 -->
+  <rect x="240" y="100" width="220" height="36" rx="6" fill="#1a2235" stroke="#ef6443" stroke-width="1" opacity="0.7"/>
+  <text x="350" y="115" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#ef6443" opacity="0.7">Stream 2</text>
+  <text x="350" y="128" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#64748b">actor/auth</text>
+
+  <!-- Stream 3 -->
+  <rect x="240" y="150" width="220" height="36" rx="6" fill="#1a2235" stroke="#ef6443" stroke-width="1" opacity="0.5"/>
+  <text x="350" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#ef6443" opacity="0.5">Stream 3</text>
+  <text x="350" y="178" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#64748b">actor/worker</text>
+
+  <!-- Idle note -->
+  <text x="350" y="210" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#64748b" opacity="0.5">streams created on first access, closed when idle</text>
+
+  <!-- Horizontal connections: Alpha → QUIC -->
+  <line x1="160" y1="68" x2="232" y2="68" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="160" y1="118" x2="232" y2="118" stroke="#f59e42" stroke-width="1" opacity="0.7" marker-end="url(#arr)"/>
+  <line x1="160" y1="168" x2="232" y2="168" stroke="#f59e42" stroke-width="1" opacity="0.5" marker-end="url(#arr)"/>
+
+  <!-- Horizontal connections: QUIC → Beta -->
+  <line x1="468" y1="68" x2="530" y2="68" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Node Beta group -->
+  <rect x="520" y="10" width="170" height="220" rx="10" fill="none" stroke="#f59e42" stroke-width="1" stroke-dasharray="4 3" opacity="0.4"/>
+  <text x="534" y="28" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" letter-spacing="0.1em" fill="#f59e42" opacity="0.8">NODE BETA</text>
+
+  <rect x="540" y="42" width="130" height="34" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="605" y="57" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#f1f5f9">StreamHandler</text>
+  <text x="605" y="70" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#94a3b8">per-stream</text>
+
+  <line x1="605" y1="76" x2="605" y2="92" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="540" y="98" width="130" height="34" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="605" y="120" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Mailbox</text>
+
+  <line x1="605" y1="132" x2="605" y2="148" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="540" y="154" width="130" height="34" rx="6" fill="#2a3650" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="605" y="176" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600" fill="#f1f5f9">Actor</text>
+</svg>

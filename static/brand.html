@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>murmer — Brand</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --slate-950: #0a0e17;
+    --slate-900: #0f1623;
+    --slate-800: #1a2235;
+    --slate-700: #2a3650;
+    --slate-500: #64748b;
+    --slate-400: #94a3b8;
+    --slate-300: #cbd5e1;
+    --slate-100: #f1f5f9;
+    --signal-warm: #f59e42;
+    --signal-hot: #ef6443;
+    --signal-cool: #38bdf8;
+    --signal-teal: #2dd4bf;
+    --signal-glow: rgba(245, 158, 66, 0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--slate-950);
+    color: var(--slate-300);
+    font-family: 'DM Sans', sans-serif;
+    line-height: 1.6;
+    overflow-x: hidden;
+  }
+
+  .grain {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 100;
+    opacity: 0.03;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  }
+
+  /* HERO */
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    padding: 4rem 2rem;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute;
+    width: 600px;
+    height: 600px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(245,158,66,0.06) 0%, transparent 70%);
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+
+  .logo-mark {
+    width: 180px;
+    height: 180px;
+    margin-bottom: 2.5rem;
+    animation: fadeIn 1s ease-out;
+  }
+
+  .wordmark {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 4rem;
+    font-weight: 300;
+    letter-spacing: 0.25em;
+    color: var(--slate-100);
+    margin-bottom: 0.5rem;
+    animation: fadeIn 1s ease-out 0.2s both;
+  }
+
+  .tagline {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    font-weight: 400;
+    letter-spacing: 0.15em;
+    color: var(--slate-500);
+    text-transform: uppercase;
+    animation: fadeIn 1s ease-out 0.4s both;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* RIPPLE ANIMATION in logo */
+  .ripple-ring {
+    animation: ripple 3s ease-out infinite;
+    transform-origin: center;
+  }
+  .ripple-ring:nth-child(2) { animation-delay: 0.6s; }
+  .ripple-ring:nth-child(3) { animation-delay: 1.2s; }
+  .ripple-ring:nth-child(4) { animation-delay: 1.8s; }
+
+  @keyframes ripple {
+    0% { opacity: 0.6; }
+    100% { opacity: 0; }
+  }
+
+  /* SECTIONS */
+  section {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 6rem 2rem;
+  }
+
+  .section-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--signal-warm);
+    margin-bottom: 1.5rem;
+  }
+
+  h2 {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 1.8rem;
+    font-weight: 500;
+    color: var(--slate-100);
+    margin-bottom: 1rem;
+    line-height: 1.3;
+  }
+
+  p.desc {
+    color: var(--slate-400);
+    max-width: 560px;
+    margin-bottom: 3rem;
+    font-size: 0.95rem;
+  }
+
+  /* DIVIDER */
+  .divider {
+    max-width: 1100px;
+    margin: 0 auto;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--slate-700), transparent);
+  }
+
+  /* LOGO VARIATIONS GRID */
+  .variations-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 2rem;
+  }
+
+  .variation-card {
+    border: 1px solid var(--slate-800);
+    border-radius: 16px;
+    padding: 3rem 2rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 260px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s;
+  }
+  .variation-card:hover {
+    border-color: var(--slate-700);
+  }
+
+  .variation-card.dark {
+    background: var(--slate-900);
+  }
+  .variation-card.light {
+    background: #f8fafc;
+  }
+  .variation-card.warm {
+    background: linear-gradient(135deg, #1a1208, #1a1510);
+  }
+
+  .variation-label {
+    position: absolute;
+    bottom: 1rem;
+    left: 1.5rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--slate-500);
+  }
+  .variation-card.light .variation-label { color: var(--slate-500); }
+
+  /* COLOR PALETTE */
+  .palette-row {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 2rem;
+  }
+
+  .swatch {
+    width: 80px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .swatch-color {
+    width: 64px;
+    height: 64px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .swatch-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    color: var(--slate-500);
+    text-align: center;
+    letter-spacing: 0.05em;
+  }
+
+  .swatch-hex {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    color: var(--slate-400);
+  }
+
+  /* TYPOGRAPHY */
+  .type-specimen {
+    margin-bottom: 2.5rem;
+  }
+  .type-specimen .font-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--signal-warm);
+    margin-bottom: 0.75rem;
+  }
+  .type-specimen .sample-mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 2rem;
+    font-weight: 300;
+    color: var(--slate-100);
+    letter-spacing: 0.08em;
+    margin-bottom: 0.5rem;
+  }
+  .type-specimen .sample-sans {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 1.6rem;
+    font-weight: 400;
+    color: var(--slate-100);
+    margin-bottom: 0.5rem;
+  }
+  .type-specimen .sample-detail {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--slate-500);
+  }
+
+  /* CONCEPT */
+  .concept-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3rem;
+    align-items: center;
+  }
+
+  .concept-text h3 {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 1.1rem;
+    font-weight: 500;
+    color: var(--slate-100);
+    margin-bottom: 0.75rem;
+  }
+  .concept-text p {
+    color: var(--slate-400);
+    font-size: 0.9rem;
+    line-height: 1.7;
+  }
+
+  .concept-visual {
+    display: flex;
+    justify-content: center;
+  }
+
+  /* BADGE / SHIELD */
+  .badge-row {
+    display: flex;
+    gap: 2rem;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 2rem;
+  }
+
+  .badge-card {
+    background: var(--slate-900);
+    border: 1px solid var(--slate-800);
+    border-radius: 12px;
+    padding: 2rem 2.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  /* USAGE EXAMPLES */
+  .usage-row {
+    display: flex;
+    gap: 2rem;
+    flex-wrap: wrap;
+    margin-top: 2rem;
+  }
+
+  .readme-preview {
+    background: var(--slate-900);
+    border: 1px solid var(--slate-800);
+    border-radius: 16px;
+    padding: 2.5rem;
+    max-width: 600px;
+    flex: 1;
+    min-width: 300px;
+  }
+
+  .readme-preview .rp-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .readme-preview .rp-header svg {
+    flex-shrink: 0;
+  }
+
+  .readme-preview .rp-title {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--slate-100);
+  }
+
+  .readme-preview .rp-desc {
+    font-size: 0.9rem;
+    color: var(--slate-400);
+    line-height: 1.6;
+  }
+
+  .readme-preview .rp-badges {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 1rem;
+  }
+
+  .rp-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: var(--slate-800);
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    color: var(--slate-400);
+  }
+  .rp-badge .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+  }
+
+  /* EXPORTS NOTE */
+  .exports {
+    margin-top: 3rem;
+    padding: 2rem;
+    border: 1px dashed var(--slate-700);
+    border-radius: 12px;
+  }
+  .exports h3 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--slate-400);
+    margin-bottom: 1rem;
+  }
+  .exports ul {
+    list-style: none;
+    padding: 0;
+  }
+  .exports li {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    color: var(--slate-500);
+    padding: 0.3rem 0;
+  }
+  .exports li code {
+    color: var(--signal-warm);
+    background: rgba(245,158,66,0.08);
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+  }
+
+  @media (max-width: 700px) {
+    .wordmark { font-size: 2.5rem; }
+    .concept-grid { grid-template-columns: 1fr; }
+    .variations-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="grain"></div>
+
+<!-- ==================== HERO ==================== -->
+<div class="hero">
+  <!-- PRIMARY LOGO MARK — animated ripples -->
+  <svg class="logo-mark" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="signalGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#f59e42"/>
+        <stop offset="100%" stop-color="#ef6443"/>
+      </linearGradient>
+      <linearGradient id="nodeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#f59e42"/>
+        <stop offset="50%" stop-color="#ef6443"/>
+        <stop offset="100%" stop-color="#f59e42"/>
+      </linearGradient>
+      <radialGradient id="glowA" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#f59e42" stop-opacity="0.3"/>
+        <stop offset="100%" stop-color="#f59e42" stop-opacity="0"/>
+      </radialGradient>
+    </defs>
+
+    <!-- Background subtle glow -->
+    <circle cx="72" cy="85" r="50" fill="url(#glowA)" opacity="0.4"/>
+    <circle cx="140" cy="105" r="40" fill="url(#glowA)" opacity="0.3"/>
+
+    <!-- Ripple rings from node A (72, 85) -->
+    <circle class="ripple-ring" cx="72" cy="85" r="28" fill="none" stroke="#f59e42" stroke-width="0.8" opacity="0.4"/>
+    <circle class="ripple-ring" cx="72" cy="85" r="44" fill="none" stroke="#f59e42" stroke-width="0.5" opacity="0.25"/>
+    <circle class="ripple-ring" cx="72" cy="85" r="62" fill="none" stroke="#f59e42" stroke-width="0.3" opacity="0.15"/>
+
+    <!-- Ripple rings from node B (140, 105) -->
+    <circle class="ripple-ring" cx="140" cy="105" r="24" fill="none" stroke="#ef6443" stroke-width="0.8" opacity="0.35" style="animation-delay: 0.3s"/>
+    <circle class="ripple-ring" cx="140" cy="105" r="40" fill="none" stroke="#ef6443" stroke-width="0.5" opacity="0.2" style="animation-delay: 0.9s"/>
+    <circle class="ripple-ring" cx="140" cy="105" r="56" fill="none" stroke="#ef6443" stroke-width="0.3" opacity="0.12" style="animation-delay: 1.5s"/>
+
+    <!-- Connection lines (message paths) -->
+    <line x1="72" y1="85" x2="140" y2="105" stroke="url(#signalGrad)" stroke-width="1.2" opacity="0.35"/>
+    <line x1="72" y1="85" x2="105" y2="148" stroke="url(#signalGrad)" stroke-width="0.8" opacity="0.2"/>
+    <line x1="140" y1="105" x2="105" y2="148" stroke="url(#signalGrad)" stroke-width="0.8" opacity="0.2"/>
+    <line x1="72" y1="85" x2="95" y2="52" stroke="url(#signalGrad)" stroke-width="0.6" opacity="0.15"/>
+    <line x1="140" y1="105" x2="160" y2="65" stroke="url(#signalGrad)" stroke-width="0.6" opacity="0.15"/>
+
+    <!-- Actor nodes -->
+    <circle cx="72" cy="85" r="7" fill="url(#nodeGrad)"/>
+    <circle cx="72" cy="85" r="3.5" fill="#0a0e17"/>
+    <circle cx="140" cy="105" r="6" fill="url(#nodeGrad)"/>
+    <circle cx="140" cy="105" r="3" fill="#0a0e17"/>
+    <circle cx="105" cy="148" r="4.5" fill="url(#nodeGrad)" opacity="0.7"/>
+    <circle cx="105" cy="148" r="2.2" fill="#0a0e17"/>
+    <circle cx="95" cy="52" r="3.5" fill="url(#nodeGrad)" opacity="0.5"/>
+    <circle cx="95" cy="52" r="1.8" fill="#0a0e17"/>
+    <circle cx="160" cy="65" r="3" fill="url(#nodeGrad)" opacity="0.4"/>
+    <circle cx="160" cy="65" r="1.5" fill="#0a0e17"/>
+  </svg>
+
+  <div class="wordmark">murmer</div>
+  <div class="tagline">distributed actors for rust</div>
+</div>
+
+<div class="divider"></div>
+
+<!-- ==================== CONCEPT ==================== -->
+<section>
+  <div class="section-label">Concept</div>
+  <div class="concept-grid">
+    <div class="concept-text">
+      <h3>Signal propagation through a mesh</h3>
+      <p>
+        The mark represents actors as hollow nodes — self-contained, stateful processes — connected by message paths. Concentric ripples radiate outward from each node: the murmur of messages propagating through the system. Whether two nodes are millimeters apart in-process or kilometers apart over QUIC, the ripples look the same. Location transparency, visualized.
+      </p>
+      <p style="margin-top: 1rem;">
+        The warm gradient (amber → coral) nods to the signal warmth of the BEAM — where the inspiration began — while the dark ground and precise geometry anchor it firmly in Rust's performance-first identity.
+      </p>
+    </div>
+    <div class="concept-visual">
+      <!-- Static mark for explanation -->
+      <svg width="220" height="220" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="sg2" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#f59e42"/>
+            <stop offset="100%" stop-color="#ef6443"/>
+          </linearGradient>
+        </defs>
+        <!-- Labeled ripples -->
+        <circle cx="72" cy="85" r="28" fill="none" stroke="#f59e42" stroke-width="0.8" opacity="0.4" stroke-dasharray="3 3"/>
+        <circle cx="72" cy="85" r="44" fill="none" stroke="#f59e42" stroke-width="0.5" opacity="0.25" stroke-dasharray="3 3"/>
+        <circle cx="140" cy="105" r="24" fill="none" stroke="#ef6443" stroke-width="0.8" opacity="0.35" stroke-dasharray="3 3"/>
+        <circle cx="140" cy="105" r="40" fill="none" stroke="#ef6443" stroke-width="0.5" opacity="0.2" stroke-dasharray="3 3"/>
+        <line x1="72" y1="85" x2="140" y2="105" stroke="url(#sg2)" stroke-width="1.2" opacity="0.35"/>
+        <line x1="72" y1="85" x2="105" y2="148" stroke="url(#sg2)" stroke-width="0.8" opacity="0.2"/>
+        <line x1="140" y1="105" x2="105" y2="148" stroke="url(#sg2)" stroke-width="0.8" opacity="0.2"/>
+        <circle cx="72" cy="85" r="7" fill="url(#sg2)"/>
+        <circle cx="72" cy="85" r="3.5" fill="#0a0e17"/>
+        <circle cx="140" cy="105" r="6" fill="url(#sg2)"/>
+        <circle cx="140" cy="105" r="3" fill="#0a0e17"/>
+        <circle cx="105" cy="148" r="4.5" fill="url(#sg2)" opacity="0.7"/>
+        <circle cx="105" cy="148" r="2.2" fill="#0a0e17"/>
+        <!-- Labels -->
+        <text x="58" y="70" fill="#64748b" font-family="JetBrains Mono, monospace" font-size="7" letter-spacing="0.1em">NODE A</text>
+        <text x="148" y="98" fill="#64748b" font-family="JetBrains Mono, monospace" font-size="7" letter-spacing="0.1em">NODE B</text>
+        <text x="105" y="170" fill="#64748b" font-family="JetBrains Mono, monospace" font-size="7" text-anchor="middle" letter-spacing="0.1em">NODE C</text>
+        <text x="20" y="30" fill="#f59e42" font-family="JetBrains Mono, monospace" font-size="6" opacity="0.5" letter-spacing="0.05em">message ripples</text>
+        <line x1="20" y1="33" x2="55" y2="60" stroke="#f59e42" stroke-width="0.4" opacity="0.3"/>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ==================== LOGO VARIATIONS ==================== -->
+<section>
+  <div class="section-label">Logo Variations</div>
+  <h2>Lockups</h2>
+  <p class="desc">The mark and wordmark work together or independently. Use the full lockup where space allows; the mark alone for favicons, badges, and compact contexts.</p>
+
+  <div class="variations-grid">
+    <!-- Dark full lockup -->
+    <div class="variation-card dark">
+      <svg width="48" height="48" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="sg3" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#f59e42"/><stop offset="100%" stop-color="#ef6443"/>
+          </linearGradient>
+        </defs>
+        <circle cx="72" cy="85" r="28" fill="none" stroke="#f59e42" stroke-width="1" opacity="0.4"/>
+        <circle cx="72" cy="85" r="44" fill="none" stroke="#f59e42" stroke-width="0.6" opacity="0.2"/>
+        <circle cx="140" cy="105" r="24" fill="none" stroke="#ef6443" stroke-width="1" opacity="0.3"/>
+        <line x1="72" y1="85" x2="140" y2="105" stroke="url(#sg3)" stroke-width="1.5" opacity="0.35"/>
+        <line x1="72" y1="85" x2="105" y2="148" stroke="url(#sg3)" stroke-width="1" opacity="0.2"/>
+        <line x1="140" y1="105" x2="105" y2="148" stroke="url(#sg3)" stroke-width="1" opacity="0.2"/>
+        <circle cx="72" cy="85" r="8" fill="url(#sg3)"/><circle cx="72" cy="85" r="4" fill="#0f1623"/>
+        <circle cx="140" cy="105" r="7" fill="url(#sg3)"/><circle cx="140" cy="105" r="3.5" fill="#0f1623"/>
+        <circle cx="105" cy="148" r="5" fill="url(#sg3)" opacity="0.7"/><circle cx="105" cy="148" r="2.5" fill="#0f1623"/>
+      </svg>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 1.4rem; font-weight: 300; letter-spacing: 0.2em; color: #f1f5f9; margin-top: 1rem;">murmer</div>
+      <span class="variation-label">Dark Background</span>
+    </div>
+
+    <!-- Light full lockup -->
+    <div class="variation-card light">
+      <svg width="48" height="48" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="sg4" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#d97706"/><stop offset="100%" stop-color="#dc2626"/>
+          </linearGradient>
+        </defs>
+        <circle cx="72" cy="85" r="28" fill="none" stroke="#d97706" stroke-width="1" opacity="0.3"/>
+        <circle cx="72" cy="85" r="44" fill="none" stroke="#d97706" stroke-width="0.6" opacity="0.15"/>
+        <circle cx="140" cy="105" r="24" fill="none" stroke="#dc2626" stroke-width="1" opacity="0.25"/>
+        <line x1="72" y1="85" x2="140" y2="105" stroke="url(#sg4)" stroke-width="1.5" opacity="0.3"/>
+        <line x1="72" y1="85" x2="105" y2="148" stroke="url(#sg4)" stroke-width="1" opacity="0.15"/>
+        <line x1="140" y1="105" x2="105" y2="148" stroke="url(#sg4)" stroke-width="1" opacity="0.15"/>
+        <circle cx="72" cy="85" r="8" fill="url(#sg4)"/><circle cx="72" cy="85" r="4" fill="#f8fafc"/>
+        <circle cx="140" cy="105" r="7" fill="url(#sg4)"/><circle cx="140" cy="105" r="3.5" fill="#f8fafc"/>
+        <circle cx="105" cy="148" r="5" fill="url(#sg4)" opacity="0.7"/><circle cx="105" cy="148" r="2.5" fill="#f8fafc"/>
+      </svg>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 1.4rem; font-weight: 300; letter-spacing: 0.2em; color: #1a2235; margin-top: 1rem;">murmer</div>
+      <span class="variation-label">Light Background</span>
+    </div>
+
+    <!-- Mark only -->
+    <div class="variation-card dark" style="padding: 2rem;">
+      <div style="display: flex; align-items: center; gap: 2.5rem;">
+        <!-- 48px mark -->
+        <div style="text-align: center;">
+          <svg width="48" height="48" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+            <defs><linearGradient id="sg5" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f59e42"/><stop offset="100%" stop-color="#ef6443"/></linearGradient></defs>
+            <circle cx="72" cy="85" r="28" fill="none" stroke="#f59e42" stroke-width="1.2" opacity="0.4"/>
+            <circle cx="140" cy="105" r="24" fill="none" stroke="#ef6443" stroke-width="1.2" opacity="0.3"/>
+            <line x1="72" y1="85" x2="140" y2="105" stroke="url(#sg5)" stroke-width="2" opacity="0.35"/>
+            <line x1="72" y1="85" x2="105" y2="148" stroke="url(#sg5)" stroke-width="1.2" opacity="0.2"/>
+            <line x1="140" y1="105" x2="105" y2="148" stroke="url(#sg5)" stroke-width="1.2" opacity="0.2"/>
+            <circle cx="72" cy="85" r="10" fill="url(#sg5)"/><circle cx="72" cy="85" r="5" fill="#0f1623"/>
+            <circle cx="140" cy="105" r="8.5" fill="url(#sg5)"/><circle cx="140" cy="105" r="4.2" fill="#0f1623"/>
+            <circle cx="105" cy="148" r="6.5" fill="url(#sg5)" opacity="0.7"/><circle cx="105" cy="148" r="3.2" fill="#0f1623"/>
+          </svg>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: #64748b; margin-top: 0.5rem;">48px</div>
+        </div>
+        <!-- 32px mark -->
+        <div style="text-align: center;">
+          <svg width="32" height="32" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+            <defs><linearGradient id="sg6" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f59e42"/><stop offset="100%" stop-color="#ef6443"/></linearGradient></defs>
+            <circle cx="75" cy="80" r="30" fill="none" stroke="#f59e42" stroke-width="2" opacity="0.35"/>
+            <circle cx="135" cy="110" r="25" fill="none" stroke="#ef6443" stroke-width="2" opacity="0.25"/>
+            <line x1="75" y1="80" x2="135" y2="110" stroke="url(#sg6)" stroke-width="3" opacity="0.3"/>
+            <circle cx="75" cy="80" r="14" fill="url(#sg6)"/><circle cx="75" cy="80" r="7" fill="#0f1623"/>
+            <circle cx="135" cy="110" r="12" fill="url(#sg6)"/><circle cx="135" cy="110" r="6" fill="#0f1623"/>
+            <circle cx="100" cy="150" r="9" fill="url(#sg6)" opacity="0.6"/>
+          </svg>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: #64748b; margin-top: 0.5rem;">32px</div>
+        </div>
+        <!-- 16px mark -->
+        <div style="text-align: center;">
+          <svg width="16" height="16" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+            <defs><linearGradient id="sg7" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f59e42"/><stop offset="100%" stop-color="#ef6443"/></linearGradient></defs>
+            <circle cx="80" cy="75" r="35" fill="none" stroke="#f59e42" stroke-width="4" opacity="0.3"/>
+            <line x1="80" y1="75" x2="135" y2="115" stroke="url(#sg7)" stroke-width="5" opacity="0.3"/>
+            <circle cx="80" cy="75" r="20" fill="url(#sg7)"/>
+            <circle cx="135" cy="115" r="16" fill="url(#sg7)" opacity="0.8"/>
+          </svg>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: #64748b; margin-top: 0.5rem;">16px</div>
+        </div>
+      </div>
+      <span class="variation-label">Mark Only — Scaled</span>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ==================== COLOR PALETTE ==================== -->
+<section>
+  <div class="section-label">Color</div>
+  <h2>Palette</h2>
+  <p class="desc">Primary signal colors are warm amber-to-coral. The slate system provides ground and typography tones. Use sparingly — the mark does the talking.</p>
+
+  <div style="margin-bottom: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: var(--slate-500); letter-spacing: 0.1em;">SIGNAL</div>
+  <div class="palette-row">
+    <div class="swatch">
+      <div class="swatch-color" style="background: #f59e42;"></div>
+      <div class="swatch-name">Amber</div>
+      <div class="swatch-hex">#f59e42</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #ef6443;"></div>
+      <div class="swatch-name">Coral</div>
+      <div class="swatch-hex">#ef6443</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: linear-gradient(135deg, #f59e42, #ef6443);"></div>
+      <div class="swatch-name">Signal</div>
+      <div class="swatch-hex">gradient</div>
+    </div>
+  </div>
+
+  <div style="margin-bottom: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: var(--slate-500); letter-spacing: 0.1em;">GROUND</div>
+  <div class="palette-row">
+    <div class="swatch">
+      <div class="swatch-color" style="background: #0a0e17;"></div>
+      <div class="swatch-name">950</div>
+      <div class="swatch-hex">#0a0e17</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #0f1623;"></div>
+      <div class="swatch-name">900</div>
+      <div class="swatch-hex">#0f1623</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #1a2235;"></div>
+      <div class="swatch-name">800</div>
+      <div class="swatch-hex">#1a2235</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #2a3650;"></div>
+      <div class="swatch-name">700</div>
+      <div class="swatch-hex">#2a3650</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #64748b;"></div>
+      <div class="swatch-name">500</div>
+      <div class="swatch-hex">#64748b</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #cbd5e1;"></div>
+      <div class="swatch-name">300</div>
+      <div class="swatch-hex">#cbd5e1</div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #f1f5f9;"></div>
+      <div class="swatch-name">100</div>
+      <div class="swatch-hex">#f1f5f9</div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ==================== TYPOGRAPHY ==================== -->
+<section>
+  <div class="section-label">Typography</div>
+  <h2>Type System</h2>
+  <p class="desc">JetBrains Mono for the wordmark, code, and technical labels. DM Sans for body copy and documentation headings.</p>
+
+  <div class="type-specimen">
+    <div class="font-name">JetBrains Mono — Wordmark / Code / Labels</div>
+    <div class="sample-mono">murmer</div>
+    <div class="sample-detail">Weight 300 · Letter-spacing 0.25em · Lowercase always</div>
+  </div>
+
+  <div class="type-specimen">
+    <div class="font-name">DM Sans — Body / Headings</div>
+    <div class="sample-sans">Distributed actors for Rust</div>
+    <div class="sample-detail">Weight 400–700 · Default spacing · Sentence case</div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ==================== IN CONTEXT ==================== -->
+<section>
+  <div class="section-label">In Context</div>
+  <h2>README Header</h2>
+  <p class="desc">How the brand works at the top of a GitHub README or docs site.</p>
+
+  <div class="usage-row">
+    <div class="readme-preview">
+      <div class="rp-header">
+        <svg width="36" height="36" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+          <defs><linearGradient id="sg8" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f59e42"/><stop offset="100%" stop-color="#ef6443"/></linearGradient></defs>
+          <circle cx="72" cy="85" r="28" fill="none" stroke="#f59e42" stroke-width="1.5" opacity="0.4"/>
+          <circle cx="140" cy="105" r="24" fill="none" stroke="#ef6443" stroke-width="1.5" opacity="0.3"/>
+          <line x1="72" y1="85" x2="140" y2="105" stroke="url(#sg8)" stroke-width="2" opacity="0.35"/>
+          <line x1="72" y1="85" x2="105" y2="148" stroke="url(#sg8)" stroke-width="1.2" opacity="0.2"/>
+          <line x1="140" y1="105" x2="105" y2="148" stroke="url(#sg8)" stroke-width="1.2" opacity="0.2"/>
+          <circle cx="72" cy="85" r="10" fill="url(#sg8)"/><circle cx="72" cy="85" r="5" fill="#0f1623"/>
+          <circle cx="140" cy="105" r="8.5" fill="url(#sg8)"/><circle cx="140" cy="105" r="4.2" fill="#0f1623"/>
+          <circle cx="105" cy="148" r="6.5" fill="url(#sg8)" opacity="0.7"/><circle cx="105" cy="148" r="3.2" fill="#0f1623"/>
+        </svg>
+        <div class="rp-title">murmer</div>
+      </div>
+      <div class="rp-desc">
+        A distributed actor framework for Rust, built on tokio and QUIC. Typed, location-transparent actors that communicate through message passing — whether local or across the network.
+      </div>
+      <div class="rp-badges">
+        <div class="rp-badge"><div class="dot" style="background: #f59e42;"></div>crates.io</div>
+        <div class="rp-badge"><div class="dot" style="background: #2dd4bf;"></div>docs.rs</div>
+        <div class="rp-badge"><div class="dot" style="background: #38bdf8;"></div>MIT / Apache-2.0</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="exports">
+    <h3>Included Assets</h3>
+    <ul>
+      <li><code>logo-mark.svg</code> — Standalone mark (all sizes)</li>
+      <li><code>logo-lockup-dark.svg</code> — Mark + wordmark, dark bg</li>
+      <li><code>logo-lockup-light.svg</code> — Mark + wordmark, light bg</li>
+      <li><code>favicon.svg</code> — Simplified 2-node mark for 16–32px</li>
+    </ul>
+  </div>
+</section>
+
+<div style="height: 6rem;"></div>
+
+</body>
+</html>

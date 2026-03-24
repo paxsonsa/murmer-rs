@@ -1,0 +1,15 @@
+[book]
+title = "Murmer — A Distributed Actor Framework for Rust"
+authors = ["Andrew Paxson"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "build"
+
+[output.html]
+git-repository-url = "https://github.com/paxsonsa/murmer-rs"
+edit-url-template = "https://github.com/paxsonsa/murmer-rs/edit/main/book/{path}"
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+additional-css = ["murmer-theme.css"]

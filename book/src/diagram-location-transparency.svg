@@ -1,0 +1,73 @@
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#f59e42"/>
+    </marker>
+    <marker id="arr-coral" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 3.5 L0 7z" fill="#ef6443"/>
+    </marker>
+  </defs>
+
+  <!-- Caller -->
+  <rect x="10" y="108" width="104" height="48" rx="6" fill="#1a2235" stroke="#64748b" stroke-width="1"/>
+  <text x="62" y="128" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="500" fill="#f1f5f9">Your Code</text>
+  <text x="62" y="144" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">.send(msg)</text>
+
+  <line x1="114" y1="132" x2="142" y2="132" stroke="#f59e42" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Endpoint -->
+  <rect x="150" y="108" width="130" height="48" rx="6" fill="#f59e42" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="215" y="128" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700" fill="#1a2235">Endpoint‹A›</text>
+  <text x="215" y="144" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="500" fill="#5c3400">location transparent</text>
+
+  <!-- Fork lines -->
+  <path d="M280 124 C305 124 305 60 330 60" stroke="#f59e42" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M280 140 C305 140 305 208 330 208" stroke="#ef6443" stroke-width="1.5" fill="none" marker-end="url(#arr-coral)"/>
+
+  <!-- Fork labels -->
+  <text x="296" y="80" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#f59e42">local</text>
+  <text x="293" y="180" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#ef6443">remote</text>
+
+  <!-- LOCAL PATH group -->
+  <rect x="326" y="10" width="424" height="100" rx="10" fill="none" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="338" y="28" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" letter-spacing="0.1em" fill="#64748b">LOCAL PATH</text>
+
+  <rect x="338" y="38" width="100" height="42" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="388" y="56" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Envelope</text>
+  <text x="388" y="70" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" fill="#94a3b8">zero-copy</text>
+
+  <line x1="438" y1="59" x2="466" y2="59" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="474" y="38" width="100" height="42" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="524" y="64" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="500" fill="#f1f5f9">Supervisor</text>
+
+  <line x1="574" y1="59" x2="602" y2="59" stroke="#f59e42" stroke-width="1" marker-end="url(#arr)"/>
+
+  <rect x="610" y="38" width="120" height="42" rx="6" fill="#2a3650" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="670" y="64" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600" fill="#f1f5f9">Actor</text>
+
+  <!-- REMOTE PATH group -->
+  <rect x="326" y="150" width="424" height="120" rx="10" fill="none" stroke="#2a3650" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="338" y="168" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" letter-spacing="0.1em" fill="#64748b">REMOTE PATH</text>
+
+  <rect x="338" y="184" width="82" height="42" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="379" y="202" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#f1f5f9">Serialize</text>
+  <text x="379" y="216" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#94a3b8">bincode</text>
+
+  <line x1="420" y1="205" x2="442" y2="205" stroke="#ef6443" stroke-width="1" marker-end="url(#arr-coral)"/>
+
+  <rect x="450" y="184" width="82" height="42" rx="6" fill="#ef6443" stroke="#f59e42" stroke-width="1.5"/>
+  <text x="491" y="202" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="700" fill="#fff">QUIC</text>
+  <text x="491" y="216" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#ffd9c4">stream</text>
+
+  <line x1="532" y1="205" x2="554" y2="205" stroke="#ef6443" stroke-width="1" marker-end="url(#arr-coral)"/>
+
+  <rect x="562" y="184" width="92" height="42" rx="6" fill="#2a3650" stroke="#64748b" stroke-width="1"/>
+  <text x="608" y="202" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="500" fill="#f1f5f9">Deserialize</text>
+  <text x="608" y="216" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#94a3b8">bincode</text>
+
+  <line x1="654" y1="205" x2="676" y2="205" stroke="#ef6443" stroke-width="1" marker-end="url(#arr-coral)"/>
+
+  <rect x="684" y="184" width="50" height="42" rx="6" fill="#2a3650" stroke="#ef6443" stroke-width="1.5"/>
+  <text x="709" y="210" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600" fill="#f1f5f9">Actor</text>
+</svg>

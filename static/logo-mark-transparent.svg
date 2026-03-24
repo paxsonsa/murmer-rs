@@ -1,0 +1,31 @@
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="signal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e42"/>
+      <stop offset="100%" stop-color="#ef6443"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Ripple rings — node A -->
+  <circle cx="78" cy="82" r="26" fill="none" stroke="#f59e42" stroke-width="1.2" opacity="0.4"/>
+  <circle cx="78" cy="82" r="42" fill="none" stroke="#f59e42" stroke-width="0.7" opacity="0.22"/>
+  <circle cx="78" cy="82" r="58" fill="none" stroke="#f59e42" stroke-width="0.4" opacity="0.1"/>
+
+  <!-- Ripple rings — node B -->
+  <circle cx="134" cy="108" r="22" fill="none" stroke="#ef6443" stroke-width="1.2" opacity="0.35"/>
+  <circle cx="134" cy="108" r="36" fill="none" stroke="#ef6443" stroke-width="0.7" opacity="0.18"/>
+
+  <!-- Connection lines -->
+  <line x1="78" y1="82" x2="134" y2="108" stroke="url(#signal)" stroke-width="1.4" opacity="0.35"/>
+  <line x1="78" y1="82" x2="100" y2="148" stroke="url(#signal)" stroke-width="0.9" opacity="0.2"/>
+  <line x1="134" y1="108" x2="100" y2="148" stroke="url(#signal)" stroke-width="0.9" opacity="0.2"/>
+  <line x1="78" y1="82" x2="98" y2="52" stroke="url(#signal)" stroke-width="0.6" opacity="0.14"/>
+  <line x1="134" y1="108" x2="158" y2="68" stroke="url(#signal)" stroke-width="0.6" opacity="0.14"/>
+
+  <!-- Actor nodes -->
+  <circle cx="78" cy="82" r="8" fill="url(#signal)"/>
+  <circle cx="134" cy="108" r="6.5" fill="url(#signal)"/>
+  <circle cx="100" cy="148" r="5" fill="url(#signal)" opacity="0.7"/>
+  <circle cx="98" cy="52" r="3.5" fill="url(#signal)" opacity="0.45"/>
+  <circle cx="158" cy="68" r="3" fill="url(#signal)" opacity="0.35"/>
+</svg>
