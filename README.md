@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="static/logo-lockup-dark.svg" alt="murmer — distributed actors for rust" width="560">
+  <img src="https://raw.githubusercontent.com/paxsonsa/murmer-rs/main/static/logo-lockup-dark.svg" alt="murmer — distributed actors for rust" width="560">
 </p>
 
 <p align="center">
@@ -19,23 +19,10 @@
 
 Typed, location-transparent actors that communicate through message passing. Whether an actor lives in the same process or on a remote node across the network, you interact with it through the same `Endpoint<A>` API.
 
-```mermaid
-flowchart LR
-    C["Your Code"]
-    EP["Endpoint‹A›"]
-    L["Actor<br/><i>in-memory, zero-copy</i>"]
-    Q["QUIC stream<br/><i>bincode, encrypted</i>"]
-    R["Actor<br/><i>remote node</i>"]
-
-    C -->|".send(msg)"| EP
-    EP -->|"local"| L
-    EP -->|"remote"| Q --> R
-
-    style C fill:#1a2235,stroke:#64748b,color:#f1f5f9
-    style EP fill:#f59e42,stroke:#ef6443,color:#0a0e17
-    style L fill:#2a3650,stroke:#64748b,color:#f1f5f9
-    style Q fill:#2a3650,stroke:#64748b,color:#f1f5f9
-    style R fill:#2a3650,stroke:#64748b,color:#f1f5f9
+```text
+                          ┌─ local ──→ Actor (in-memory, zero-copy)
+Your Code → Endpoint<A> ──┤
+                          └─ remote ─→ QUIC stream (bincode, encrypted) ──→ Actor (remote node)
 ```
 
 ## Highlights
