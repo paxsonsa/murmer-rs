@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "murmer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "bytes",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-cluster-tests"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "murmer",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-examples"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "murmer",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-monitor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "murmer",
  "serde",
