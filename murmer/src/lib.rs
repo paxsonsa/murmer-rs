@@ -108,6 +108,8 @@ pub mod actor;
 pub mod app;
 pub mod cluster;
 pub mod endpoint;
+#[allow(dead_code)]
+pub(crate) mod instrument;
 pub mod lifecycle;
 pub mod listing;
 #[cfg(feature = "monitor")]

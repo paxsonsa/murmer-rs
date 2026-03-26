@@ -15,7 +15,7 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 default = ["macros"]
 macros = ["dep:murmer-macros"]
 app = []
-monitor = []
+monitor = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 
 [dependencies]
 bincode = { workspace = true }
@@ -39,6 +39,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { version = "0.7", features = ["full"] }
 linkme = "0.3"
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

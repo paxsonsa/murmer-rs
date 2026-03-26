@@ -7,5 +7,6 @@
 - [Discovery](./discovery.md)
 - [Supervision](./supervision.md)
 - [Clustering](./clustering.md)
+- [Monitoring](./monitoring.md)
 - [Proc Macro Reference](./macros.md)
 - [Application Orchestration](./murmer-app.md)
