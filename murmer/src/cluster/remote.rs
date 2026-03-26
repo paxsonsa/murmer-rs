@@ -1,7 +1,17 @@
+//! Remote actor streams — multiplexed QUIC streams for actor messaging.
+//!
+//! Each remote actor gets a dedicated QUIC stream. This module provides:
+//!
+//! - [`run_actor_stream_writer`] — outbound: serializes messages and writes
+//!   them to a QUIC stream, reads responses back
+//! - [`handle_actor_stream`] — inbound: reads messages from a QUIC stream,
+//!   dispatches to local actors, writes responses back
+
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::instrument;
 use crate::{DispatchRequest, Receptionist, RemoteInvocation, RemoteResponse, ResponseRegistry};
 
 use super::framing::{self, FrameCodec, StreamInit};
@@ -32,7 +42,10 @@ pub async fn run_actor_stream_writer(
 ) {
     // Open a stream to the remote node
     let (mut send, recv) = match transport.open_actor_stream(&remote_node_id).await {
-        Ok(streams) => streams,
+        Ok(streams) => {
+            instrument::stream_opened();
+            streams
+        }
         Err(e) => {
             tracing::error!(
                 "Failed to open actor stream to {remote_node_id} for {actor_label}: {e}"
@@ -75,6 +88,7 @@ pub async fn run_actor_stream_writer(
             &invocation.message_type,
             &invocation.payload,
         );
+        instrument::network_bytes_sent(frame.len() as u64);
         if let Err(e) = send.write_all(&frame).await {
             tracing::error!("Actor stream write failed for {actor_label}: {e} — closing stream");
             break;
@@ -88,6 +102,7 @@ pub async fn run_actor_stream_writer(
     response_registry.fail_all(&format!(
         "actor stream to {remote_node_id} for {actor_label} closed"
     ));
+    instrument::stream_closed();
     tracing::debug!("Actor stream writer for {actor_label} on {remote_node_id} closed");
 }
 
@@ -106,6 +121,7 @@ async fn read_responses(
     let close_reason = loop {
         match recv.read(&mut buf).await {
             Ok(Some(n)) => {
+                instrument::network_bytes_received(n as u64);
                 codec.push_data(&buf[..n]);
                 while let Ok(Some(frame)) = codec.next_frame() {
                     match framing::decode_response_frame(&frame) {
@@ -188,12 +204,14 @@ pub async fn handle_actor_stream(
         }
     };
 
+    instrument::stream_opened();
     tracing::debug!("Handling actor stream for {actor_label}");
 
     // Step 3: Read invocations and dispatch (lean wire format)
     loop {
         match recv.read(&mut buf).await {
             Ok(Some(n)) => {
+                instrument::network_bytes_received(n as u64);
                 codec.push_data(&buf[..n]);
                 while let Ok(Some(frame)) = codec.next_frame() {
                     match framing::decode_invocation_frame(&frame) {
@@ -219,6 +237,7 @@ pub async fn handle_actor_stream(
                                     response.call_id,
                                     &response.result,
                                 );
+                                instrument::network_bytes_sent(frame.len() as u64);
                                 if let Err(e) = send.write_all(&frame).await {
                                     tracing::warn!(
                                         "Failed to send response for {actor_label}: {e}"
@@ -243,4 +262,5 @@ pub async fn handle_actor_stream(
             }
         }
     }
+    instrument::stream_closed();
 }

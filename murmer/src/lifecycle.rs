@@ -32,6 +32,22 @@ use crate::actor::{Actor, RemoteDispatch};
 // =============================================================================
 
 /// Why an actor terminated — used by watches and restart policies.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// impl Actor for Supervisor {
+///     type State = SupervisorState;
+///
+///     fn on_actor_terminated(&mut self, state: &mut SupervisorState, event: &ActorTerminated) {
+///         match &event.reason {
+///             TerminationReason::Stopped => println!("{} stopped cleanly", event.label),
+///             TerminationReason::Panicked(msg) => println!("{} panicked: {msg}", event.label),
+///             TerminationReason::RestartLimitExceeded => println!("{} gave up", event.label),
+///         }
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub enum TerminationReason {
     /// Clean shutdown (receptionist.stop() or channel close)
@@ -43,6 +59,15 @@ pub enum TerminationReason {
 }
 
 /// Notification delivered to watchers when a watched actor terminates.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// fn on_actor_terminated(&mut self, state: &mut MyState, event: &ActorTerminated) {
+///     tracing::warn!("Watched actor {} terminated: {:?}", event.label, event.reason);
+///     state.failed_peers.push(event.label.clone());
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ActorTerminated {
     pub label: String,
@@ -50,6 +75,21 @@ pub struct ActorTerminated {
 }
 
 /// Restart strategy for an actor — mirrors Erlang/OTP child spec strategies.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use murmer::{RestartConfig, RestartPolicy};
+///
+/// // Restart on crash only (most common for workers)
+/// let config = RestartConfig { policy: RestartPolicy::Transient, ..Default::default() };
+///
+/// // Always restart (for essential services)
+/// let config = RestartConfig { policy: RestartPolicy::Permanent, ..Default::default() };
+///
+/// // Never restart (for one-shot tasks)
+/// let config = RestartConfig { policy: RestartPolicy::Temporary, ..Default::default() };
+/// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub enum RestartPolicy {
     /// Never restart (current behavior)
@@ -62,6 +102,26 @@ pub enum RestartPolicy {
 }
 
 /// Configuration for restart limits and backoff behavior.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use murmer::{RestartConfig, RestartPolicy, BackoffConfig};
+/// use std::time::Duration;
+///
+/// let config = RestartConfig {
+///     policy: RestartPolicy::Transient,  // restart on panic only
+///     max_restarts: 3,                   // max 3 restarts...
+///     window: Duration::from_secs(30),   // ...within 30 seconds
+///     backoff: BackoffConfig {
+///         initial: Duration::from_millis(200),
+///         max: Duration::from_secs(10),
+///         multiplier: 2.0,
+///     },
+/// };
+///
+/// let endpoint = system.start_with_config("worker/0", MyFactory, config);
+/// ```
 #[derive(Debug, Clone)]
 pub struct RestartConfig {
     pub policy: RestartPolicy,
@@ -84,6 +144,19 @@ impl Default for RestartConfig {
 }
 
 /// Exponential backoff configuration for actor restarts.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use murmer::BackoffConfig;
+/// use std::time::Duration;
+///
+/// let backoff = BackoffConfig {
+///     initial: Duration::from_millis(500),   // first retry after 500ms
+///     max: Duration::from_secs(30),          // cap at 30s
+///     multiplier: 2.0,                       // 500ms → 1s → 2s → 4s → ...
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct BackoffConfig {
     /// Initial delay before the first restart.
@@ -105,7 +178,28 @@ impl Default for BackoffConfig {
 }
 
 /// Factory for creating actor instances on restart.
-/// `&mut self` allows stateful factories (e.g. incrementing restart counters).
+///
+/// `&mut self` allows stateful factories (e.g. incrementing restart counters,
+/// loading config from disk).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// struct CounterFactory { initial_count: i64 }
+///
+/// impl ActorFactory for CounterFactory {
+///     type Actor = Counter;
+///     fn create(&mut self) -> (Counter, CounterState) {
+///         (Counter, CounterState { count: self.initial_count })
+///     }
+/// }
+///
+/// let ep = system.start_with_policy(
+///     "counter/0",
+///     CounterFactory { initial_count: 0 },
+///     RestartPolicy::Permanent,
+/// );
+/// ```
 pub trait ActorFactory: Send + 'static {
     type Actor: Actor + RemoteDispatch;
     fn create(&mut self) -> (Self::Actor, <Self::Actor as Actor>::State);

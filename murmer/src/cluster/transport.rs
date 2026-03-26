@@ -1,3 +1,12 @@
+//! QUIC transport layer — manages connections between cluster nodes.
+//!
+//! [`Transport`] owns a `quinn::Endpoint` and maintains a connection map
+//! keyed by node address. It handles:
+//!
+//! - Outbound connections with incarnation-based deduplication
+//! - Incoming connection acceptance and handshake
+//! - Connection lifecycle events (opened, replaced, removed)
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -5,6 +14,8 @@ use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
+
+use crate::instrument;
 
 use super::certs;
 use super::config::{NodeClass, NodeIdentity, TransportTuning};
@@ -262,6 +273,7 @@ impl Transport {
                          with new incarnation (nid {})",
                         remote_identity.incarnation
                     );
+                    instrument::connection_closed();
                     let _ = self
                         .connection_events_tx
                         .send(ConnectionEvent::Disconnected(existing_key));
@@ -278,6 +290,7 @@ impl Transport {
             );
         }
 
+        instrument::connection_opened();
         let _ = self
             .connection_events_tx
             .send(ConnectionEvent::Connected(node_key));
@@ -339,6 +352,7 @@ impl Transport {
         if let Some(nc) = conns.remove(node_id) {
             nc.connection
                 .close(quinn::VarInt::from_u32(0), b"node departed");
+            instrument::connection_closed();
             let _ = self
                 .connection_events_tx
                 .send(ConnectionEvent::Disconnected(node_id.to_string()));
@@ -480,6 +494,7 @@ impl Transport {
                          with new incarnation (nid {})",
                         remote_identity.incarnation
                     );
+                    instrument::connection_closed();
                     let _ = self
                         .connection_events_tx
                         .send(ConnectionEvent::Disconnected(existing_key));
@@ -496,6 +511,7 @@ impl Transport {
             );
         }
 
+        instrument::connection_opened();
         let _ = self
             .connection_events_tx
             .send(ConnectionEvent::Connected(node_key));

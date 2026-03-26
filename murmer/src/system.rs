@@ -45,6 +45,26 @@ use crate::{Actor, Endpoint, RemoteDispatch};
 ///
 /// - [`System::local()`] — in-memory, no networking
 /// - [`System::clustered()`] — QUIC transport, SWIM membership, registry replication
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use murmer::prelude::*;
+///
+/// // Local system — no networking, instant startup
+/// let system = System::local();
+///
+/// // Start an actor
+/// let counter = system.start("counter/main", Counter, CounterState { count: 0 });
+///
+/// // Send a message
+/// let result = counter.send(Increment { amount: 5 }).await?;
+///
+/// // Look up an actor by label
+/// if let Some(ep) = system.lookup::<Counter>("counter/main") {
+///     let count = ep.send(GetCount).await?;
+/// }
+/// ```
 pub struct System {
     inner: SystemInner,
 }
@@ -60,6 +80,14 @@ impl System {
     /// All actors run in the same process and communicate through in-memory
     /// channels. Zero serialization cost, instant startup. Ideal for
     /// development and testing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let system = System::local();
+    /// let ep = system.start("greeter/main", Greeter, GreeterState::default());
+    /// let reply = ep.send(Greet { name: "world".into() }).await?;
+    /// ```
     pub fn local() -> Self {
         Self {
             inner: SystemInner::Local {
@@ -90,6 +118,16 @@ impl System {
     ///
     /// Uses [`TypeRegistry::from_auto()`] to automatically register all actor
     /// types annotated with `#[handlers]` — no manual registry setup needed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let config = ClusterConfig::builder()
+    ///     .listen("127.0.0.1:9001".parse()?)
+    ///     .cookie("secret")
+    ///     .build()?;
+    /// let system = System::clustered_auto(config).await?;
+    /// ```
     pub async fn clustered_auto(config: ClusterConfig) -> Result<Self, ClusterError> {
         Self::clustered(config, TypeRegistry::from_auto(), SpawnRegistry::new()).await
     }
@@ -104,6 +142,14 @@ impl System {
     /// clustered modes. In local mode, messages are dispatched through
     /// in-memory channels. In clustered mode, the actor is also registered
     /// for discovery by remote nodes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let counter = system.start("counter/0", Counter, CounterState { count: 0 });
+    /// let value = counter.send(Increment { amount: 1 }).await?;
+    /// assert_eq!(value, 1);
+    /// ```
     pub fn start<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
     where
         A: Actor + RemoteDispatch + 'static,
@@ -117,6 +163,14 @@ impl System {
     /// [`ReadyHandle`] whose `start()` method spawns the supervisor.
     /// If the `ReadyHandle` is dropped without calling `start()`, the actor
     /// is automatically deregistered.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let (endpoint, ready) = system.prepare("cache/0", Cache, CacheState::new());
+    /// endpoint.send(Warmup { key: "users".into() }).await.ok(); // queues
+    /// ready.start(); // now processes queued messages
+    /// ```
     pub fn prepare<A>(
         &self,
         label: &str,
@@ -130,6 +184,12 @@ impl System {
     }
 
     /// Start an actor with a simple restart policy.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = system.start_with_policy("worker/0", WorkerFactory, RestartPolicy::Transient);
+    /// ```
     pub fn start_with_policy<F: ActorFactory>(
         &self,
         label: &str,
@@ -144,6 +204,18 @@ impl System {
     }
 
     /// Start an actor with full restart configuration (policy, limits, backoff).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let config = RestartConfig {
+    ///     policy: RestartPolicy::Transient,
+    ///     max_restarts: 3,
+    ///     window: Duration::from_secs(30),
+    ///     ..Default::default()
+    /// };
+    /// let ep = system.start_with_config("worker/0", WorkerFactory, config);
+    /// ```
     pub fn start_with_config<F: ActorFactory>(
         &self,
         label: &str,
@@ -166,21 +238,61 @@ impl System {
     /// Returns `None` if no actor with the given label exists, or if the
     /// type doesn't match. In clustered mode, this also finds actors on
     /// remote nodes that have been replicated to the local registry.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // Type-safe: the caller specifies the expected actor type
+    /// if let Some(counter) = system.lookup::<Counter>("counter/main") {
+    ///     let count = counter.send(GetCount).await?;
+    /// }
+    ///
+    /// // Returns None if the type doesn't match
+    /// assert!(system.lookup::<ChatRoom>("counter/main").is_none());
+    /// ```
     pub fn lookup<A: Actor + 'static>(&self, label: &str) -> Option<Endpoint<A>> {
         self.receptionist().lookup(label)
     }
 
     /// Check an actor into a reception key group for discovery.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let key = ReceptionKey::<Worker>::new("workers");
+    /// system.check_in("worker/0", key);
+    /// ```
     pub fn check_in<A: Actor + 'static>(&self, label: &str, key: ReceptionKey<A>) {
         self.receptionist().check_in(label, key);
     }
 
     /// Subscribe to a reception key and receive endpoints as actors check in.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let key = ReceptionKey::<Worker>::new("workers");
+    /// let mut listing = system.listing(key);
+    /// while let Some(ep) = listing.next().await {
+    ///     ep.send(Ping).await.ok();
+    /// }
+    /// ```
     pub fn listing<A: Actor + 'static>(&self, key: ReceptionKey<A>) -> Listing<A> {
         self.receptionist().listing(key)
     }
 
     /// Subscribe to lifecycle events (registrations and deregistrations).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut events = system.subscribe_events();
+    /// tokio::spawn(async move {
+    ///     while let Some(event) = events.recv().await {
+    ///         println!("{event:?}");
+    ///     }
+    /// });
+    /// ```
     pub fn subscribe_events(&self) -> tokio::sync::mpsc::UnboundedReceiver<ActorEvent> {
         self.receptionist().subscribe_events()
     }
@@ -190,6 +302,12 @@ impl System {
     // =========================================================================
 
     /// Stop an actor by label.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// system.stop("worker/0");
+    /// ```
     pub fn stop(&self, label: &str) {
         self.receptionist().stop(label);
     }
@@ -212,6 +330,13 @@ impl System {
     ///
     /// Useful for advanced operations like `register_remote` or direct
     /// OpLog access. For typical use, prefer the `System` methods.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let receptionist = system.receptionist();
+    /// let has_it = receptionist.has_entry("counter/0");
+    /// ```
     pub fn receptionist(&self) -> &Receptionist {
         match &self.inner {
             SystemInner::Local { receptionist } => receptionist,
@@ -220,6 +345,14 @@ impl System {
     }
 
     /// Returns `true` if this is a clustered system.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// if system.is_clustered() {
+    ///     println!("Running on: {:?}", system.local_addr());
+    /// }
+    /// ```
     pub fn is_clustered(&self) -> bool {
         matches!(self.inner, SystemInner::Clustered { .. })
     }
@@ -239,6 +372,13 @@ impl System {
     ///
     /// Useful for reading the OS-assigned port after binding to `127.0.0.1:0`,
     /// e.g. to pass as a seed address to other nodes in tests.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let addr = system.local_addr().expect("not clustered");
+    /// println!("Listening on {addr}");
+    /// ```
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.inner {
             SystemInner::Local { .. } => None,

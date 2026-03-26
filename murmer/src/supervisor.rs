@@ -9,9 +9,9 @@
 //!
 //! The supervisor wraps every handler invocation in `catch_unwind`, so a panicking
 //! handler doesn't crash the entire runtime — it records the panic as a
-//! [`TerminationReason::Panicked`](crate::TerminationReason::Panicked) and exits cleanly.
+//! [`TerminationReason::Panicked`] and exits cleanly.
 //!
-//! On exit, the [`DeregisterGuard`] RAII type automatically removes the actor
+//! On exit, the `DeregisterGuard` RAII type automatically removes the actor
 //! from the receptionist and fires any registered watches.
 
 use std::panic::AssertUnwindSafe;
@@ -21,6 +21,7 @@ use futures_util::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{Actor, ActorContext, RemoteDispatch};
+use crate::instrument;
 use crate::lifecycle::{RestartPolicy, SystemSignal, TerminationReason};
 use crate::receptionist::DeregisterGuard;
 use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteResponse};
@@ -45,6 +46,7 @@ pub(crate) async fn run_supervisor<A>(
 where
     A: Actor + RemoteDispatch + 'static,
 {
+    let actor_type = std::any::type_name::<A>();
     let mut msg_count: u64 = 0;
 
     loop {
@@ -52,13 +54,21 @@ where
             msg = mailbox_rx.recv() => {
                 match msg {
                     Some(envelope) => {
+                        #[cfg(feature = "monitor")]
+                        let start = std::time::Instant::now();
+
                         let fut = envelope.handle(&ctx, &mut actor, &mut state);
                         let result = AssertUnwindSafe(fut).catch_unwind().await;
                         if let Err(panic_info) = result {
+                            instrument::message_failed(actor_type);
                             let msg = extract_panic_message(&panic_info);
                             *exit_reason.lock().unwrap() = TerminationReason::Panicked(msg);
                             break;
                         }
+                        instrument::message_processed(actor_type);
+                        #[cfg(feature = "monitor")]
+                        instrument::message_processing_duration(actor_type, start.elapsed());
+
                         msg_count += 1;
                         if msg_count.is_multiple_of(64) {
                             tokio::task::yield_now().await;
@@ -70,6 +80,9 @@ where
             req = dispatch_rx.recv() => {
                 match req {
                     Some(request) => {
+                        #[cfg(feature = "monitor")]
+                        let start = std::time::Instant::now();
+
                         let fut = actor.dispatch_remote(
                             &ctx,
                             &mut state,
@@ -79,6 +92,10 @@ where
                         let result = AssertUnwindSafe(fut).catch_unwind().await;
                         match result {
                             Ok(dispatch_result) => {
+                                instrument::message_processed(actor_type);
+                                #[cfg(feature = "monitor")]
+                                instrument::message_processing_duration(actor_type, start.elapsed());
+
                                 let response = RemoteResponse {
                                     call_id: request.invocation.call_id,
                                     result: dispatch_result.map_err(|e| e.to_string()),
@@ -86,6 +103,7 @@ where
                                 let _ = request.respond_to.send(response);
                             }
                             Err(panic_info) => {
+                                instrument::message_failed(actor_type);
                                 let msg = extract_panic_message(&panic_info);
                                 // Send error response before breaking
                                 let response = RemoteResponse {

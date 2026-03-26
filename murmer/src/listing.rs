@@ -30,14 +30,40 @@ use crate::receptionist::{ActorEntry, EntryLocation};
 // =============================================================================
 
 /// A typed key for grouping actors by type + group name.
+///
 /// Multiple actors can share the same key. Used with `listing()` for
 /// subscription-based discovery (like Swift's `DistributedReception.Key<Guest>`).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Define a key for worker discovery
+/// let worker_key = ReceptionKey::<Worker>::new("workers");
+///
+/// // Check actors in
+/// system.check_in("worker/0", worker_key.clone());
+/// system.check_in("worker/1", worker_key.clone());
+///
+/// // Subscribe — gets all current + future matches
+/// let mut listing = system.listing(worker_key);
+/// while let Some(endpoint) = listing.next().await {
+///     endpoint.send(DoWork { task: "process".into() }).await?;
+/// }
+/// ```
 pub struct ReceptionKey<A: Actor> {
     pub(crate) id: String,
     _marker: PhantomData<A>,
 }
 
 impl<A: Actor> ReceptionKey<A> {
+    /// Create a new reception key with the given group ID.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let worker_key = ReceptionKey::<Worker>::new("workers");
+    /// let cache_key = ReceptionKey::<Cache>::new("caches");
+    /// ```
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -45,6 +71,14 @@ impl<A: Actor> ReceptionKey<A> {
         }
     }
 
+    /// Get the group ID of this key.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let key = ReceptionKey::<Worker>::new("workers");
+    /// assert_eq!(key.id(), "workers");
+    /// ```
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -86,6 +120,18 @@ pub(crate) struct ErasedReceptionKey {
 /// as actors register with the matching key.
 ///
 /// Analogous to Swift's `GuestListing<Guest>: AsyncSequence`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let worker_key = ReceptionKey::<Worker>::new("workers");
+/// let mut listing = receptionist.listing(worker_key);
+///
+/// // Each call yields the next matching endpoint (backfill first, then live)
+/// while let Some(endpoint) = listing.next().await {
+///     endpoint.send(DoWork { task: "process".into() }).await?;
+/// }
+/// ```
 pub struct Listing<A: Actor> {
     rx: mpsc::UnboundedReceiver<Endpoint<A>>,
 }
@@ -95,12 +141,29 @@ impl<A: Actor> Listing<A> {
         Self { rx }
     }
 
-    /// Await the next endpoint. Returns None when the subscription is closed.
+    /// Await the next endpoint. Returns `None` when the subscription is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// while let Some(ep) = listing.next().await {
+    ///     ep.send(Ping).await.ok();
+    /// }
+    /// ```
     pub async fn next(&mut self) -> Option<Endpoint<A>> {
         self.rx.recv().await
     }
 
-    /// Try to receive without blocking. Returns None if no endpoint is ready.
+    /// Try to receive without blocking. Returns `None` if no endpoint is ready.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // Drain all currently available endpoints
+    /// while let Some(ep) = listing.try_next() {
+    ///     endpoints.push(ep);
+    /// }
+    /// ```
     pub fn try_next(&mut self) -> Option<Endpoint<A>> {
         self.rx.try_recv().ok()
     }
@@ -166,6 +229,24 @@ impl<A: Actor + 'static> ErasedListingSender for TypedListingSender<A> {
 // =============================================================================
 
 /// An event from a watched listing: an actor was added or removed from the group.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let mut watched = receptionist.watched_listing(worker_key);
+/// while let Some(event) = watched.next().await {
+///     match event {
+///         ListingEvent::Added { label, endpoint } => {
+///             println!("Worker {label} joined");
+///             pool.insert(label, endpoint);
+///         }
+///         ListingEvent::Removed { label } => {
+///             println!("Worker {label} left");
+///             pool.remove(&label);
+///         }
+///     }
+/// }
+/// ```
 pub enum ListingEvent<A: Actor> {
     /// A new actor checked in with the matching key.
     Added {
@@ -179,7 +260,24 @@ pub enum ListingEvent<A: Actor> {
 /// A listing that streams both additions and removals, with labels.
 ///
 /// Use this to build reactive pools that automatically track membership
-/// changes. Created via [`Receptionist::watched_listing`].
+/// changes. Created via [`Receptionist::watched_listing()`](crate::Receptionist::watched_listing).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let key = ReceptionKey::<Worker>::new("workers");
+/// let mut watched = receptionist.watched_listing(key);
+///
+/// // Process events: backfill arrives as Added, then live updates
+/// tokio::spawn(async move {
+///     while let Some(event) = watched.next().await {
+///         match event {
+///             ListingEvent::Added { label, endpoint } => { /* track */ }
+///             ListingEvent::Removed { label } => { /* untrack */ }
+///         }
+///     }
+/// });
+/// ```
 pub struct WatchedListing<A: Actor> {
     rx: mpsc::UnboundedReceiver<ListingEvent<A>>,
 }

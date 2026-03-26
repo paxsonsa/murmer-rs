@@ -6,15 +6,15 @@
 //! - **Start actors**: `receptionist.start("label", actor, state)` spawns a supervised actor
 //! - **Lookup actors**: `receptionist.lookup::<A>("label")` returns a typed `Endpoint<A>`
 //! - **Lifecycle events**: subscribe to registration/deregistration notifications
-//! - **Group discovery**: check actors into [`ReceptionKey`](crate::ReceptionKey) groups
-//!   and subscribe via [`Listing`](crate::Listing) streams
+//! - **Group discovery**: check actors into [`ReceptionKey`] groups
+//!   and subscribe via [`Listing`] streams
 //! - **Supervision**: `start_with_config` enables restart policies with backoff
 //! - **Distributed replication**: OpLog-based sync with version vectors
 //! - **Node pruning**: remove all actors from a departed cluster node
 //!
 //! # Type erasure with safe downcasts
 //!
-//! Internally, the receptionist stores entries as type-erased [`ActorEntry`] values
+//! Internally, the receptionist stores entries as type-erased `ActorEntry` values
 //! (no actor type parameter). At lookup time, the caller provides the expected type
 //! via `lookup::<A>()`, and a `TypeId` guard ensures the internal downcast is safe.
 //! This design means the receptionist never needs to be generic over actor types.
@@ -29,6 +29,7 @@ use tokio::time::Instant;
 
 use crate::actor::{Actor, ActorContext, RemoteDispatch};
 use crate::endpoint::Endpoint;
+use crate::instrument;
 use crate::lifecycle::{
     ActorFactory, ActorTerminated, RestartConfig, RestartPolicy, SystemSignal, TerminationReason,
     WatchEntry,
@@ -47,8 +48,26 @@ use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegi
 // =============================================================================
 
 /// Lifecycle events. Fully type-erased — subscribers don't need to know the
-/// actor type. If they want an endpoint, they call lookup::<A>() with the
+/// actor type. If they want an endpoint, they call `lookup::<A>()` with the
 /// type they expect.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let mut events = receptionist.subscribe();
+/// tokio::spawn(async move {
+///     while let Some(event) = events.recv().await {
+///         match event {
+///             ActorEvent::Registered { label, actor_type } => {
+///                 println!("Actor {label} ({actor_type}) registered");
+///             }
+///             ActorEvent::Deregistered { label, actor_type } => {
+///                 println!("Actor {label} ({actor_type}) deregistered");
+///             }
+///         }
+///     }
+/// });
+/// ```
 #[derive(Debug, Clone)]
 pub enum ActorEvent {
     Registered { label: String, actor_type: String },
@@ -110,6 +129,21 @@ pub(crate) enum EntryLocation {
 // =============================================================================
 
 /// Receptionist configuration for clustering features.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use murmer::receptionist::ReceptionistConfig;
+/// use std::time::Duration;
+///
+/// let config = ReceptionistConfig {
+///     node_id: "node-1".to_string(),
+///     origin_addr: "192.168.1.10:9001".to_string(),
+///     flush_interval: Some(Duration::from_millis(50)),
+///     blip_window: Some(Duration::from_millis(200)),
+/// };
+/// let receptionist = Receptionist::with_config(config);
+/// ```
 #[derive(Debug, Clone)]
 pub struct ReceptionistConfig {
     pub node_id: String,
@@ -182,6 +216,26 @@ struct ReceptionistInner {
 /// subscription-based discovery, and distributed replication support.
 ///
 /// Cheap to clone (wraps Arc).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let receptionist = Receptionist::new();
+///
+/// // Start an actor
+/// let ep = receptionist.start("counter/0", Counter, CounterState { count: 0 });
+///
+/// // Look it up later
+/// let ep: Option<Endpoint<Counter>> = receptionist.lookup("counter/0");
+///
+/// // Subscribe to lifecycle events
+/// let mut events = receptionist.subscribe();
+///
+/// // Group discovery with reception keys
+/// let key = ReceptionKey::<Counter>::new("counters");
+/// receptionist.check_in("counter/0", key.clone());
+/// let mut listing = receptionist.listing(key);
+/// ```
 #[derive(Clone)]
 pub struct Receptionist {
     inner: Arc<ReceptionistInner>,
@@ -243,6 +297,13 @@ impl Receptionist {
 
     /// Start a local actor, register it, and return its typed endpoint.
     /// Uses `Temporary` restart policy (never restarts).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = receptionist.start("counter/0", Counter, CounterState { count: 0 });
+    /// let count = ep.send(Increment { amount: 1 }).await?;
+    /// ```
     pub fn start<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
     where
         A: Actor + RemoteDispatch + 'static,
@@ -312,6 +373,8 @@ impl Receptionist {
         // Record in oplog (respects blip window if configured)
         self.record_register_op(label, std::any::type_name::<A>(), &[]);
 
+        instrument::actor_started(std::any::type_name::<A>());
+        instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<A>().to_string(),
@@ -330,6 +393,14 @@ impl Receptionist {
     /// Messages sent to the endpoint queue in the unbounded mailbox until
     /// [`ReadyHandle::start()`] is called. If the `ReadyHandle` is dropped
     /// without calling `start()`, the actor is automatically deregistered.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let (ep, ready) = receptionist.prepare("cache/0", Cache, CacheState::new());
+    /// ep.send(Warmup { key: "users".into() }).await.ok(); // queues
+    /// ready.start(); // begins processing
+    /// ```
     pub fn prepare<A>(
         &self,
         label: &str,
@@ -390,6 +461,8 @@ impl Receptionist {
         // Record in oplog (respects blip window if configured)
         self.record_register_op(label, std::any::type_name::<A>(), &[]);
 
+        instrument::actor_started(std::any::type_name::<A>());
+        instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<A>().to_string(),
@@ -415,6 +488,12 @@ impl Receptionist {
     /// The factory is called to create each incarnation of the actor (initial + restarts).
     /// The returned endpoint remains valid across restarts — the underlying mailbox
     /// channel is reused so existing `Endpoint<A>` handles keep working.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = receptionist.start_with_policy("worker/0", WorkerFactory, RestartPolicy::Transient);
+    /// ```
     pub fn start_with_policy<F: ActorFactory>(
         &self,
         label: &str,
@@ -494,6 +573,8 @@ impl Receptionist {
 
         self.record_register_op(label, std::any::type_name::<F::Actor>(), &[]);
 
+        instrument::actor_started(std::any::type_name::<F::Actor>());
+        instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<F::Actor>().to_string(),
@@ -542,6 +623,7 @@ impl Receptionist {
 
                 // Check if we've exceeded the restart limit
                 if restart_times.len() >= config.max_restarts as usize {
+                    instrument::actor_restart_limit_exceeded(std::any::type_name::<F::Actor>());
                     // The previous incarnation's guard already removed the entry.
                     // Re-register briefly so deregister_with_reason can fire watches.
                     let entry = ActorEntry {
@@ -623,6 +705,8 @@ impl Receptionist {
                     .unwrap()
                     .insert(label_owned.clone(), entry);
 
+                instrument::actor_restarted(std::any::type_name::<F::Actor>());
+                instrument::receptionist_registration();
                 receptionist.emit(ActorEvent::Registered {
                     label: label_owned.clone(),
                     actor_type: std::any::type_name::<F::Actor>().to_string(),
@@ -695,6 +779,8 @@ impl Receptionist {
 
         self.record_register_op(label, std::any::type_name::<A>(), &[]);
 
+        instrument::actor_started(std::any::type_name::<A>());
+        instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<A>().to_string(),
@@ -715,6 +801,14 @@ impl Receptionist {
         }
 
         if let Some(entry) = self.inner.entries.lock().unwrap().remove(label) {
+            let reason_str = match &reason {
+                TerminationReason::Stopped => "stopped",
+                TerminationReason::Panicked(_) => "panicked",
+                TerminationReason::RestartLimitExceeded => "restart_limit_exceeded",
+            };
+            instrument::actor_stopped(&entry.actor_type_name, reason_str);
+            instrument::receptionist_deregistration();
+
             // Record remove op in oplog (immediate, no blip window for removes)
             self.inner.oplog.lock().unwrap().append(OpType::Remove {
                 label: label.to_string(),
@@ -791,6 +885,12 @@ impl Receptionist {
 
     /// Stop a local actor gracefully. Sends shutdown signal to supervisor.
     /// The supervisor will exit, and the DeregisterGuard will auto-deregister.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// receptionist.stop("worker/0");
+    /// ```
     pub fn stop(&self, label: &str) {
         let mut entries = self.inner.entries.lock().unwrap();
         if let Some(entry) = entries.get_mut(label)
@@ -803,8 +903,17 @@ impl Receptionist {
     }
 
     /// Lookup an actor by label. **The caller provides the expected type.**
-    /// Returns None if not found or if the type doesn't match.
+    /// Returns `None` if not found or if the type doesn't match.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// if let Some(counter) = receptionist.lookup::<Counter>("counter/0") {
+    ///     let count = counter.send(GetCount).await?;
+    /// }
+    /// ```
     pub fn lookup<A: Actor + 'static>(&self, label: &str) -> Option<Endpoint<A>> {
+        instrument::receptionist_lookup();
         let entries = self.inner.entries.lock().unwrap();
         let entry = entries.get(label)?;
 
@@ -846,6 +955,13 @@ impl Receptionist {
     }
 
     /// Check if an entry exists for the given label.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// assert!(receptionist.has_entry("counter/0"));
+    /// assert!(!receptionist.has_entry("nonexistent"));
+    /// ```
     pub fn has_entry(&self, label: &str) -> bool {
         self.inner.entries.lock().unwrap().contains_key(label)
     }
@@ -855,6 +971,17 @@ impl Receptionist {
     // =========================================================================
 
     /// Subscribe to lifecycle events (type-erased).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut events = receptionist.subscribe_events();
+    /// tokio::spawn(async move {
+    ///     while let Some(event) = events.recv().await {
+    ///         println!("{event:?}");
+    ///     }
+    /// });
+    /// ```
     pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<ActorEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.event_subscribers.lock().unwrap().push(tx);
@@ -876,6 +1003,14 @@ impl Receptionist {
     /// Multiple actors can share the same key. This is how you build
     /// actor groups — register several actors with the same key, then
     /// subscribe to the key to discover them all.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let key = ReceptionKey::<Worker>::new("workers");
+    /// receptionist.check_in("worker/0", key.clone());
+    /// receptionist.check_in("worker/1", key.clone());
+    /// ```
     pub fn check_in<A: Actor + 'static>(&self, label: &str, key: ReceptionKey<A>) {
         let erased_key = ErasedReceptionKey {
             id: key.id.clone(),
@@ -940,6 +1075,16 @@ impl Receptionist {
     /// new actors as they check in with the matching key.
     ///
     /// Analogous to Swift's `receptionist.listing(of: key)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let key = ReceptionKey::<Worker>::new("workers");
+    /// let mut listing = receptionist.listing(key);
+    /// while let Some(ep) = listing.next().await {
+    ///     ep.send(Ping).await.ok();
+    /// }
+    /// ```
     pub fn listing<A: Actor + 'static>(&self, key: ReceptionKey<A>) -> Listing<A> {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -979,7 +1124,7 @@ impl Receptionist {
 
     /// Get a watched listing that streams both additions and removals with labels.
     ///
-    /// Unlike [`listing`](Self::listing), this returns [`ListingEvent`] values
+    /// Unlike [`listing`](Self::listing), this returns [`ListingEvent`](crate::ListingEvent) values
     /// that include the actor's label and distinguish between additions and
     /// removals. Use this to build reactive pools that auto-track membership.
     ///

@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::instrument;
 use crate::{
     Actor, DispatchRequest, Endpoint, Listing, OpType, ReceptionKey, Receptionist,
     ReceptionistConfig, RemoteDispatch, RemoteInvocation,
@@ -96,6 +97,17 @@ impl ClusterSystem {
     ///
     /// This binds the QUIC transport, starts discovery, initializes SWIM
     /// membership, and spawns the main event loop.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let config = ClusterConfig::builder()
+    ///     .listen("127.0.0.1:0".parse()?)
+    ///     .cookie("secret")
+    ///     .build()?;
+    /// let system = ClusterSystem::start(config, TypeRegistry::from_auto(), SpawnRegistry::new()).await?;
+    /// let ep = system.start_actor("counter/0", Counter, CounterState { count: 0 });
+    /// ```
     pub async fn start(
         config: ClusterConfig,
         type_registry: TypeRegistry,
@@ -171,6 +183,13 @@ impl ClusterSystem {
     }
 
     /// Start a local actor and register it with the receptionist.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = cluster.start_actor("worker/0", Worker, WorkerState::default());
+    /// ep.send(DoWork { task: "process".into() }).await?;
+    /// ```
     pub fn start_actor<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
     where
         A: Actor + RemoteDispatch + 'static,
@@ -179,6 +198,14 @@ impl ClusterSystem {
     }
 
     /// Look up an actor by label (local or remote).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// if let Some(counter) = cluster.lookup::<Counter>("counter/0") {
+    ///     let count = counter.send(GetCount).await?;
+    /// }
+    /// ```
     pub fn lookup<A: Actor + 'static>(&self, label: &str) -> Option<Endpoint<A>> {
         self.receptionist.lookup(label)
     }
@@ -192,6 +219,21 @@ impl ClusterSystem {
     }
 
     /// Subscribe to cluster events.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut events = cluster.subscribe_events();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = events.recv().await {
+    ///         match event {
+    ///             ClusterEvent::NodeJoined(id) => println!("Node joined: {id}"),
+    ///             ClusterEvent::NodeLeft(id) => println!("Node left: {id}"),
+    ///             _ => {}
+    ///         }
+    ///     }
+    /// });
+    /// ```
     pub fn subscribe_events(&self) -> broadcast::Receiver<ClusterEvent> {
         self.event_tx.subscribe()
     }
@@ -450,6 +492,7 @@ fn spawn_event_loop(
                         ControlMessage::Departure(ref identity) => {
                             let departing_id = identity.node_id_string();
                             tracing::info!("Node {departing_id} departing gracefully");
+                            instrument::cluster_node_left();
                             let _ = event_tx.send(ClusterEvent::NodeLeft(identity.clone()));
                             receptionist.prune_node(&departing_id);
                             transport.remove_connection(&departing_id).await;

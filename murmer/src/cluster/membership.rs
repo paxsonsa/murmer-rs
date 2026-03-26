@@ -1,3 +1,9 @@
+//! SWIM-based cluster membership via the `foca` crate.
+//!
+//! [`ClusterMembership`] wraps a `Foca` instance and translates its
+//! protocol notifications into [`ClusterEvent`]s that drive the rest
+//! of the cluster system (connection management, receptionist sync, etc.).
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -6,6 +12,8 @@ use futures_util::StreamExt;
 use rand::SeedableRng;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::time::DelayQueue;
+
+use crate::instrument;
 
 use super::config::NodeIdentity;
 
@@ -186,6 +194,7 @@ impl Runtime<NodeIdentity> for FocaRuntime {
             Notification::MemberUp(identity) => {
                 if identity.socket_addr() != self.local_identity.socket_addr() {
                     tracing::info!("SWIM: node joined: {identity}");
+                    instrument::cluster_node_joined();
                     let _ = self
                         .event_tx
                         .send(ClusterEvent::NodeJoined(identity.clone()));
@@ -193,6 +202,7 @@ impl Runtime<NodeIdentity> for FocaRuntime {
             }
             Notification::MemberDown(identity) => {
                 tracing::info!("SWIM: node failed (detected by failure detector): {identity}");
+                instrument::cluster_node_failed();
                 let _ = self
                     .event_tx
                     .send(ClusterEvent::NodeFailed(identity.clone()));

@@ -1,7 +1,7 @@
 //! Node receiver — routes incoming remote invocations to local actors.
 //!
 //! [`run_node_receiver`] bridges the network layer to the receptionist.
-//! It reads [`RemoteInvocation`](crate::RemoteInvocation) messages from a
+//! It reads [`RemoteInvocation`] messages from a
 //! channel, looks up the target actor's dispatch channel via the receptionist,
 //! and forwards the request. Responses are sent back through the response channel.
 //!

@@ -308,6 +308,18 @@ pub struct ClusterConfigBuilder {
 }
 
 impl ClusterConfigBuilder {
+    /// Create a new builder with default settings.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let config = ClusterConfigBuilder::new()
+    ///     .name("worker-1")
+    ///     .listen("0.0.0.0:9001".parse()?)
+    ///     .cookie("my-cluster-secret")
+    ///     .seed_nodes(vec!["192.168.1.10:9001".parse()?])
+    ///     .build()?;
+    /// ```
     pub fn new() -> Self {
         Self {
             name: None,
@@ -390,6 +402,16 @@ impl ClusterConfigBuilder {
         self
     }
 
+    /// Build the cluster config. Requires `listen` and `cookie` to be set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let config = ClusterConfig::builder()
+    ///     .listen("127.0.0.1:0".parse()?)
+    ///     .cookie("secret")
+    ///     .build()?;
+    /// ```
     pub fn build(self) -> Result<ClusterConfig, &'static str> {
         let listen_addr = self.listen_addr.ok_or("listen address is required")?;
         let cookie = self.cookie.ok_or("cookie is required")?;
@@ -425,6 +447,17 @@ impl Default for ClusterConfigBuilder {
 }
 
 impl ClusterConfig {
+    /// Create a builder for constructing cluster configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let config = ClusterConfig::builder()
+    ///     .listen("127.0.0.1:9001".parse()?)
+    ///     .cookie("secret")
+    ///     .seed_nodes(vec!["192.168.1.10:9001".parse()?])
+    ///     .build()?;
+    /// ```
     pub fn builder() -> ClusterConfigBuilder {
         ClusterConfigBuilder::new()
     }

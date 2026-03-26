@@ -17,7 +17,7 @@
 //! # Envelope pattern (local dispatch)
 //!
 //! For local actors, the [`EnvelopeProxy`] trait provides zero-cost type-erased
-//! dispatch. A [`TypedEnvelope<M>`] wraps the concrete message and a oneshot
+//! dispatch. A `TypedEnvelope<M>` wraps the concrete message and a oneshot
 //! channel for the response, then erases the message type behind `dyn EnvelopeProxy<A>`.
 
 use std::collections::HashMap;
@@ -30,12 +30,24 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::actor::{Actor, ActorContext, AsyncHandler, Handler, Message};
+use crate::instrument;
 
 // =============================================================================
 // WIRE TYPES
 // =============================================================================
 
 /// What crosses the wire — analogous to Swift's InvocationMessage.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let invocation = RemoteInvocation {
+///     call_id: 42,
+///     actor_label: "counter/0".to_string(),
+///     message_type: "counter::Increment".to_string(),
+///     payload: bincode::serde::encode_to_vec(&msg, bincode::config::standard())?,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteInvocation {
     pub call_id: u64,
@@ -45,6 +57,20 @@ pub struct RemoteInvocation {
 }
 
 /// Response from the remote side.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let response = RemoteResponse {
+///     call_id: 42,
+///     result: Ok(serialized_result),
+/// };
+/// // Or on error:
+/// let response = RemoteResponse {
+///     call_id: 42,
+///     result: Err("actor not found".to_string()),
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteResponse {
     pub call_id: u64,
@@ -52,6 +78,18 @@ pub struct RemoteResponse {
 }
 
 /// Internal: routes an incoming remote invocation to a local actor's supervisor.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let (tx, rx) = oneshot::channel();
+/// let request = DispatchRequest {
+///     invocation: remote_invocation,
+///     respond_to: tx,
+/// };
+/// dispatch_channel.send(request).ok();
+/// let response = rx.await?;
+/// ```
 pub struct DispatchRequest {
     pub invocation: RemoteInvocation,
     pub respond_to: oneshot::Sender<RemoteResponse>,
@@ -61,6 +99,27 @@ pub struct DispatchRequest {
 // SEND ERROR
 // =============================================================================
 
+/// Errors that can occur when sending a message via an [`Endpoint`](crate::Endpoint).
+///
+/// # Variants
+///
+/// - `MailboxClosed` — the actor has stopped and its mailbox channel is closed.
+/// - `ResponseDropped` — the actor processed the message but the response channel was dropped
+///   (typically because the actor panicked during handling).
+/// - `WireClosed` — the QUIC stream to the remote node is closed.
+/// - `SerializationFailed` / `DeserializationFailed` — bincode encoding/decoding error.
+/// - `RemoteError` — the remote actor returned an error (e.g., dispatch failure or panic).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// match endpoint.send(MyMessage).await {
+///     Ok(result) => println!("Got: {result:?}"),
+///     Err(SendError::MailboxClosed) => println!("Actor is gone"),
+///     Err(SendError::RemoteError(msg)) => println!("Remote error: {msg}"),
+///     Err(e) => println!("Other error: {e}"),
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
     #[error("actor mailbox closed")]
@@ -87,6 +146,22 @@ pub enum SendError {
 /// envelope (auto-reply after handler returns) and the handler (via
 /// [`ActorContext::reply`] or [`ActorContext::reply_sender`]) can access it.
 /// Taking from the `Option` ensures exactly-once delivery.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Used internally by the envelope system, but accessible via ctx.reply_sender()
+/// impl AsyncHandler<LongRunning> for MyActor {
+///     async fn handle(&self, ctx: &ActorContext<Self>, state: &mut MyState, msg: LongRunning) -> String {
+///         let sender = ctx.reply_sender::<String>().unwrap();
+///         ctx.spawn(async move {
+///             let result = do_expensive_work().await;
+///             sender.send(result);  // reply from a background task
+///         });
+///         String::new()  // ignored — reply_sender owns the channel
+///     }
+/// }
+/// ```
 pub struct ReplySender<R: Send + 'static> {
     inner: Arc<Mutex<Option<oneshot::Sender<R>>>>,
 }
@@ -259,6 +334,12 @@ where
 // RESPONSE REGISTRY — correlates wire responses to in-flight calls
 // =============================================================================
 
+/// Correlates in-flight remote calls to their response channels.
+///
+/// Each remote `send()` registers a call ID and a `oneshot::Sender` here.
+/// When the response arrives from the wire, `complete()` routes it to the
+/// waiting caller. If the connection drops, `fail_all()` sends errors to
+/// every pending caller so they don't hang.
 #[derive(Clone)]
 pub struct ResponseRegistry {
     inner: Arc<Mutex<HashMap<u64, oneshot::Sender<RemoteResponse>>>>,
@@ -272,11 +353,16 @@ impl ResponseRegistry {
     }
 
     pub fn register(&self, call_id: u64, tx: oneshot::Sender<RemoteResponse>) {
-        self.inner.lock().unwrap().insert(call_id, tx);
+        let mut map = self.inner.lock().unwrap();
+        map.insert(call_id, tx);
+        instrument::inflight_calls_set(map.len() as f64);
     }
 
     pub fn complete(&self, response: RemoteResponse) {
-        if let Some(tx) = self.inner.lock().unwrap().remove(&response.call_id) {
+        let mut map = self.inner.lock().unwrap();
+        if let Some(tx) = map.remove(&response.call_id) {
+            instrument::inflight_calls_set(map.len() as f64);
+            drop(map);
             let _ = tx.send(response);
         }
     }
@@ -286,12 +372,15 @@ impl ResponseRegistry {
     /// failure immediately instead of waiting forever.
     pub fn fail_all(&self, error_msg: &str) {
         let mut map = self.inner.lock().unwrap();
+        let count = map.len() as u64;
         for (call_id, tx) in map.drain() {
             let _ = tx.send(RemoteResponse {
                 call_id,
                 result: Err(error_msg.to_string()),
             });
         }
+        instrument::inflight_calls_set(0.0);
+        instrument::dead_letters(count);
     }
 }
 

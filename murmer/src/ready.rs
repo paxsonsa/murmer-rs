@@ -9,8 +9,8 @@
 //! channel until [`ReadyHandle::start()`] is called to spawn the supervisor.
 //!
 //! If the `ReadyHandle` is dropped without calling `start()`, the internal
-//! [`DeregisterGuard`](crate::receptionist::DeregisterGuard) fires and the actor
-//! is automatically removed from the receptionist.
+//! `DeregisterGuard` fires and the actor is automatically removed from the
+//! receptionist.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +30,19 @@ use crate::wire::{DispatchRequest, EnvelopeProxy};
 /// draining the mailbox and processing messages.
 ///
 /// Dropping without calling `start()` automatically deregisters the actor.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Prepare an actor — it's discoverable but not processing yet
+/// let (endpoint, ready) = system.prepare("cache/0", Cache, CacheState::new());
+///
+/// // Messages sent now will queue in the mailbox
+/// endpoint.send(Warmup { key: "users".into() }).await.ok();
+///
+/// // Start processing — queued messages drain in order
+/// ready.start();
+/// ```
 pub struct ReadyHandle<A: Actor + RemoteDispatch + 'static> {
     actor: Option<A>,
     state: Option<A::State>,
@@ -74,7 +87,7 @@ impl<A: Actor + RemoteDispatch + 'static> ReadyHandle<A> {
     /// All messages that were queued in the mailbox while the actor was in
     /// the prepared state will be processed in order.
     ///
-    /// This consumes the `ReadyHandle`. The [`DeregisterGuard`] ownership
+    /// This consumes the `ReadyHandle`. The `DeregisterGuard` ownership
     /// transfers to the supervisor task — when the supervisor exits, the
     /// guard fires and deregisters the actor.
     pub fn start(mut self) {

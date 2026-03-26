@@ -41,7 +41,7 @@ pub enum ControlMessage {
 /// A request to spawn an actor on a remote node.
 ///
 /// Sent by the Coordinator over the control stream. The receiving node
-/// looks up the `actor_type_name` in its [`SpawnRegistry`], deserializes
+/// looks up the `actor_type_name` in its `SpawnRegistry`, deserializes
 /// the state bytes, and calls `receptionist.start()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRequest {

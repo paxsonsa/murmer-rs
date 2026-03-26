@@ -99,6 +99,33 @@ where
 ///
 /// Override [`on_actor_terminated`](Actor::on_actor_terminated) to react when
 /// a watched actor terminates (set up watches via [`ActorContext::watch`]).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use murmer::prelude::*;
+///
+/// #[derive(Debug)]
+/// struct Counter;
+///
+/// struct CounterState { count: i64 }
+///
+/// impl Actor for Counter {
+///     type State = CounterState;
+/// }
+///
+/// // Define a message and handler
+/// #[derive(Debug, Clone, Serialize, Deserialize, Message)]
+/// #[message(result = i64, remote = "counter::Increment")]
+/// struct Increment { amount: i64 }
+///
+/// impl Handler<Increment> for Counter {
+///     fn handle(&self, _ctx: &ActorContext<Self>, state: &mut CounterState, msg: Increment) -> i64 {
+///         state.count += msg.amount;
+///         state.count
+///     }
+/// }
+/// ```
 pub trait Actor: Send + 'static {
     type State: Send + 'static;
 
@@ -117,6 +144,28 @@ pub trait Actor: Send + 'static {
 /// - [`receptionist()`](ActorContext::receptionist) — for looking up other actors
 /// - [`watch()`](ActorContext::watch) — Erlang-style actor monitoring
 /// - [`actor_ref()`](ActorContext::actor_ref) — serializable reference for embedding in messages
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// impl Handler<Ping> for MyActor {
+///     fn handle(&self, ctx: &ActorContext<Self>, state: &mut MyState, _msg: Ping) -> String {
+///         // Access actor identity
+///         let label = ctx.label();
+///         let node = ctx.node_id();
+///
+///         // Look up other actors
+///         if let Some(peer) = ctx.receptionist().lookup::<OtherActor>("peer/0") {
+///             ctx.spawn(async move { peer.send(Notify).await.ok(); });
+///         }
+///
+///         // Watch another actor for termination
+///         ctx.watch("worker/0");
+///
+///         format!("{label}@{node}")
+///     }
+/// }
+/// ```
 pub struct ActorContext<A: Actor> {
     pub(crate) label: String,
     pub(crate) node_id: String,
@@ -130,6 +179,14 @@ pub struct ActorContext<A: Actor> {
 
 impl<A: Actor + 'static> ActorContext<A> {
     /// This actor's label in the receptionist.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, _state: &mut MyState, _msg: Ping) -> String {
+    ///     format!("Hello from {}", ctx.label())
+    /// }
+    /// ```
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -140,6 +197,15 @@ impl<A: Actor + 'static> ActorContext<A> {
     }
 
     /// Get an endpoint to this actor (useful for self-sends or passing identity).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, _state: &mut MyState, msg: RegisterSelf) -> () {
+    ///     let self_ep = ctx.endpoint();
+    ///     msg.coordinator.send(Register { worker: self_ep }).await.ok();
+    /// }
+    /// ```
     pub fn endpoint(&self) -> Endpoint<A> {
         Endpoint::local(self.mailbox_tx.clone())
     }
@@ -156,6 +222,19 @@ impl<A: Actor + 'static> ActorContext<A> {
     ///
     /// If the watched actor doesn't exist at the time of the call, the
     /// termination notification fires immediately (Erlang semantics).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, _state: &mut MyState, msg: WatchWorker) -> () {
+    ///     ctx.watch(&msg.worker_label);
+    /// }
+    ///
+    /// // Then handle termination in the Actor trait:
+    /// fn on_actor_terminated(&mut self, state: &mut MyState, event: &ActorTerminated) {
+    ///     state.dead_workers.push(event.label.clone());
+    /// }
+    /// ```
     pub fn watch(&self, label: &str) {
         self.receptionist
             .add_watch(label, &self.label, self.system_tx.clone());
@@ -165,7 +244,7 @@ impl<A: Actor + 'static> ActorContext<A> {
     ///
     /// The stop is asynchronous: the current handler completes normally,
     /// and the supervisor exits on its next loop iteration. The actor
-    /// terminates with [`TerminationReason::Stopped`] — a `Transient`
+    /// terminates with [`TerminationReason::Stopped`](crate::TerminationReason::Stopped) — a `Transient`
     /// restart policy will *not* restart it, but `Permanent` will.
     ///
     /// Idempotent: calling `stop()` multiple times is harmless (the
@@ -178,6 +257,18 @@ impl<A: Actor + 'static> ActorContext<A> {
     ///
     /// Use this for background work that doesn't need to block the handler.
     /// The spawned future runs independently of the actor's lifecycle.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, _state: &mut MyState, msg: Notify) -> () {
+    ///     let ep = ctx.endpoint();
+    ///     ctx.spawn(async move {
+    ///         tokio::time::sleep(Duration::from_secs(5)).await;
+    ///         ep.send(CheckTimeout).await.ok();
+    ///     });
+    /// }
+    /// ```
     pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -205,6 +296,18 @@ impl<A: Actor + 'static> ActorContext<A> {
     /// Returns `true` if the reply was sent, `false` if already consumed
     /// (e.g., by a previous `reply()` call or `forward()`).
     ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, state: &mut MyState, msg: GetCached) -> String {
+    ///     if let Some(cached) = state.cache.get(&msg.key) {
+    ///         ctx.reply(cached.clone()); // reply early
+    ///         return String::new();      // return value is discarded
+    ///     }
+    ///     "miss".to_string() // normal return-value reply
+    /// }
+    /// ```
+    ///
     /// # Panics
     ///
     /// Panics if `R` doesn't match the current message's result type.
@@ -227,6 +330,19 @@ impl<A: Actor + 'static> ActorContext<A> {
     /// After calling this, the handler's return value will be discarded.
     /// The caller is responsible for eventually calling `sender.send(value)`.
     ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, _state: &mut MyState, msg: SlowQuery) -> String {
+    ///     let sender = ctx.reply_sender::<String>();
+    ///     ctx.spawn(async move {
+    ///         let result = expensive_io(msg.query).await;
+    ///         sender.send(result); // reply from background task
+    ///     });
+    ///     String::new() // discarded
+    /// }
+    /// ```
+    ///
     /// # Panics
     ///
     /// Panics if `R` doesn't match the current message's result type,
@@ -248,6 +364,17 @@ impl<A: Actor + 'static> ActorContext<A> {
     ///
     /// Only works for local endpoints. Returns `false` if the reply was already
     /// consumed or the target's mailbox is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, state: &mut RouterState, msg: Request) -> Response {
+    ///     // Route to the appropriate backend — reply goes directly to caller
+    ///     let backend = &state.backends[msg.shard % state.backends.len()];
+    ///     ctx.forward(backend, msg);
+    ///     Response::default() // discarded
+    /// }
+    /// ```
     pub fn forward<B, M>(&self, endpoint: &Endpoint<B>, message: M) -> bool
     where
         B: Handler<M> + 'static,
@@ -446,6 +573,22 @@ pub trait AsyncHandler<M: Message>: Actor + Sized {
 /// and serializes the result.
 ///
 /// You should not need to implement this manually — use `#[handlers]` instead.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Generated by #[handlers] — you don't write this by hand:
+/// #[handlers]
+/// impl Counter {
+///     #[handler]
+///     fn handle_increment(&self, ctx: &ActorContext<Self>, state: &mut CounterState, msg: Increment) -> i64 {
+///         state.count += msg.amount;
+///         state.count
+///     }
+/// }
+/// // The macro generates a RemoteDispatch impl that routes
+/// // "counter::Increment" → handle_increment
+/// ```
 pub trait RemoteDispatch: Actor + Sized {
     fn dispatch_remote<'a>(
         &'a mut self,
@@ -457,6 +600,18 @@ pub trait RemoteDispatch: Actor + Sized {
 }
 
 /// Errors from remote message dispatch.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// match actor.dispatch_remote(ctx, state, "unknown::Msg", &payload).await {
+///     Ok(bytes) => { /* send response */ }
+///     Err(DispatchError::UnknownMessageType(t)) => {
+///         tracing::warn!("No handler for message type: {t}");
+///     }
+///     Err(e) => tracing::error!("Dispatch failed: {e}"),
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
     #[error("unknown message type: {0}")]
