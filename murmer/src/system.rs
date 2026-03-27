@@ -157,6 +157,41 @@ impl System {
         self.receptionist().start(label, actor, state)
     }
 
+    /// Start a public actor visible to Edge clients and all cluster members.
+    ///
+    /// Identical to [`start()`](Self::start) but marks the actor as
+    /// [`Visibility`](crate::Visibility)`::Public`, making it discoverable by Edge clients
+    /// connected via `MurmerClient`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = system.start_public("api/users", UserService, UserServiceState::new());
+    /// ```
+    pub fn start_public<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
+    where
+        A: Actor + RemoteDispatch + 'static,
+    {
+        self.receptionist().start_public(label, actor, state)
+    }
+
+    /// Start a private actor visible only on this node.
+    ///
+    /// Private actors are never replicated and cannot be discovered remotely.
+    /// Use for utility actors that are purely node-local implementation details.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = system.start_private("node/metrics", MetricsCollector, state);
+    /// ```
+    pub fn start_private<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
+    where
+        A: Actor + RemoteDispatch + 'static,
+    {
+        self.receptionist().start_private(label, actor, state)
+    }
+
     /// Prepare an actor for deferred start.
     ///
     /// Returns an `Endpoint<A>` that can immediately queue messages, and a

@@ -106,6 +106,7 @@ extern crate self as murmer;
 pub mod actor;
 #[cfg(feature = "app")]
 pub mod app;
+pub mod client;
 pub mod cluster;
 pub mod endpoint;
 #[allow(dead_code)]
@@ -149,6 +150,7 @@ pub struct TypeRegistryEntry {
         tokio::sync::mpsc::UnboundedSender<crate::RemoteInvocation>,
         crate::ResponseRegistry,
         &str,
+        crate::receptionist::Visibility,
     ),
 }
 
@@ -191,7 +193,7 @@ pub mod prelude {
     };
     pub use crate::listing::{Listing, ListingEvent, ReceptionKey, WatchedListing};
     pub use crate::ready::ReadyHandle;
-    pub use crate::receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
+    pub use crate::receptionist::{ActorEvent, Receptionist, ReceptionistConfig, Visibility};
     pub use crate::router::{PoolRouter, Router, RoutingStrategy};
     pub use crate::system::System;
     pub use crate::wire::{ReplySender, SendError};
@@ -214,8 +216,9 @@ pub use listing::{Listing, ListingEvent, ReceptionKey, WatchedListing};
 pub use node::run_node_receiver;
 pub use oplog::{Op, OpType, VersionVector};
 pub use ready::ReadyHandle;
-pub use receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
+pub use receptionist::{ActorEvent, Receptionist, ReceptionistConfig, Visibility};
 pub use router::{PoolRouter, Router, RoutingStrategy};
+pub use client::{ClientOptions, MurmerClient};
 pub use system::System;
 pub use wire::{
     DispatchRequest, RemoteInvocation, RemoteResponse, ReplySender, ResponseRegistry, SendError,

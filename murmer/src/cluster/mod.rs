@@ -41,6 +41,12 @@ use transport::{ConnectionEvent, Transport};
 pub struct NodeRegistryEntry {
     pub class: NodeClass,
     pub metadata: HashMap<String, String>,
+    /// True only when the peer used `Transport::connect_only()` — a pure Edge
+    /// client that doesn't host actors and shouldn't participate in SWIM.
+    ///
+    /// Distinct from `class`: a node may have `class = NodeClass::Edge` while
+    /// still being a full server-mode cluster member.
+    pub is_edge_client: bool,
 }
 
 /// Thread-safe registry of node capabilities, populated during connection setup.
@@ -54,12 +60,18 @@ impl NodeRegistry {
         Self::default()
     }
 
-    /// Record a node's class and metadata (called during handle_new_connection).
-    pub fn insert(&self, node_id: &str, class: NodeClass, metadata: HashMap<String, String>) {
-        self.nodes
-            .write()
-            .unwrap()
-            .insert(node_id.to_string(), NodeRegistryEntry { class, metadata });
+    /// Record a node's class, metadata, and edge-client flag (called during handle_new_connection).
+    pub fn insert(
+        &self,
+        node_id: &str,
+        class: NodeClass,
+        metadata: HashMap<String, String>,
+        is_edge_client: bool,
+    ) {
+        self.nodes.write().unwrap().insert(
+            node_id.to_string(),
+            NodeRegistryEntry { class, metadata, is_edge_client },
+        );
     }
 
     /// Look up a node's class and metadata.
@@ -88,6 +100,7 @@ pub struct ClusterSystem {
     event_tx: broadcast::Sender<ClusterEvent>,
     #[allow(dead_code)]
     type_registry: Arc<TypeRegistry>,
+    spawn_registry: Arc<SpawnRegistry>,
     node_registry: NodeRegistry,
     shutdown: CancellationToken,
 }
@@ -158,6 +171,7 @@ impl ClusterSystem {
             identity: identity.clone(),
             event_tx: event_tx.clone(),
             type_registry: Arc::clone(&type_registry),
+            spawn_registry: Arc::clone(&spawn_registry),
             node_registry: node_registry.clone(),
             shutdown: shutdown.clone(),
         };
@@ -243,9 +257,24 @@ impl ClusterSystem {
         &self.identity
     }
 
+    /// Get this node's class.
+    pub fn node_class(&self) -> &NodeClass {
+        &self.config.node_class
+    }
+
+    /// Get this node's metadata.
+    pub fn node_metadata(&self) -> &std::collections::HashMap<String, String> {
+        &self.config.node_metadata
+    }
+
     /// Get a reference to the receptionist.
     pub fn receptionist(&self) -> &Receptionist {
         &self.receptionist
+    }
+
+    /// Get a reference to the spawn registry.
+    pub fn spawn_registry(&self) -> &Arc<SpawnRegistry> {
+        &self.spawn_registry
     }
 
     /// Access the node registry (class and metadata for connected nodes).
@@ -473,12 +502,25 @@ fn spawn_event_loop(
                             }
                         }
                         ControlMessage::RegistrySyncRequest(peer_vv) => {
-                            sync::send_sync_to_peer(
-                                &transport,
-                                &receptionist,
-                                &node_id,
-                                &peer_vv,
-                            ).await;
+                            let is_edge = node_registry
+                                .get(&node_id)
+                                .map(|e| e.is_edge_client)
+                                .unwrap_or(false);
+                            if is_edge {
+                                sync::send_public_sync_to_peer(
+                                    &transport,
+                                    &receptionist,
+                                    &node_id,
+                                    &peer_vv,
+                                ).await;
+                            } else {
+                                sync::send_sync_to_peer(
+                                    &transport,
+                                    &receptionist,
+                                    &node_id,
+                                    &peer_vv,
+                                ).await;
+                            }
                         }
                         ControlMessage::Ping => {
                             let _ = transport.send_control(
@@ -579,16 +621,28 @@ fn spawn_event_loop(
                 // ── Connection events (disconnect handling) ────────────
                 Some(event) = conn_events.recv() => {
                     if let ConnectionEvent::Disconnected(ref disconnected_node_id) = event {
-                        tracing::info!(
-                            "Connection lost to {disconnected_node_id}, pruning actors"
-                        );
-                        receptionist.prune_node(disconnected_node_id);
+                        let was_edge = node_registry
+                            .get(disconnected_node_id)
+                            .map(|e| e.is_edge_client)
+                            .unwrap_or(false);
+
+                        if was_edge {
+                            // Silent cleanup — Edge clients are not cluster members.
+                            // No SWIM events, no actor pruning, no cluster alarms.
+                            node_registry.remove(disconnected_node_id);
+                            tracing::debug!("Edge client disconnected: {disconnected_node_id}");
+                        } else {
+                            tracing::info!(
+                                "Connection lost to {disconnected_node_id}, pruning actors"
+                            );
+                            receptionist.prune_node(disconnected_node_id);
+                        }
                     }
                 }
 
                 // ── Periodic registry sync ──────────────────────────────
                 _ = sync_interval.tick() => {
-                    sync::periodic_sync(&transport, &receptionist).await;
+                    sync::periodic_sync(&transport, &receptionist, &node_registry).await;
                 }
 
                 // ── Shutdown ────────────────────────────────────────────
@@ -616,21 +670,30 @@ async fn handle_new_connection(
     node_registry: &NodeRegistry,
 ) {
     let node_id = incoming.remote_identity.node_id_string();
-    tracing::info!("New peer connected: {node_id}");
+    let is_edge_client = incoming.is_edge_client;
 
-    // Store node class and metadata from handshake
+    if is_edge_client {
+        tracing::info!("Edge client connected: {node_id}");
+    } else {
+        tracing::info!("New peer connected: {node_id}");
+    }
+
+    // Store node class, metadata, and edge-client flag from handshake
     node_registry.insert(
         &node_id,
         incoming.node_class.clone(),
         incoming.node_metadata.clone(),
+        is_edge_client,
     );
 
-    // Tell foca about the new member
-    let _ = membership.foca.apply_many(
-        std::iter::once(foca::Member::alive(incoming.remote_identity.clone())),
-        false,
-        runtime,
-    );
+    // Only add full cluster members to SWIM gossip — Edge clients are not peers
+    if !is_edge_client {
+        let _ = membership.foca.apply_many(
+            std::iter::once(foca::Member::alive(incoming.remote_identity.clone())),
+            false,
+            runtime,
+        );
+    }
 
     // Spawn control stream reader — reads ongoing control messages from
     // the handshake stream (which survived read_handshake).
@@ -642,7 +705,7 @@ async fn handle_new_connection(
     ));
 
     // Spawn a task to accept additional bi streams from this connection.
-    // New streams are either actor streams (StreamInit) or control continuations.
+    // New streams are actor streams or control continuations.
     let control_tx = control_in_tx.clone();
     let shutdown_clone = shutdown.clone();
     let conn = incoming.connection.clone();
@@ -678,8 +741,11 @@ async fn handle_new_connection(
         }
     });
 
-    // Request initial sync
-    sync::request_sync_from_peer(transport, receptionist, &node_id).await;
+    // Only request bidirectional sync for full cluster members.
+    // Edge clients send their own RegistrySyncRequest on connect.
+    if !is_edge_client {
+        sync::request_sync_from_peer(transport, receptionist, &node_id).await;
+    }
 }
 
 // =============================================================================
@@ -949,12 +1015,14 @@ mod tests {
                  label: &str,
                  wire_tx: mpsc::UnboundedSender<crate::RemoteInvocation>,
                  response_registry: ResponseRegistry,
-                 node_id: &str| {
+                 node_id: &str,
+                 visibility: crate::receptionist::Visibility| {
                     receptionist.register_remote_from_node::<TestCounter>(
                         label,
                         wire_tx,
                         response_registry,
                         node_id,
+                        visibility,
                     );
                 },
             ),
@@ -1390,12 +1458,14 @@ mod tests {
                  label: &str,
                  wire_tx: mpsc::UnboundedSender<crate::RemoteInvocation>,
                  response_registry: ResponseRegistry,
-                 node_id: &str| {
+                 node_id: &str,
+                 visibility: crate::receptionist::Visibility| {
                     receptionist.register_remote_from_node::<RefReceiver>(
                         label,
                         wire_tx,
                         response_registry,
                         node_id,
+                        visibility,
                     );
                 },
             ),

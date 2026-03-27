@@ -52,6 +52,10 @@ pub struct IncomingConnection {
     pub node_class: NodeClass,
     /// The peer's declared metadata (from handshake).
     pub node_metadata: HashMap<String, String>,
+    /// Whether the peer is a pure Edge client (connected via `Transport::connect_only`).
+    /// Distinct from `node_class` — a node may have `node_class = Edge` while still
+    /// being a full server-mode cluster member.
+    pub is_edge_client: bool,
 }
 
 /// Manages a single connection to a peer node.
@@ -76,6 +80,9 @@ pub struct Transport {
     client_config: quinn::ClientConfig,
     shutdown: CancellationToken,
     connection_events_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    /// Whether this transport is a pure Edge client (no server, no actor hosting).
+    /// Set to `true` only by `connect_only()`; always `false` for `bind()`.
+    is_edge_client: bool,
 }
 
 impl Transport {
@@ -154,6 +161,7 @@ impl Transport {
             client_config,
             shutdown: shutdown.clone(),
             connection_events_tx,
+            is_edge_client: false,
         });
 
         // Spawn the accept loop
@@ -163,6 +171,77 @@ impl Transport {
         });
 
         Ok((transport, incoming_rx, connection_events_rx))
+    }
+
+    /// Create a client-only transport that can connect to cluster nodes but does
+    /// not accept incoming connections.
+    ///
+    /// Uses an ephemeral UDP port. No TLS server certificate is generated.
+    /// No accept loop is spawned. Edge clients use this to connect to a cluster
+    /// node, pull the public actor registry, and send messages.
+    pub async fn connect_only(
+        cookie: String,
+        node_class: NodeClass,
+        node_metadata: HashMap<String, String>,
+        tuning: TransportTuning,
+        shutdown: CancellationToken,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<ConnectionEvent>), ClusterError> {
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.initial_rtt(Duration::from_millis(tuning.initial_rtt_ms));
+        transport_config.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(tuning.max_idle_timeout_secs))
+                .expect("valid idle timeout"),
+        ));
+        if let Some(interval) = tuning.keep_alive_interval_secs {
+            transport_config.keep_alive_interval(Some(Duration::from_secs(interval)));
+        }
+        transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(
+            tuning.max_concurrent_bidi_streams,
+        ));
+        transport_config
+            .stream_receive_window(quinn::VarInt::from_u32(tuning.stream_receive_window));
+        transport_config.receive_window(quinn::VarInt::from_u32(tuning.receive_window));
+        transport_config.send_window(tuning.send_window);
+        transport_config.initial_mtu(tuning.initial_mtu);
+        let transport_config = Arc::new(transport_config);
+
+        let mut client_config = certs::create_client_config()?;
+        client_config.transport_config(transport_config);
+
+        let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+            .map_err(|e| ClusterError::Transport(e.to_string()))?;
+
+        let local_addr = endpoint
+            .local_addr()
+            .map_err(|e| ClusterError::Transport(e.to_string()))?;
+
+        // Synthetic identity — Edge clients don't accept connections so their
+        // identity is only used for the handshake payload (to tell the server
+        // this is an Edge node).
+        let identity = NodeIdentity {
+            name: format!("edge-{}", rand::random::<u32>()),
+            host: local_addr.ip().to_string(),
+            port: local_addr.port(),
+            incarnation: 0,
+        };
+
+        let (connection_events_tx, connection_events_rx) = mpsc::unbounded_channel();
+
+        let transport = Arc::new(Self {
+            endpoint,
+            identity,
+            cookie,
+            type_manifest: Vec::new(),
+            node_class,
+            node_metadata,
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            client_config,
+            shutdown,
+            connection_events_tx,
+            is_edge_client: true,
+        });
+
+        Ok((transport, connection_events_rx))
     }
 
     /// The actual listen port (useful when binding to port 0).
@@ -206,6 +285,7 @@ impl Transport {
             protocol_version: PROTOCOL_VERSION,
             node_class: self.node_class.clone(),
             node_metadata: self.node_metadata.clone(),
+            is_edge_client: self.is_edge_client,
         };
 
         let frame = framing::encode_message(&ControlMessage::Handshake(our_handshake))
@@ -302,6 +382,7 @@ impl Transport {
             control_recv: recv,
             node_class: peer_handshake.node_class,
             node_metadata: peer_handshake.node_metadata,
+            is_edge_client: peer_handshake.is_edge_client,
         })
     }
 
@@ -447,6 +528,7 @@ impl Transport {
             protocol_version: PROTOCOL_VERSION,
             node_class: self.node_class.clone(),
             node_metadata: self.node_metadata.clone(),
+            is_edge_client: self.is_edge_client,
         };
         let frame = framing::encode_message(&ControlMessage::Handshake(our_handshake))
             .map_err(ClusterError::Serialization)?;
@@ -525,6 +607,7 @@ impl Transport {
             control_recv: recv,
             node_class: peer_handshake.node_class,
             node_metadata: peer_handshake.node_metadata,
+            is_edge_client: peer_handshake.is_edge_client,
         })
     }
 }

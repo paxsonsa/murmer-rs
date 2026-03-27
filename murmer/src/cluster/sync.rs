@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{Op, OpType, Receptionist, RemoteInvocation, ResponseRegistry};
+use crate::receptionist::Visibility;
 
 use super::framing::ControlMessage;
 use super::membership::ClusterEvent;
@@ -48,10 +49,47 @@ pub async fn send_sync_to_peer(
     }
 }
 
+/// Respond to an Edge client's sync request with only public actor ops.
+///
+/// Edge clients only see `Visibility::Public` actors. Remove ops are always
+/// propagated so Edge clients are notified when a public actor they know about
+/// is removed.
+pub async fn send_public_sync_to_peer(
+    transport: &Arc<Transport>,
+    receptionist: &Receptionist,
+    peer_node_id: &str,
+    peer_vv: &crate::VersionVector,
+) {
+    let delta = receptionist.public_ops_since(peer_vv);
+    if delta.is_empty() {
+        return;
+    }
+    tracing::debug!("Sending {} public ops to edge {peer_node_id}", delta.len());
+    if let Err(e) = transport
+        .send_control(peer_node_id, ControlMessage::RegistrySync(delta))
+        .await
+    {
+        tracing::debug!("Failed to send public sync to {peer_node_id}: {e}");
+    }
+}
+
 /// Periodic sync: exchange deltas with all connected peers.
-pub async fn periodic_sync(transport: &Arc<Transport>, receptionist: &Receptionist) {
+/// Skips Edge clients — they pull on their own schedule.
+pub async fn periodic_sync(
+    transport: &Arc<Transport>,
+    receptionist: &Receptionist,
+    node_registry: &crate::cluster::NodeRegistry,
+) {
     let nodes = transport.connected_nodes().await;
     for node_id in &nodes {
+        // Edge clients pull on their own schedule — skip server-initiated sync
+        if node_registry
+            .get(node_id)
+            .map(|e| e.is_edge_client)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         request_sync_from_peer(transport, receptionist, node_id).await;
     }
 }
@@ -64,8 +102,14 @@ pub async fn periodic_sync(transport: &Arc<Transport>, receptionist: &Receptioni
 /// single binary so all types are known at compile time. Each actor type
 /// registers a factory function that creates the `Endpoint::Remote` plumbing.
 pub type RemoteRegistrationFn = Box<
-    dyn Fn(&Receptionist, &str, mpsc::UnboundedSender<RemoteInvocation>, ResponseRegistry, &str)
-        + Send
+    dyn Fn(
+            &Receptionist,
+            &str,
+            mpsc::UnboundedSender<RemoteInvocation>,
+            ResponseRegistry,
+            &str,
+            Visibility,
+        ) + Send
         + Sync,
 >;
 
@@ -231,6 +275,7 @@ pub fn apply_remote_ops(
         if let OpType::Register {
             label,
             actor_type_name,
+            visibility,
             ..
         } = &op.op_type
         {
@@ -248,13 +293,14 @@ pub fn apply_remote_ops(
                 let (wire_tx, wire_rx) = mpsc::unbounded_channel();
                 let response_registry = ResponseRegistry::new();
 
-                // Register the remote actor
+                // Register the remote actor, passing through its visibility
                 factory(
                     receptionist,
                     label,
                     wire_tx,
                     response_registry.clone(),
                     &op.node_id,
+                    *visibility,
                 );
 
                 // Use the origin node's identity (op.node_id) as the stream

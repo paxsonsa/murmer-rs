@@ -27,6 +27,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use crate::actor::{Actor, ActorContext, RemoteDispatch};
 use crate::endpoint::Endpoint;
 use crate::instrument;
@@ -58,7 +60,7 @@ use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegi
 /// tokio::spawn(async move {
 ///     while let Some(event) = events.recv().await {
 ///         match event {
-///             ActorEvent::Registered { label, actor_type } => {
+///             ActorEvent::Registered { label, actor_type, visibility } => {
 ///                 println!("Actor {label} ({actor_type}) registered");
 ///             }
 ///             ActorEvent::Deregistered { label, actor_type } => {
@@ -70,8 +72,59 @@ use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegi
 /// ```
 #[derive(Debug, Clone)]
 pub enum ActorEvent {
-    Registered { label: String, actor_type: String },
-    Deregistered { label: String, actor_type: String },
+    Registered {
+        label: String,
+        actor_type: String,
+        visibility: Visibility,
+    },
+    Deregistered {
+        label: String,
+        actor_type: String,
+    },
+}
+
+// =============================================================================
+// VISIBILITY — actor replication and discovery scope
+// =============================================================================
+
+/// Controls the replication and discovery scope of an actor.
+///
+/// | Variant | Edge clients | Cluster members | Other nodes |
+/// |---------|-------------|-----------------|-------------|
+/// | `Public` | Yes | Yes | Yes (replicated) |
+/// | `Internal` | No | Yes | Yes (replicated) |
+/// | `Private` | No | No | No (never replicated) |
+///
+/// The default is `Internal`. Use `Public` to expose actors to Edge clients
+/// connected via `MurmerClient`. Use `Private` for utility actors that are
+/// purely node-local implementation details — they will never appear in
+/// any remote node's receptionist.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Private utility actor — node-local only
+/// let metrics = system.start_private("node/metrics", MetricsCollector, state);
+///
+/// // Internal cluster actor — visible to cluster, not Edge clients (default)
+/// let router = system.start("routing/shard-0", ShardRouter, state);
+///
+/// // Public API actor — visible to everyone including Edge clients
+/// let api = system.start_public("api/users", UserService, state);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Visibility {
+    /// Visible to all cluster members and Edge clients.
+    /// Replicated via OpLog to every node.
+    Public,
+    /// Visible to full cluster members only, not Edge clients (default).
+    /// Replicated via OpLog to every node.
+    #[default]
+    Internal,
+    /// Node-local only. Never replicated. Invisible to all remote nodes
+    /// and Edge clients. Use for utility actors that are purely internal
+    /// to the node (e.g., connection managers, local caches, metrics collectors).
+    Private,
 }
 
 // =============================================================================
@@ -107,6 +160,9 @@ pub(crate) struct ActorEntry {
     pub(crate) location: EntryLocation,
     pub(crate) keys: Vec<ErasedReceptionKey>,
     pub(crate) node_id: String,
+    /// Replication and discovery scope. Used in Phase 3+ for Edge client filtering.
+    #[allow(dead_code)]
+    pub(crate) visibility: Visibility,
 }
 
 pub(crate) enum EntryLocation {
@@ -363,6 +419,7 @@ impl Receptionist {
             },
             keys: Vec::new(),
             node_id: self.inner.config.node_id.clone(),
+            visibility: Visibility::Internal,
         };
         self.inner
             .entries
@@ -371,13 +428,131 @@ impl Receptionist {
             .insert(label.to_string(), entry);
 
         // Record in oplog (respects blip window if configured)
-        self.record_register_op(label, std::any::type_name::<A>(), &[]);
+        self.record_register_op(label, std::any::type_name::<A>(), &[], Visibility::Internal);
 
         instrument::actor_started(std::any::type_name::<A>());
         instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<A>().to_string(),
+            visibility: Visibility::Internal,
+        });
+
+        endpoint
+    }
+
+    /// Start a public actor visible to Edge clients and all cluster members.
+    ///
+    /// Identical to [`start()`](Self::start) but marks the actor as
+    /// [`Visibility::Public`], making it discoverable by Edge clients.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = receptionist.start_public("api/users", UserService, UserServiceState::new());
+    /// ```
+    pub fn start_public<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
+    where
+        A: Actor + RemoteDispatch + 'static,
+    {
+        self.start_with_visibility(label, actor, state, Visibility::Public)
+    }
+
+    /// Start a private actor visible only on this node.
+    ///
+    /// Private actors are never replicated via OpLog. They do not appear in
+    /// any remote node's receptionist or in Edge client discovery. Use for
+    /// utility actors that are purely node-local implementation details —
+    /// connection managers, local caches, per-node workers, metrics collectors.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let ep = receptionist.start_private("node/metrics", MetricsCollector, state);
+    /// ```
+    pub fn start_private<A>(&self, label: &str, actor: A, state: A::State) -> Endpoint<A>
+    where
+        A: Actor + RemoteDispatch + 'static,
+    {
+        self.start_with_visibility(label, actor, state, Visibility::Private)
+    }
+
+    fn start_with_visibility<A>(
+        &self,
+        label: &str,
+        actor: A,
+        state: A::State,
+        visibility: Visibility,
+    ) -> Endpoint<A>
+    where
+        A: Actor + RemoteDispatch + 'static,
+    {
+        let (mailbox_tx, mailbox_rx) = mpsc::unbounded_channel::<Box<dyn EnvelopeProxy<A>>>();
+        let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchRequest>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (system_tx, system_rx) = mpsc::unbounded_channel::<SystemSignal>();
+
+        let exit_reason = Arc::new(Mutex::new(TerminationReason::Stopped));
+
+        let guard = DeregisterGuard {
+            receptionist: self.clone(),
+            label: label.to_string(),
+            reason: exit_reason.clone(),
+        };
+
+        let ctx = ActorContext {
+            label: label.to_string(),
+            node_id: self.inner.config.node_id.clone(),
+            mailbox_tx: mailbox_tx.clone(),
+            receptionist: self.clone(),
+            system_tx,
+            reply_token: std::sync::Mutex::new(None),
+        };
+
+        tokio::spawn(async move {
+            let _ = run_supervisor(
+                actor,
+                state,
+                ctx,
+                mailbox_rx,
+                dispatch_rx,
+                shutdown_rx,
+                system_rx,
+                exit_reason,
+                guard,
+            )
+            .await;
+        });
+
+        let endpoint = Endpoint::local(mailbox_tx.clone());
+
+        let entry = ActorEntry {
+            label: label.to_string(),
+            type_id: TypeId::of::<A>(),
+            actor_type_name: std::any::type_name::<A>().to_string(),
+            location: EntryLocation::Local {
+                endpoint_factory: Box::new(LocalEndpointFactory { mailbox_tx }),
+                dispatch_tx,
+                shutdown_tx: Some(shutdown_tx),
+            },
+            keys: Vec::new(),
+            node_id: self.inner.config.node_id.clone(),
+            visibility,
+        };
+        self.inner
+            .entries
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), entry);
+
+        self.record_register_op(label, std::any::type_name::<A>(), &[], visibility);
+
+        instrument::actor_started(std::any::type_name::<A>());
+        instrument::receptionist_registration();
+        self.emit(ActorEvent::Registered {
+            label: label.to_string(),
+            actor_type: std::any::type_name::<A>().to_string(),
+            visibility,
         });
 
         endpoint
@@ -451,6 +626,7 @@ impl Receptionist {
             },
             keys: Vec::new(),
             node_id: self.inner.config.node_id.clone(),
+            visibility: Visibility::Internal,
         };
         self.inner
             .entries
@@ -459,13 +635,14 @@ impl Receptionist {
             .insert(label.to_string(), entry);
 
         // Record in oplog (respects blip window if configured)
-        self.record_register_op(label, std::any::type_name::<A>(), &[]);
+        self.record_register_op(label, std::any::type_name::<A>(), &[], Visibility::Internal);
 
         instrument::actor_started(std::any::type_name::<A>());
         instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<A>().to_string(),
+            visibility: Visibility::Internal,
         });
 
         let ready = ReadyHandle::new(
@@ -564,6 +741,7 @@ impl Receptionist {
             },
             keys: Vec::new(),
             node_id: self.inner.config.node_id.clone(),
+            visibility: Visibility::Internal,
         };
         self.inner
             .entries
@@ -571,13 +749,19 @@ impl Receptionist {
             .unwrap()
             .insert(label.to_string(), entry);
 
-        self.record_register_op(label, std::any::type_name::<F::Actor>(), &[]);
+        self.record_register_op(
+            label,
+            std::any::type_name::<F::Actor>(),
+            &[],
+            Visibility::Internal,
+        );
 
         instrument::actor_started(std::any::type_name::<F::Actor>());
         instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<F::Actor>().to_string(),
+            visibility: Visibility::Internal,
         });
 
         // Spawn restart wrapper
@@ -639,6 +823,7 @@ impl Receptionist {
                         },
                         keys: Vec::new(),
                         node_id: node_id.clone(),
+                        visibility: Visibility::Internal,
                     };
                     receptionist
                         .inner
@@ -697,6 +882,7 @@ impl Receptionist {
                     },
                     keys: Vec::new(),
                     node_id: node_id.clone(),
+                    visibility: Visibility::Internal,
                 };
                 receptionist
                     .inner
@@ -710,6 +896,7 @@ impl Receptionist {
                 receptionist.emit(ActorEvent::Registered {
                     label: label_owned.clone(),
                     actor_type: std::any::type_name::<F::Actor>().to_string(),
+                    visibility: Visibility::Internal,
                 });
 
                 let (mb, dp) = run_supervisor(
@@ -749,16 +936,18 @@ impl Receptionist {
             wire_tx,
             response_registry,
             &self.inner.config.node_id.clone(),
+            Visibility::Internal,
         );
     }
 
-    /// Register a remote actor from a specific node.
+    /// Register a remote actor from a specific node with a given visibility.
     pub fn register_remote_from_node<A: Actor + 'static>(
         &self,
         label: &str,
         wire_tx: mpsc::UnboundedSender<RemoteInvocation>,
         response_registry: ResponseRegistry,
         node_id: &str,
+        visibility: Visibility,
     ) {
         let entry = ActorEntry {
             label: label.to_string(),
@@ -770,6 +959,7 @@ impl Receptionist {
             },
             keys: Vec::new(),
             node_id: node_id.to_string(),
+            visibility,
         };
         self.inner
             .entries
@@ -777,13 +967,14 @@ impl Receptionist {
             .unwrap()
             .insert(label.to_string(), entry);
 
-        self.record_register_op(label, std::any::type_name::<A>(), &[]);
+        self.record_register_op(label, std::any::type_name::<A>(), &[], visibility);
 
         instrument::actor_started(std::any::type_name::<A>());
         instrument::receptionist_registration();
         self.emit(ActorEvent::Registered {
             label: label.to_string(),
             actor_type: std::any::type_name::<A>().to_string(),
+            visibility,
         });
     }
 
@@ -1187,6 +1378,29 @@ impl Receptionist {
         oplog.ops_since(peer_has_seen).to_vec()
     }
 
+    /// Get only public-actor ops that the peer hasn't seen yet.
+    ///
+    /// Used for Edge client sync — Edge clients only receive `Public` actors.
+    /// Remove ops are always propagated regardless of visibility so Edge clients
+    /// are notified when a public actor they know about is removed.
+    pub fn public_ops_since(&self, peer_versions: &VersionVector) -> Vec<Op> {
+        let oplog = self.inner.oplog.lock().unwrap();
+        let peer_has_seen = peer_versions.get(&self.inner.config.node_id);
+        oplog
+            .ops_since(peer_has_seen)
+            .iter()
+            .filter(|op| match &op.op_type {
+                OpType::Register {
+                    visibility: Visibility::Public,
+                    ..
+                } => true,
+                OpType::Register { .. } => false,
+                OpType::Remove { .. } => true,
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Apply operations received from a remote peer.
     /// Uses version vectors for deduplication — already-seen ops are skipped.
     pub fn apply_ops(&self, ops: Vec<Op>) {
@@ -1204,6 +1418,7 @@ impl Receptionist {
                 OpType::Register {
                     label,
                     actor_type_name,
+                    visibility,
                     ..
                 } => {
                     // For remote ops, we emit an event but don't create a full entry
@@ -1212,6 +1427,7 @@ impl Receptionist {
                     self.emit(ActorEvent::Registered {
                         label: label.clone(),
                         actor_type: actor_type_name.clone(),
+                        visibility: *visibility,
                     });
                 }
                 OpType::Remove { label } => {
@@ -1254,7 +1470,19 @@ impl Receptionist {
     // =========================================================================
 
     /// Record a register op, respecting blip window if configured.
-    fn record_register_op(&self, label: &str, actor_type_name: &str, key_ids: &[String]) {
+    /// Private actors are never written to the oplog — they exist only on this node.
+    fn record_register_op(
+        &self,
+        label: &str,
+        actor_type_name: &str,
+        key_ids: &[String],
+        visibility: Visibility,
+    ) {
+        // Private actors are never replicated — skip OpLog entirely
+        if visibility == Visibility::Private {
+            return;
+        }
+
         let blip_window = self.inner.config.blip_window;
         let origin_addr = self.inner.config.origin_addr.clone();
 
@@ -1288,6 +1516,7 @@ impl Receptionist {
                             actor_type_name,
                             key_ids,
                             origin_addr,
+                            visibility,
                         });
                 }
 
@@ -1312,6 +1541,7 @@ impl Receptionist {
                 actor_type_name: actor_type_name.to_string(),
                 key_ids: key_ids.to_vec(),
                 origin_addr,
+                visibility,
             });
         }
     }

@@ -72,6 +72,16 @@ pub struct HandshakePayload {
     /// Arbitrary key-value metadata describing node capabilities.
     /// Examples: `"region" = "us-west"`, `"gpu" = "true"`, `"rack" = "A3"`.
     pub node_metadata: HashMap<String, String>,
+    /// Whether this node is a pure Edge client (connected via `Transport::connect_only`).
+    ///
+    /// True Edge clients do not host actors, skip SWIM membership, and receive
+    /// only public actor ops. Defaults to `false` so old nodes deserialize correctly.
+    ///
+    /// Distinct from `NodeClass::Edge`: a node can have `node_class = Edge` while
+    /// still being a full cluster member (server mode). This flag is only set when
+    /// using `Transport::connect_only()`.
+    #[serde(default)]
+    pub is_edge_client: bool,
 }
 
 /// Current protocol version.

@@ -496,12 +496,14 @@ mod tests {
             wire_tx1,
             ResponseRegistry::new(),
             "node-B",
+            murmer::receptionist::Visibility::Internal,
         );
         receptionist.register_remote_from_node::<CounterActor>(
             "counter/remote-2",
             wire_tx2,
             ResponseRegistry::new(),
             "node-B",
+            murmer::receptionist::Visibility::Internal,
         );
 
         // Drain the 3 Registered events
@@ -956,12 +958,14 @@ mod tests {
             wire_tx1,
             ResponseRegistry::new(),
             "node-A",
+            murmer::receptionist::Visibility::Internal,
         );
         node_b.register_remote_from_node::<CounterActor>(
             "counter/service-2",
             wire_tx2,
             ResponseRegistry::new(),
             "node-A",
+            murmer::receptionist::Visibility::Internal,
         );
 
         // Verify actors exist on node-B

@@ -28,21 +28,37 @@ use crate::app::coordinator::{
     Coordinator, CoordinatorState, NotifyNodeFailed, NotifyNodeJoined, NotifyNodeLeft,
     NotifySpawnAck, SerializableNodeInfo,
 };
+use crate::app::node_info::NodeInfo;
 use crate::app::spawn_sender::SpawnSender;
 
 /// Start the Coordinator actor and the cluster bridge.
 ///
 /// This is the recommended way to set up orchestration. It:
-/// 1. Creates a SpawnSender channel
-/// 2. Starts the Coordinator actor with the sender wired in
-/// 3. Spawns the bridge loop (ClusterEvents → Coordinator messages)
-/// 4. Spawns the spawn drain loop (SpawnRequests → transport.send_control)
+/// 1. Auto-registers the local node in the coordinator's ClusterView
+/// 2. Creates a SpawnSender channel
+/// 3. Starts the Coordinator actor with the sender wired in
+/// 4. Spawns the bridge loop (ClusterEvents → Coordinator messages)
+/// 5. Spawns the spawn drain loop (SpawnRequests → transport.send_control)
 ///
 /// Returns the Coordinator endpoint for submitting specs.
+///
+/// The local node auto-registration means a single-node cluster is fully
+/// functional immediately: `is_leader()` returns `true` and `SubmitSpec`
+/// can place actors without waiting for any `NodeJoined` events.
 pub fn start_coordinator(
     cluster: &ClusterSystem,
-    state: CoordinatorState,
+    mut state: CoordinatorState,
 ) -> Endpoint<Coordinator> {
+    // A node always knows about itself — auto-insert so single-node clusters
+    // work without manual NotifyNodeJoined calls and the coordinator sees
+    // itself as leader immediately.
+    let local_info = NodeInfo::new(
+        cluster.identity().clone(),
+        cluster.node_class().clone(),
+        cluster.node_metadata().clone(),
+    );
+    state.cluster_view.upsert_node(local_info);
+
     let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
     let state = state.with_spawn_sender(SpawnSender::new(spawn_tx));
 
@@ -56,9 +72,20 @@ pub fn start_coordinator(
         run_bridge_loop(&mut events, &node_registry, &bridge_ep).await;
     });
 
-    // Spawn drain loop (SpawnRequests → transport)
+    // Spawn drain loop (SpawnRequests → transport or local spawn)
     let transport = Arc::clone(cluster.transport());
-    tokio::spawn(run_spawn_drain_loop(transport, spawn_rx));
+    let local_node_id = cluster.identity().node_id_string();
+    let spawn_registry = Arc::clone(cluster.spawn_registry());
+    let receptionist = cluster.receptionist().clone();
+    let ack_ep = coordinator_ep.clone();
+    tokio::spawn(run_spawn_drain_loop(
+        transport,
+        local_node_id,
+        spawn_registry,
+        receptionist,
+        ack_ep,
+        spawn_rx,
+    ));
 
     coordinator_ep
 }
@@ -150,23 +177,49 @@ async fn run_bridge_loop(
     }
 }
 
-/// Drain loop: reads spawn requests from the channel and sends them as
-/// SpawnActor control messages via the transport.
+/// Drain loop: reads spawn requests from the channel and either spawns locally
+/// (if target == local node) or sends a `SpawnActor` control message via transport.
 async fn run_spawn_drain_loop(
     transport: Arc<Transport>,
+    local_node_id: String,
+    spawn_registry: Arc<crate::cluster::sync::SpawnRegistry>,
+    receptionist: crate::receptionist::Receptionist,
+    coordinator: Endpoint<Coordinator>,
     mut rx: mpsc::UnboundedReceiver<(String, crate::cluster::framing::SpawnRequest)>,
 ) {
     while let Some((node_id, request)) = rx.recv().await {
-        tracing::debug!(
-            "Sending SpawnActor to {node_id}: label={}, type={}",
-            request.label,
-            request.actor_type_name
-        );
-        if let Err(e) = transport
-            .send_control(&node_id, ControlMessage::SpawnActor(request))
-            .await
-        {
-            tracing::warn!("Failed to send spawn request to {node_id}: {e}");
+        if node_id == local_node_id {
+            // Local spawn — bypass transport, invoke spawn registry directly
+            tracing::debug!(
+                "Spawning actor locally: label={}, type={}",
+                request.label,
+                request.actor_type_name
+            );
+            let result = spawn_registry.spawn(
+                &receptionist,
+                &request.label,
+                &request.actor_type_name,
+                &request.initial_state,
+            );
+            let _ = coordinator
+                .send(NotifySpawnAck {
+                    request_id: request.request_id,
+                    success: result.is_ok(),
+                    error: result.err().map(|e| e.to_string()),
+                })
+                .await;
+        } else {
+            tracing::debug!(
+                "Sending SpawnActor to {node_id}: label={}, type={}",
+                request.label,
+                request.actor_type_name
+            );
+            if let Err(e) = transport
+                .send_control(&node_id, ControlMessage::SpawnActor(request))
+                .await
+            {
+                tracing::warn!("Failed to send spawn request to {node_id}: {e}");
+            }
         }
     }
 }

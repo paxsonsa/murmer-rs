@@ -36,4 +36,7 @@ pub enum ClusterError {
 
     #[error("deserialization error: {0}")]
     Deserialization(String),
+
+    #[error("timeout: {0}")]
+    Timeout(String),
 }

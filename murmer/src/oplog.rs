@@ -19,6 +19,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::receptionist::Visibility;
+
 // =============================================================================
 // OPLOG
 // =============================================================================
@@ -32,6 +34,10 @@ pub enum OpType {
         key_ids: Vec<String>,
         /// "host:port" of the node where the actor lives.
         origin_addr: String,
+        /// Visibility scope of the actor. Defaults to `Internal` on old nodes
+        /// that don't have this field (wire-compatible rolling upgrade).
+        #[serde(default)]
+        visibility: Visibility,
     },
     Remove {
         label: String,

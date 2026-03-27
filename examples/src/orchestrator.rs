@@ -189,6 +189,64 @@ mod tests {
         }
     }
 
+    // ── Test: Single-node local spawn ────────────────────────────────────
+
+    /// A single-node cluster can submit a spec, have the Coordinator place it
+    /// locally, and actually run the actor — no remote transport involved.
+    #[tokio::test]
+    async fn test_single_node_local_spawn() {
+        init_tracing();
+
+        // Single node acting as its own gateway and worker
+        let node = System::clustered(
+            node_config("solo", NodeClass::Worker, vec![("volume", "all")], &[]),
+            TypeRegistry::from_auto(),
+            make_spawn_registry(),
+        )
+        .await
+        .unwrap();
+
+        let cluster = node.cluster_system().unwrap();
+        let coordinator_state = CoordinatorState::new(
+            cluster.identity().node_id_string(),
+            Box::new(LeastLoaded),
+            Box::new(OldestNode::any()),
+        );
+
+        // start_coordinator auto-inserts the local node; single-node is leader immediately
+        let coordinator_ep = bridge::start_coordinator(cluster, coordinator_state);
+
+        // Submit a spec — should place on the only node (local) and spawn it
+        let state = StorageState {
+            root_name: "local-store".into(),
+            dirs: [("/".into(), vec!["readme.txt".into()])].into(),
+        };
+        let state_bytes =
+            bincode::serde::encode_to_vec(&state, bincode::config::standard()).unwrap();
+
+        let result = coordinator_ep
+            .send(SubmitSpec {
+                spec: ActorSpec::new("storage/local", "orchestrator::StorageAgent")
+                    .with_state(state_bytes)
+                    .with_crash_strategy(CrashStrategy::WaitForReturn(Duration::from_secs(30))),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_ok(), "Placement failed: {:?}", result);
+
+        // The actor should appear locally after the local spawn completes
+        let ep: Endpoint<StorageAgent> = wait_for(&node, "storage/local").await;
+
+        let root = ep.send(GetRoot).await.unwrap();
+        assert_eq!(root, "local-store");
+
+        let entries = ep.send(ListDir { path: "/".into() }).await.unwrap();
+        assert_eq!(entries, vec!["readme.txt"]);
+
+        node.shutdown().await;
+    }
+
     // ── Test: Full orchestration loop ────────────────────────────────────
 
     #[tokio::test]

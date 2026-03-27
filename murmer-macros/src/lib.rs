@@ -566,9 +566,9 @@ pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #[linkme(crate = ::murmer::__reexport::linkme)]
             static _MURMER_AUTO_REG: ::murmer::TypeRegistryEntry = ::murmer::TypeRegistryEntry {
                 actor_type_name: || ::core::any::type_name::<#self_ty>(),
-                register: |receptionist, label, wire_tx, response_registry, node_id| {
+                register: |receptionist, label, wire_tx, response_registry, node_id, visibility| {
                     receptionist.register_remote_from_node::<#self_ty>(
-                        label, wire_tx, response_registry, node_id,
+                        label, wire_tx, response_registry, node_id, visibility,
                     );
                 },
             };
