@@ -23,6 +23,10 @@ path = "src/cluster_chat.rs"
 name = "orchestrator"
 path = "src/orchestrator.rs"
 
+[[bin]]
+name = "edge_client"
+path = "src/edge_client.rs"
+
 [dependencies]
 murmer = { workspace = true, features = ["app"] }
 serde = { workspace = true }
