@@ -33,6 +33,7 @@ Your Code → Endpoint<A> ──┤
 | **Minimal boilerplate** | `#[handlers]` generates message structs, dispatch tables, and extension traits from plain method signatures |
 | **Networking included** | QUIC transport, TLS encryption, SWIM membership, mDNS discovery — configured, not hand-rolled |
 | **OTP-style supervision** | Restart policies (Temporary, Transient, Permanent) with limits and exponential backoff |
+| **Edge clients** | Lightweight `MurmerClient` connects to a cluster and calls public actors without joining it |
 | **Test without infra** | Spin up multi-node clusters in-memory from a single process |
 
 ## Quick Start
@@ -102,13 +103,46 @@ let remote = system.lookup::<Counter>("counter/on-other-node").unwrap();
 remote.get_count().await?;  // transparently serialized over QUIC
 ```
 
+## Edge Clients
+
+Not everything that talks to your cluster needs to join it. Use `MurmerClient` to connect from a REST gateway, CLI tool, or test runner and call public actors directly:
+
+```rust,ignore
+use murmer::MurmerClient;
+
+let client = MurmerClient::connect("10.0.0.5:9000".parse()?, "cluster-cookie").await?;
+let ep = client.lookup::<UserService>("api/users").unwrap();
+let user = ep.send(GetUser { id: 42 }).await?;
+client.disconnect().await;
+```
+
+Mark actors as public on the server side with `system.start_public()`:
+
+```rust,ignore
+// Visible to Edge clients
+let api = system.start_public("api/users", UserService, state);
+
+// Internal cluster actors — not visible to Edge clients (default)
+let router = system.start("routing/shard", ShardRouter, state);
+```
+
+`lookup_wait` blocks until the actor appears — useful when connecting before the cluster has finished placing actors:
+
+```rust,ignore
+let ep = client
+    .lookup_wait::<UserService>("api/users", Duration::from_secs(5))
+    .await?;
+```
+
+See the [Edge Clients](https://paxsonsa.github.io/murmer-rs/edge-clients.html) chapter in the book for the full API, visibility model, and scalability details.
+
 ## Documentation
 
 | Resource | Description |
 |----------|-------------|
 | **[The Murmer Book](https://paxsonsa.github.io/murmer-rs/)** | User guide: actors, discovery, supervision, clustering, macros, orchestration |
 | **[API Reference](https://docs.rs/murmer)** | Rustdoc on docs.rs |
-| **[Examples](https://github.com/paxsonsa/murmer-rs/tree/main/examples)** | Runnable demos: counter, cluster chat, orchestrator |
+| **[Examples](https://github.com/paxsonsa/murmer-rs/tree/main/examples)** | Runnable demos: counter, cluster chat, orchestrator, edge client |
 
 ## Build & Test
 
