@@ -97,7 +97,6 @@ pub struct ClientOptions {
     pub sync_interval: Option<Duration>,
 }
 
-
 // =============================================================================
 // MurmerClient
 // =============================================================================
@@ -303,9 +302,7 @@ impl MurmerClient {
     /// Closes the QUIC connection to the server node and cancels the
     /// background event loop.
     pub async fn disconnect(self) {
-        self.transport
-            .remove_connection(&self.server_node_id)
-            .await;
+        self.transport.remove_connection(&self.server_node_id).await;
         self.shutdown.cancel();
     }
 
@@ -336,8 +333,7 @@ fn spawn_edge_event_loop(
     sync_interval: Option<Duration>,
     shutdown: CancellationToken,
 ) {
-    let (control_in_tx, mut control_in_rx) =
-        mpsc::unbounded_channel::<(String, ControlMessage)>();
+    let (control_in_tx, mut control_in_rx) = mpsc::unbounded_channel::<(String, ControlMessage)>();
 
     tokio::spawn(run_control_stream_reader(
         control_recv,

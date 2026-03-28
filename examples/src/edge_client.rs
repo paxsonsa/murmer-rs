@@ -142,7 +142,11 @@ mod tests {
         );
 
         // Register an INTERNAL actor — Edge clients will NOT see this
-        server.start("metrics/requests", MetricsActor, MetricsState { request_count: 0 });
+        server.start(
+            "metrics/requests",
+            MetricsActor,
+            MetricsState { request_count: 0 },
+        );
 
         // Connect a short-lived Edge client (pull once on connect)
         let client = MurmerClient::connect(server_addr, "edge-client-example")
@@ -166,7 +170,9 @@ mod tests {
         // Send a message through the remote endpoint
         let reply = ep
             .unwrap()
-            .send(SayHello { name: "World".into() })
+            .send(SayHello {
+                name: "World".into(),
+            })
             .await
             .unwrap();
         assert_eq!(reply, "Hello, World!");
@@ -218,7 +224,12 @@ mod tests {
         );
         let ep = ep_result.unwrap();
 
-        let reply = ep.send(SayHello { name: "Alice".into() }).await.unwrap();
+        let reply = ep
+            .send(SayHello {
+                name: "Alice".into(),
+            })
+            .await
+            .unwrap();
         assert_eq!(reply, "Hey, Alice!");
 
         client.disconnect().await;
@@ -270,10 +281,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reply = ep
-            .send(SayHello { name: "Bob".into() })
-            .await
-            .unwrap();
+        let reply = ep.send(SayHello { name: "Bob".into() }).await.unwrap();
         assert_eq!(reply, "Greetings, Bob!");
 
         assert!(client.is_connected());

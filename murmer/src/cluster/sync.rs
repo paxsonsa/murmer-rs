@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::{Op, OpType, Receptionist, RemoteInvocation, ResponseRegistry};
 use crate::receptionist::Visibility;
+use crate::{Op, OpType, Receptionist, RemoteInvocation, ResponseRegistry};
 
 use super::framing::ControlMessage;
 use super::membership::ClusterEvent;

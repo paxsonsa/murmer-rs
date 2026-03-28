@@ -208,6 +208,7 @@ pub use actor::{
     Actor, ActorContext, ActorRef, AsyncHandler, DispatchError, Handler, Message, MigratableActor,
     RemoteDispatch, RemoteMessage,
 };
+pub use client::{ClientOptions, MurmerClient};
 pub use endpoint::Endpoint;
 pub use lifecycle::{
     ActorFactory, ActorTerminated, BackoffConfig, RestartConfig, RestartPolicy, TerminationReason,
@@ -218,7 +219,6 @@ pub use oplog::{Op, OpType, VersionVector};
 pub use ready::ReadyHandle;
 pub use receptionist::{ActorEvent, Receptionist, ReceptionistConfig, Visibility};
 pub use router::{PoolRouter, Router, RoutingStrategy};
-pub use client::{ClientOptions, MurmerClient};
 pub use system::System;
 pub use wire::{
     DispatchRequest, RemoteInvocation, RemoteResponse, ReplySender, ResponseRegistry, SendError,

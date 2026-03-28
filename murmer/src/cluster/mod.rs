@@ -70,7 +70,11 @@ impl NodeRegistry {
     ) {
         self.nodes.write().unwrap().insert(
             node_id.to_string(),
-            NodeRegistryEntry { class, metadata, is_edge_client },
+            NodeRegistryEntry {
+                class,
+                metadata,
+                is_edge_client,
+            },
         );
     }
 
