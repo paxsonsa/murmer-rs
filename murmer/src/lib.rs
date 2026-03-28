@@ -2,14 +2,98 @@
 //!
 //! Murmer provides typed, location-transparent actors that communicate through
 //! message passing. Whether an actor lives in the same process or on a remote
-//! node across the network, you interact with it through the same
-//! [`Endpoint<A>`] API.
+//! node across the network, you interact with it through the same [`Endpoint<A>`] API.
+//!
+//! **[Read the book →](https://paxsonsa.github.io/murmer-rs/)**
+//! &nbsp;·&nbsp;
+//! **[GitHub](https://github.com/paxsonsa/murmer-rs)**
+//!
+//! ---
+//!
+//! ## Murmer in 1 minute
+//!
+//! ```toml
+//! [dependencies]
+//! murmer = "0.1"
+//! serde = { version = "1", features = ["derive"] }
+//! tokio = { version = "1", features = ["full"] }
+//! ```
+//!
+//! ```rust,ignore
+//! use murmer::prelude::*;
+//!
+//! // ① Define your actor — state lives separately
+//! #[derive(Debug)]
+//! struct Counter;
+//! struct CounterState { count: i64 }
+//!
+//! impl Actor for Counter {
+//!     type State = CounterState;
+//! }
+//!
+//! // ② Handlers become the actor's API
+//! #[handlers]
+//! impl Counter {
+//!     #[handler]
+//!     fn increment(
+//!         &mut self,
+//!         _ctx: &ActorContext<Self>,
+//!         state: &mut CounterState,
+//!         amount: i64,
+//!     ) -> i64 {
+//!         state.count += amount;
+//!         state.count
+//!     }
+//!
+//!     #[handler]
+//!     fn get_count(
+//!         &mut self,
+//!         _ctx: &ActorContext<Self>,
+//!         state: &mut CounterState,
+//!     ) -> i64 {
+//!         state.count
+//!     }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // ③ Create a local actor system
+//!     let system = System::local();
+//!
+//!     // ④ Start an actor — returns a typed Endpoint<Counter>
+//!     let counter = system.start("counter/main", Counter, CounterState { count: 0 });
+//!
+//!     // ⑤ Send messages via auto-generated extension methods
+//!     let result = counter.increment(5).await.unwrap();
+//!     println!("Count: {result}"); // → Count: 5
+//!
+//!     // ⑥ Look up actors by label — works for local and remote
+//!     let found = system.lookup::<Counter>("counter/main").unwrap();
+//!     let count = found.get_count().await.unwrap();
+//!     println!("Looked up: {count}"); // → Looked up: 5
+//! }
+//! ```
+//!
+//! ## What it gives you
+//!
+//! - **Send messages without caring where the actor lives.** `counter.increment(5)` works
+//!   identically whether the actor is local or on a remote node — [`Endpoint<A>`] abstracts
+//!   the difference away.
+//! - **Test distributed systems from a single process.** [`System::local`] runs everything
+//!   in-memory. Swap to `System::clustered_auto` when ready for real networking — your
+//!   actor code stays identical.
+//! - **Define actors with minimal boilerplate.** The `#[handlers]` macro auto-generates
+//!   message structs, dispatch tables, serialization, and ergonomic extension methods.
+//! - **Get networking and encryption handled for you.** QUIC transport with automatic TLS,
+//!   SWIM-based cluster membership, and mDNS discovery — all configured, not hand-rolled.
+//! - **Supervise actors like OTP.** Restart policies with configurable limits and
+//!   exponential backoff keep your system running through failures.
 //!
 //! ## Core concepts
 //!
 //! | Concept | Type | Purpose |
 //! |---------|------|---------|
-//! | **Actor** | [`Actor`] | Stateful message processor. Holds no state itself — state lives in an associated `State` type. |
+//! | **Actor** | [`Actor`] | Stateful message processor. State lives in an associated `State` type. |
 //! | **Message** | [`Message`] | Defines a request and its response type. |
 //! | **RemoteMessage** | [`RemoteMessage`] | A message that can cross the wire (serializable + `TYPE_ID`). |
 //! | **Endpoint** | [`Endpoint<A>`] | Opaque send handle. Abstracts local vs remote — callers never know which. |
@@ -17,51 +101,12 @@
 //! | **Router** | [`Router<A>`] | Distributes messages across a pool of endpoints (round-robin, broadcast). |
 //! | **Listing** | [`Listing<A>`] | Async stream of endpoints matching a [`ReceptionKey`]. |
 //!
-//! ## Quick start
-//!
-//! ```rust,ignore
-//! use murmer::prelude::*;
-//!
-//! // 1. Define your actor
-//! #[derive(Debug)]
-//! struct Greeter;
-//!
-//! struct GreeterState { greeting: String }
-//!
-//! impl Actor for Greeter {
-//!     type State = GreeterState;
-//! }
-//!
-//! // 2. Implement handlers — macro auto-generates message structs,
-//! //    Handler impls, RemoteDispatch, and a GreeterExt extension trait
-//! #[handlers]
-//! impl Greeter {
-//!     #[handler]
-//!     fn greet(&mut self, _ctx: &ActorContext<Self>, state: &mut GreeterState, name: String) -> String {
-//!         format!("{}, {}!", state.greeting, name)
-//!     }
-//! }
-//!
-//! // 3. Start and use
-//! #[tokio::main]
-//! async fn main() {
-//!     let system = System::local();
-//!     let endpoint = system.start("greeter/main", Greeter, GreeterState {
-//!         greeting: "Hello".into(),
-//!     });
-//!
-//!     // Call via auto-generated extension trait
-//!     let reply = endpoint.greet("world".into()).await.unwrap();
-//!     assert_eq!(reply, "Hello, world!");
-//! }
-//! ```
-//!
 //! ## Location transparency
 //!
 //! The key design principle: [`Endpoint<A>`] hides whether the actor is local or remote.
 //!
-//! - **Local actors** use the [envelope pattern](wire::EnvelopeProxy) — zero serialization cost,
-//!   direct in-memory dispatch through a type-erased trait object.
+//! - **Local actors** use the [envelope pattern](wire::EnvelopeProxy) — zero serialization
+//!   cost, direct in-memory dispatch through a type-erased trait object.
 //! - **Remote actors** serialize messages with [bincode], send them over QUIC streams,
 //!   and deserialize responses on return.
 //!
@@ -98,6 +143,33 @@
 //! - **mDNS discovery** for zero-configuration LAN clustering
 //! - **OpLog replication** with version vectors for consistent registry views
 //! - **Per-actor QUIC streams** — one multiplexed connection per node pair
+//!
+//! ## Going from local to clustered
+//!
+//! Only the system construction changes — all actor code stays identical:
+//!
+//! ```rust,ignore
+//! // Local
+//! let system = System::local();
+//!
+//! // Clustered
+//! let config = ClusterConfig::builder()
+//!     .name("my-node")
+//!     .listen("0.0.0.0:7100".parse()?)
+//!     .cookie("my-cluster-secret")
+//!     .build()?;
+//!
+//! let system = System::clustered_auto(config).await?;
+//! ```
+//!
+//! ## Learn more
+//!
+//! - **[The Murmer Book](https://paxsonsa.github.io/murmer-rs/)** — full guide with
+//!   examples, diagrams, and deep-dives into every component
+//! - [`cluster`] — multi-node clustering and networking
+//! - [`receptionist`] — actor discovery and subscriptions
+//! - [`lifecycle`] — supervision, restart policies, and actor factories
+//! - [`router`] — round-robin and broadcast routing across actor pools
 
 // Allow proc-macro-generated code (e.g. `#[handlers]`) to reference `murmer::`
 // and `::murmer::` when used inside this crate — same pattern as serde.
