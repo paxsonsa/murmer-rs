@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "murmer"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bincode",
  "bytes",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-cluster-tests"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bincode",
  "murmer",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-examples"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bincode",
  "murmer",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-macros"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "proc-macro2",
  "quote",
