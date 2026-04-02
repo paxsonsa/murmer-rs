@@ -2069,3 +2069,161 @@ mod tests {
         );
     }
 }
+
+// =============================================================================
+// TICK COUNTER — test actor for scheduling primitives
+// =============================================================================
+
+use std::time::Duration;
+
+#[derive(Debug)]
+struct TickCounter;
+
+struct TickCounterState {
+    tick_count: u64,
+    once_fired: bool,
+    schedule_handle: Option<ScheduleHandle>,
+    once_handle: Option<ScheduleHandle>,
+}
+
+impl Actor for TickCounter {
+    type State = TickCounterState;
+}
+
+#[handlers]
+impl TickCounter {
+    #[handler]
+    fn tick(&mut self, _ctx: &ActorContext<Self>, state: &mut TickCounterState) {
+        state.tick_count += 1;
+    }
+
+    #[handler]
+    fn once_fire(&mut self, _ctx: &ActorContext<Self>, state: &mut TickCounterState) {
+        state.once_fired = true;
+    }
+
+    #[handler]
+    fn start_repeating(
+        &mut self,
+        ctx: &ActorContext<Self>,
+        state: &mut TickCounterState,
+        interval_ms: u64,
+    ) {
+        state.schedule_handle = Some(ctx.schedule_repeat(Duration::from_millis(interval_ms), Tick));
+    }
+
+    #[handler]
+    fn start_once(
+        &mut self,
+        ctx: &ActorContext<Self>,
+        state: &mut TickCounterState,
+        delay_ms: u64,
+    ) {
+        state.once_handle = Some(ctx.schedule_once(Duration::from_millis(delay_ms), OnceFire));
+    }
+
+    #[handler]
+    fn cancel_repeating(&mut self, _ctx: &ActorContext<Self>, state: &mut TickCounterState) {
+        state.schedule_handle = None; // drop cancels
+    }
+
+    #[handler]
+    fn get_tick_count(&mut self, _ctx: &ActorContext<Self>, state: &mut TickCounterState) -> u64 {
+        state.tick_count
+    }
+
+    #[handler]
+    fn get_once_fired(&mut self, _ctx: &ActorContext<Self>, state: &mut TickCounterState) -> bool {
+        state.once_fired
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn tick_state() -> TickCounterState {
+        TickCounterState {
+            tick_count: 0,
+            once_fired: false,
+            schedule_handle: None,
+            once_handle: None,
+        }
+    }
+
+    /// Test: schedule_repeat sends a message on each interval.
+    #[tokio::test]
+    async fn test_schedule_repeat() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start("tick/repeat", TickCounter, tick_state());
+
+        ep.start_repeating(50).await.unwrap(); // 50ms interval
+        tokio::time::sleep(Duration::from_millis(275)).await; // ~5 ticks
+
+        let count = ep.get_tick_count().await.unwrap();
+        assert!(
+            (4..=6).contains(&count),
+            "expected 4-6 ticks in 275ms at 50ms interval, got {count}"
+        );
+    }
+
+    /// Test: schedule_once fires exactly once after the delay.
+    #[tokio::test]
+    async fn test_schedule_once() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start("tick/once", TickCounter, tick_state());
+
+        ep.start_once(100).await.unwrap(); // 100ms delay
+
+        // Should not have fired yet
+        assert!(!ep.get_once_fired().await.unwrap());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            ep.get_once_fired().await.unwrap(),
+            "once_fire should have fired"
+        );
+    }
+
+    /// Test: dropping ScheduleHandle cancels the timer.
+    #[tokio::test]
+    async fn test_schedule_cancel_on_drop() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start("tick/cancel", TickCounter, tick_state());
+
+        ep.start_repeating(50).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let count_before = ep.get_tick_count().await.unwrap();
+        assert!(count_before > 0, "should have ticked before cancel");
+
+        ep.cancel_repeating().await.unwrap(); // drops the handle
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let count_after = ep.get_tick_count().await.unwrap();
+        assert!(
+            count_after <= count_before + 1,
+            "ticks should stop after cancel: before={count_before} after={count_after}"
+        );
+    }
+
+    /// Test: stopping the actor cleans up the schedule task without panic.
+    #[tokio::test]
+    async fn test_schedule_cancel_on_actor_stop() {
+        let receptionist = Receptionist::new();
+        let ep = receptionist.start("tick/stop", TickCounter, tick_state());
+
+        ep.start_repeating(50).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let count = ep.get_tick_count().await.unwrap();
+        assert!(count > 0);
+
+        receptionist.stop("tick/stop");
+        // Give the schedule task time to notice the actor is gone
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // If we reach here without panic, the cleanup was clean
+    }
+}

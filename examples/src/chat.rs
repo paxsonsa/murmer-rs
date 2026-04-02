@@ -88,8 +88,12 @@ impl Actor for Participant {
     type State = ParticipantState;
 
     fn on_actor_terminated(&mut self, state: &mut ParticipantState, terminated: &ActorTerminated) {
+        let tag_info = match &terminated.tag {
+            Some(tag) => format!(" (tag: {tag})"),
+            None => String::new(),
+        };
         state.inbox.push(format!(
-            "[system] watched actor '{}' terminated: {:?}",
+            "[system] watched actor '{}' terminated: {:?}{tag_info}",
             terminated.label, terminated.reason
         ));
     }
@@ -124,6 +128,17 @@ impl Participant {
         label: String,
     ) {
         ctx.watch(&label);
+    }
+
+    #[handler]
+    fn watch_actor_with_tag(
+        &mut self,
+        ctx: &ActorContext<Self>,
+        _state: &mut ParticipantState,
+        label: String,
+        tag: String,
+    ) {
+        ctx.watch_with_tag(&label, tag);
     }
 }
 
@@ -442,5 +457,118 @@ mod tests {
         // Wrong type resolution returns None
         let bad_ref = ActorRef::<ChatRoom>::new("user/admin", "local");
         assert!(bad_ref.resolve(&receptionist).is_none());
+    }
+
+    /// Test: watch_with_tag delivers the tag in the termination notification.
+    #[tokio::test]
+    async fn test_tagged_watch_notification() {
+        let receptionist = Receptionist::new();
+
+        let watcher = receptionist.start(
+            "user/supervisor",
+            Participant,
+            ParticipantState {
+                username: "supervisor".into(),
+                inbox: vec![],
+            },
+        );
+
+        let _room = receptionist.start(
+            "room/tagged",
+            ChatRoom,
+            ChatRoomState {
+                room_name: "Tagged".into(),
+                messages: vec![],
+            },
+        );
+
+        watcher
+            .watch_actor_with_tag("room/tagged".into(), "chatroom".into())
+            .await
+            .unwrap();
+
+        receptionist.stop("room/tagged");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let inbox = watcher.read_inbox().await.unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert!(
+            inbox[0].contains("room/tagged"),
+            "label missing: {}",
+            inbox[0]
+        );
+        assert!(
+            inbox[0].contains("(tag: chatroom)"),
+            "tag missing: {}",
+            inbox[0]
+        );
+    }
+
+    /// Test: watch_with_tag fires immediately if the watched actor doesn't exist.
+    #[tokio::test]
+    async fn test_tagged_watch_immediate_fire() {
+        let receptionist = Receptionist::new();
+
+        let watcher = receptionist.start(
+            "user/observer",
+            Participant,
+            ParticipantState {
+                username: "observer".into(),
+                inbox: vec![],
+            },
+        );
+
+        // Watch an actor that was never started
+        watcher
+            .watch_actor_with_tag("nonexistent/actor".into(), "missing".into())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let inbox = watcher.read_inbox().await.unwrap();
+        assert_eq!(inbox.len(), 1, "expected immediate fire, got: {:?}", inbox);
+        assert!(
+            inbox[0].contains("(tag: missing)"),
+            "tag missing: {}",
+            inbox[0]
+        );
+    }
+
+    /// Test: plain watch() still delivers tag: None (backward compatible).
+    #[tokio::test]
+    async fn test_untagged_watch_has_no_tag() {
+        let receptionist = Receptionist::new();
+
+        let watcher = receptionist.start(
+            "user/plain-watcher",
+            Participant,
+            ParticipantState {
+                username: "plain-watcher".into(),
+                inbox: vec![],
+            },
+        );
+
+        let _room = receptionist.start(
+            "room/untagged",
+            ChatRoom,
+            ChatRoomState {
+                room_name: "Untagged".into(),
+                messages: vec![],
+            },
+        );
+
+        watcher.watch_actor("room/untagged".into()).await.unwrap();
+        receptionist.stop("room/untagged");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let inbox = watcher.read_inbox().await.unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert!(inbox[0].contains("room/untagged"));
+        assert!(
+            !inbox[0].contains("(tag:"),
+            "unexpected tag in untagged watch: {}",
+            inbox[0]
+        );
     }
 }

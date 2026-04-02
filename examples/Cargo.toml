@@ -27,6 +27,10 @@ path = "src/orchestrator.rs"
 name = "edge_client"
 path = "src/edge_client.rs"
 
+[[bin]]
+name = "supervisor"
+path = "src/supervisor.rs"
+
 [dependencies]
 murmer = { workspace = true, features = ["app"] }
 serde = { workspace = true }

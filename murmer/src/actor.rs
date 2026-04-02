@@ -34,6 +34,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -135,6 +136,57 @@ pub trait Actor: Send + 'static {
     }
 }
 
+// =============================================================================
+// SCHEDULE HANDLE
+// =============================================================================
+
+/// Handle to a scheduled timer. Cancels the timer when dropped.
+///
+/// Returned by [`ActorContext::schedule_once`] and [`ActorContext::schedule_repeat`].
+/// Store it in actor state to keep the schedule alive; drop it to cancel.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// struct MyState {
+///     // Dropping the state cancels the schedule automatically.
+///     maintenance: Option<ScheduleHandle>,
+/// }
+/// ```
+pub struct ScheduleHandle {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ScheduleHandle {
+    /// Cancel the scheduled timer explicitly.
+    pub fn cancel(self) {
+        self.handle.abort();
+    }
+
+    /// Returns `true` if the timer has not yet fired or been cancelled.
+    pub fn is_active(&self) -> bool {
+        !self.handle.is_finished()
+    }
+}
+
+impl Drop for ScheduleHandle {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl std::fmt::Debug for ScheduleHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScheduleHandle")
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
+// =============================================================================
+// ACTOR CONTEXT
+// =============================================================================
+
 /// Intrinsic context available to every actor handler invocation.
 ///
 /// Provides:
@@ -143,6 +195,9 @@ pub trait Actor: Send + 'static {
 /// - [`endpoint()`](ActorContext::endpoint) — a self-endpoint for passing identity
 /// - [`receptionist()`](ActorContext::receptionist) — for looking up other actors
 /// - [`watch()`](ActorContext::watch) — Erlang-style actor monitoring
+/// - [`watch_with_tag()`](ActorContext::watch_with_tag) — actor monitoring with role tag
+/// - [`schedule_once()`](ActorContext::schedule_once) — delayed self-message
+/// - [`schedule_repeat()`](ActorContext::schedule_repeat) — repeating self-message
 /// - [`actor_ref()`](ActorContext::actor_ref) — serializable reference for embedding in messages
 ///
 /// # Examples
@@ -238,6 +293,104 @@ impl<A: Actor + 'static> ActorContext<A> {
     pub fn watch(&self, label: &str) {
         self.receptionist
             .add_watch(label, &self.label, self.system_tx.clone());
+    }
+
+    /// Watch another actor with a role tag.
+    ///
+    /// Same as [`watch`](Self::watch) but attaches `tag` to the notification.
+    /// When the watched actor terminates, `terminated.tag` is `Some(tag)`,
+    /// letting the watcher identify the role without parsing label strings.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // In a supervisor:
+    /// ctx.watch_with_tag("writer/ns/container", "writer");
+    /// ctx.watch_with_tag("reader/ns/container/0", "reader");
+    ///
+    /// fn on_actor_terminated(&mut self, state: &mut State, event: &ActorTerminated) {
+    ///     match event.tag.as_deref() {
+    ///         Some("writer") => { /* restart writer */ }
+    ///         Some("reader") => { /* restart reader */ }
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
+    pub fn watch_with_tag(&self, label: &str, tag: impl Into<String>) {
+        self.receptionist.add_watch_with_tag(
+            label,
+            &self.label,
+            self.system_tx.clone(),
+            tag.into(),
+        );
+    }
+
+    /// Schedule a message to be delivered once after `delay`.
+    ///
+    /// The returned [`ScheduleHandle`] cancels the timer when dropped. If you
+    /// don't need to cancel, you can discard it with `let _ = ...`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn handle(&self, ctx: &ActorContext<Self>, state: &mut MyState, _msg: StartTimer) -> () {
+    ///     state.timeout = Some(ctx.schedule_once(Duration::from_secs(5), Timeout));
+    /// }
+    /// ```
+    pub fn schedule_once<M>(&self, delay: Duration, message: M) -> ScheduleHandle
+    where
+        M: Message,
+        A: Handler<M>,
+    {
+        let tx = self.mailbox_tx.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+            let envelope = crate::wire::TypedEnvelope {
+                message,
+                respond_to: reply_tx,
+            };
+            tx.send(Box::new(envelope)).ok();
+        });
+        ScheduleHandle { handle }
+    }
+
+    /// Schedule a message to be delivered repeatedly at `interval`.
+    ///
+    /// The timer fires immediately after the first `interval` elapses (no
+    /// initial skip). The returned [`ScheduleHandle`] cancels the timer when
+    /// dropped — store it in actor state to keep the schedule alive.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// fn on_start(&self, ctx: &ActorContext<Self>, state: &mut MyState) {
+    ///     state.heartbeat = Some(ctx.schedule_repeat(Duration::from_secs(1), Heartbeat));
+    /// }
+    /// ```
+    pub fn schedule_repeat<M>(&self, interval: Duration, message: M) -> ScheduleHandle
+    where
+        M: Message + Clone,
+        A: Handler<M>,
+    {
+        let tx = self.mailbox_tx.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                let envelope = crate::wire::TypedEnvelope {
+                    message: message.clone(),
+                    respond_to: reply_tx,
+                };
+                if tx.send(Box::new(envelope)).is_err() {
+                    break;
+                }
+            }
+        });
+        ScheduleHandle { handle }
     }
 
     /// Request this actor to stop itself.

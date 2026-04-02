@@ -64,14 +64,23 @@ pub enum TerminationReason {
 ///
 /// ```rust,ignore
 /// fn on_actor_terminated(&mut self, state: &mut MyState, event: &ActorTerminated) {
+///     match event.tag.as_deref() {
+///         Some("writer") => state.writer_down = true,
+///         Some("reader") => state.reader_down = true,
+///         _ => {}
+///     }
 ///     tracing::warn!("Watched actor {} terminated: {:?}", event.label, event.reason);
-///     state.failed_peers.push(event.label.clone());
 /// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct ActorTerminated {
     pub label: String,
     pub reason: TerminationReason,
+    /// Optional tag set by [`ActorContext::watch_with_tag`] to identify the
+    /// *role* of the terminated actor without parsing the label string.
+    ///
+    /// `None` when set via plain [`ActorContext::watch`].
+    pub tag: Option<String>,
 }
 
 /// Restart strategy for an actor — mirrors Erlang/OTP child spec strategies.
@@ -217,4 +226,6 @@ pub(crate) struct WatchEntry {
     #[allow(dead_code)]
     pub(crate) watcher_label: String,
     pub(crate) system_tx: mpsc::UnboundedSender<SystemSignal>,
+    /// Tag supplied by `watch_with_tag`; `None` for plain `watch`.
+    pub(crate) tag: Option<String>,
 }

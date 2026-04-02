@@ -1005,16 +1005,18 @@ impl Receptionist {
                 label: label.to_string(),
             });
 
-            // Fire watches (one-shot: remove drains the list)
+            // Fire watches (one-shot: remove drains the list).
+            // Each watcher gets its own ActorTerminated with its specific tag.
             if let Some(watchers) = self.inner.watches.lock().unwrap().remove(label) {
-                let terminated = ActorTerminated {
-                    label: label.to_string(),
-                    reason: reason.clone(),
-                };
                 for watcher in watchers {
+                    let terminated = ActorTerminated {
+                        label: label.to_string(),
+                        reason: reason.clone(),
+                        tag: watcher.tag,
+                    };
                     let _ = watcher
                         .system_tx
-                        .send(SystemSignal::ActorTerminated(terminated.clone()));
+                        .send(SystemSignal::ActorTerminated(terminated));
                 }
             }
 
@@ -1047,6 +1049,31 @@ impl Receptionist {
         watcher_label: &str,
         system_tx: mpsc::UnboundedSender<SystemSignal>,
     ) {
+        self.add_watch_inner(watched_label, watcher_label, system_tx, None);
+    }
+
+    /// Register a tagged watch on an actor.
+    ///
+    /// Like [`add_watch`](Self::add_watch) but the `tag` is delivered in
+    /// [`ActorTerminated::tag`] so the watcher can identify which role terminated
+    /// without parsing the label string.
+    pub(crate) fn add_watch_with_tag(
+        &self,
+        watched_label: &str,
+        watcher_label: &str,
+        system_tx: mpsc::UnboundedSender<SystemSignal>,
+        tag: String,
+    ) {
+        self.add_watch_inner(watched_label, watcher_label, system_tx, Some(tag));
+    }
+
+    fn add_watch_inner(
+        &self,
+        watched_label: &str,
+        watcher_label: &str,
+        system_tx: mpsc::UnboundedSender<SystemSignal>,
+        tag: Option<String>,
+    ) {
         let exists = self
             .inner
             .entries
@@ -1058,6 +1085,7 @@ impl Receptionist {
             let _ = system_tx.send(SystemSignal::ActorTerminated(ActorTerminated {
                 label: watched_label.to_string(),
                 reason: TerminationReason::Stopped,
+                tag,
             }));
             return;
         }
@@ -1071,6 +1099,7 @@ impl Receptionist {
             .push(WatchEntry {
                 watcher_label: watcher_label.to_string(),
                 system_tx,
+                tag,
             });
     }
 

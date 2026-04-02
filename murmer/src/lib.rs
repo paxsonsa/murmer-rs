@@ -256,7 +256,7 @@ pub mod prelude {
     pub use crate::actor::DispatchError;
     pub use crate::actor::{
         Actor, ActorContext, ActorRef, AsyncHandler, Handler, Message, MigratableActor,
-        RemoteDispatch, RemoteMessage,
+        RemoteDispatch, RemoteMessage, ScheduleHandle,
     };
     pub use crate::endpoint::Endpoint;
     pub use crate::lifecycle::{
@@ -278,7 +278,7 @@ pub mod prelude {
 // Re-export core types for convenience
 pub use actor::{
     Actor, ActorContext, ActorRef, AsyncHandler, DispatchError, Handler, Message, MigratableActor,
-    RemoteDispatch, RemoteMessage,
+    RemoteDispatch, RemoteMessage, ScheduleHandle,
 };
 pub use client::{ClientOptions, MurmerClient};
 pub use endpoint::Endpoint;
