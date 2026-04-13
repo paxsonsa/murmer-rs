@@ -137,14 +137,18 @@ mod tests {
         let mut reg = SpawnRegistry::new();
         reg.register(
             "orchestrator::StorageAgent",
-            Box::new(|receptionist, label, state_bytes| {
-                let (state, _): (StorageState, _) =
-                    bincode::serde::decode_from_slice(state_bytes, bincode::config::standard())
-                        .map_err(|e| {
-                            murmer::cluster::sync::SpawnError::DeserializeFailed(e.to_string())
-                        })?;
-                receptionist.start(label, StorageAgent, state);
-                Ok(())
+            Box::new(|receptionist, label, state_bytes: Vec<u8>| {
+                Box::pin(async move {
+                    let (state, _): (StorageState, _) = bincode::serde::decode_from_slice(
+                        &state_bytes,
+                        bincode::config::standard(),
+                    )
+                    .map_err(|e| {
+                        murmer::cluster::sync::SpawnError::DeserializeFailed(e.to_string())
+                    })?;
+                    receptionist.start(&label, StorageAgent, state);
+                    Ok(())
+                })
             }),
         );
         reg

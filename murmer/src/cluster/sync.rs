@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use crate::receptionist::Visibility;
 use crate::{Op, OpType, Receptionist, RemoteInvocation, ResponseRegistry};
@@ -181,8 +181,17 @@ pub enum SpawnError {
 ///
 /// Given a receptionist, a label, and serialized state bytes (from `MigratableActor`),
 /// the factory deserializes the state and calls `receptionist.start(label, actor, state)`.
-pub type SpawnFactory =
-    Box<dyn Fn(&Receptionist, &str, &[u8]) -> Result<(), SpawnError> + Send + Sync>;
+///
+/// Parameters are owned so the returned future can capture them without lifetime issues.
+pub type SpawnFactory = Box<
+    dyn Fn(
+            Receptionist,
+            String,
+            Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SpawnError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Registry of actor types that can be spawned remotely.
 ///
@@ -194,12 +203,14 @@ pub type SpawnFactory =
 ///
 /// ```rust,ignore
 /// let mut spawn_registry = SpawnRegistry::new();
-/// spawn_registry.register("my_app::Worker", Box::new(|receptionist, label, state_bytes| {
-///     let (state, _): (WorkerState, _) = bincode::serde::decode_from_slice(
-///         state_bytes, bincode::config::standard()
-///     ).map_err(|e| SpawnError::DeserializeFailed(e.to_string()))?;
-///     receptionist.start(label, Worker, state);
-///     Ok(())
+/// spawn_registry.register("my_app::Worker", Box::new(|receptionist, label, state_bytes: Vec<u8>| {
+///     Box::pin(async move {
+///         let (state, _): (WorkerState, _) = bincode::serde::decode_from_slice(
+///             &state_bytes, bincode::config::standard()
+///         ).map_err(|e| SpawnError::DeserializeFailed(e.to_string()))?;
+///         receptionist.start(&label, Worker, state);
+///         Ok(())
+///     })
 /// }));
 /// ```
 pub struct SpawnRegistry {
@@ -224,9 +235,9 @@ impl SpawnRegistry {
     }
 
     /// Spawn an actor using the registered factory.
-    pub fn spawn(
+    pub async fn spawn(
         &self,
-        receptionist: &Receptionist,
+        receptionist: Receptionist,
         label: &str,
         actor_type_name: &str,
         state_bytes: &[u8],
@@ -234,7 +245,7 @@ impl SpawnRegistry {
         let factory = self
             .get(actor_type_name)
             .ok_or_else(|| SpawnError::UnknownType(actor_type_name.to_string()))?;
-        factory(receptionist, label, state_bytes)
+        factory(receptionist, label.to_string(), state_bytes.to_vec()).await
     }
 
     /// List all registered actor type names.

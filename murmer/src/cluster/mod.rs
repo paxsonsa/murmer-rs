@@ -550,11 +550,11 @@ fn spawn_event_loop(
                                 request.label, request.actor_type_name
                             );
                             match spawn_registry.spawn(
-                                &receptionist,
+                                receptionist.clone(),
                                 &request.label,
                                 &request.actor_type_name,
                                 &request.initial_state,
-                            ) {
+                            ).await {
                                 Ok(()) => {
                                     tracing::info!(
                                         "Spawned {} (type: {}) successfully",

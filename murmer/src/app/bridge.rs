@@ -195,12 +195,14 @@ async fn run_spawn_drain_loop(
                 request.label,
                 request.actor_type_name
             );
-            let result = spawn_registry.spawn(
-                &receptionist,
-                &request.label,
-                &request.actor_type_name,
-                &request.initial_state,
-            );
+            let result = spawn_registry
+                .spawn(
+                    receptionist.clone(),
+                    &request.label,
+                    &request.actor_type_name,
+                    &request.initial_state,
+                )
+                .await;
             let _ = coordinator
                 .send(NotifySpawnAck {
                     request_id: request.request_id,
