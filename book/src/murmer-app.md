@@ -156,7 +156,13 @@ let state = CoordinatorState::new(
 let coordinator = bridge::start_coordinator(cluster, state);
 ```
 
-This wires up everything: the Coordinator actor, the event bridge loop, and the spawn drain loop (which sends placement decisions to the transport layer).
+This wires up everything: the Coordinator actor, the event bridge loop, and the spawn drain loop.
+
+### The spawn drain loop
+
+The spawn drain loop reads placement decisions from the Coordinator and dispatches them — either invoking a local spawn factory or sending a `SpawnActor` control message to a remote node. Each request is dispatched as an independent `tokio::spawn` task so factories run concurrently; acks arrive at the Coordinator in any order (keyed by `request_id`).
+
+An `AckGuard` ensures that every spawn request receives an acknowledgement, even if the factory panics or the task is cancelled. On the happy path the factory calls `ack(true, None)`. If the guard is dropped without an explicit ack (panic, cancellation), it fires a detached task to deliver a failure ack so the Coordinator's `pending_spawns` map never leaks stale entries.
 
 ### The cluster view
 
