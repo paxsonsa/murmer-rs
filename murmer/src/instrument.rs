@@ -255,6 +255,36 @@ pub(crate) fn cluster_node_left() {
     }
 }
 
+// ─── Spawn Drain Loop ────────────────────────────────────────────────
+
+#[inline(always)]
+pub(crate) fn spawn_drain_dispatch(duration: std::time::Duration) {
+    #[cfg(feature = "monitor")]
+    metrics::histogram!("murmer_spawn_drain_dispatch_seconds").record(duration);
+    #[cfg(not(feature = "monitor"))]
+    let _ = duration;
+}
+
+#[inline(always)]
+pub(crate) fn spawn_drain_factory(locality: &str, duration: std::time::Duration) {
+    #[cfg(feature = "monitor")]
+    metrics::histogram!(
+        "murmer_spawn_drain_factory_seconds",
+        "locality" => locality.to_string(),
+    )
+    .record(duration);
+    #[cfg(not(feature = "monitor"))]
+    let _ = (locality, duration);
+}
+
+#[inline(always)]
+pub(crate) fn spawn_drain_queue_depth(depth: f64) {
+    #[cfg(feature = "monitor")]
+    metrics::gauge!("murmer_spawn_drain_queue_depth").set(depth);
+    #[cfg(not(feature = "monitor"))]
+    let _ = depth;
+}
+
 // ─── Receptionist ────────────────────────────────────────────────────
 
 #[inline(always)]
