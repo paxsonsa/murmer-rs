@@ -83,6 +83,14 @@ Murmer instruments five categories of metrics automatically. You don't need to a
 | `murmer_cluster_nodes` | gauge | `status` | Number of nodes in the cluster |
 | `murmer_cluster_membership_changes_total` | counter | `event_type` | Membership events (`joined`, `failed`, `left`) |
 
+### Spawn drain loop
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `murmer_spawn_drain_dispatch_seconds` | histogram | | Time from enqueue to drain-loop dequeue (dispatch latency) |
+| `murmer_spawn_drain_factory_seconds` | histogram | `locality` | Wall-clock time for a spawn factory (`local`) or `send_control` (`remote`) to complete |
+| `murmer_spawn_drain_queue_depth` | gauge | | Number of spawn requests currently pending in the drain-loop channel |
+
 ### Receptionist
 
 | Metric | Type | Description |
@@ -150,4 +158,13 @@ histogram_quantile(0.95, rate(murmer_network_roundtrip_duration_seconds_bucket[5
 
 # Cluster size over time
 murmer_cluster_nodes{status="active"}
+
+# Spawn dispatch latency (time requests wait in the drain queue)
+histogram_quantile(0.95, rate(murmer_spawn_drain_dispatch_seconds_bucket[5m]))
+
+# Spawn factory execution time by locality
+histogram_quantile(0.99, rate(murmer_spawn_drain_factory_seconds_bucket{locality="local"}[5m]))
+
+# Current spawn queue backpressure
+murmer_spawn_drain_queue_depth
 ```
