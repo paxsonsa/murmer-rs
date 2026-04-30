@@ -573,4 +573,185 @@ mod tests {
         node_a.shutdown().await;
         node_b.shutdown().await;
     }
+
+    // ── Test: Spawn pipeline parallelism ─────────────────────────────────
+
+    /// N concurrent SubmitSpec calls on a node whose factory sleeps should
+    /// complete in roughly factory_time, not N × factory_time.
+    ///
+    /// With the old serial drain loop this test would take ≥ N × FACTORY_SLEEP.
+    /// With parallel dispatch it finishes in ~FACTORY_SLEEP + scheduling jitter.
+    #[tokio::test]
+    async fn test_spawn_pipeline_parallelism() {
+        init_tracing();
+
+        const N: usize = 20;
+        const FACTORY_SLEEP: Duration = Duration::from_millis(200);
+
+        let mut reg = SpawnRegistry::new();
+        reg.register(
+            "orchestrator::SlowActor",
+            Box::new(move |receptionist, label, _state_bytes: Vec<u8>| {
+                Box::pin(async move {
+                    tokio::time::sleep(FACTORY_SLEEP).await;
+                    receptionist.start(&label, StorageAgent, StorageState {
+                        root_name: label.clone(),
+                        dirs: Default::default(),
+                    });
+                    Ok(())
+                })
+            }),
+        );
+
+        let node = System::clustered(
+            node_config("parallel-solo", NodeClass::Worker, vec![], &[]),
+            TypeRegistry::from_auto(),
+            reg,
+        )
+        .await
+        .unwrap();
+
+        let cluster = node.cluster_system().unwrap();
+        let coordinator_ep = bridge::start_coordinator(
+            cluster,
+            CoordinatorState::new(
+                cluster.identity().node_id_string(),
+                Box::new(LeastLoaded),
+                Box::new(OldestNode::any()),
+            ),
+        );
+
+        let dummy_state = bincode::serde::encode_to_vec(
+            &StorageState { root_name: "x".into(), dirs: Default::default() },
+            bincode::config::standard(),
+        )
+        .unwrap();
+
+        let start = tokio::time::Instant::now();
+
+        let mut js = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let ep = coordinator_ep.clone();
+            let state = dummy_state.clone();
+            js.spawn(async move {
+                ep.send(SubmitSpec {
+                    spec: ActorSpec::new(&format!("slow/{i}"), "orchestrator::SlowActor")
+                        .with_state(state)
+                        .with_crash_strategy(CrashStrategy::WaitForReturn(Duration::from_secs(30))),
+                })
+                .await
+                .unwrap()
+            });
+        }
+        while js.join_next().await.is_some() {}
+
+        // Wait for all actors to actually appear (factory ran and registered them).
+        for i in 0..N {
+            wait_for::<StorageAgent>(&node, &format!("slow/{i}")).await;
+        }
+
+        let elapsed = start.elapsed();
+        // Serial would be N × FACTORY_SLEEP. Allow 4× slack for scheduling jitter.
+        let serial_time = FACTORY_SLEEP * N as u32;
+        let limit = FACTORY_SLEEP * 4;
+        assert!(
+            elapsed < limit,
+            "spawn pipeline took {elapsed:?} — expected < {limit:?} (serial would be {serial_time:?})"
+        );
+
+        node.shutdown().await;
+    }
+
+    // ── Test: Panic-safety via AckGuard ──────────────────────────────────
+
+    /// A factory that panics must not leave a stale entry in pending_spawns.
+    /// The AckGuard's Drop impl fires a failure ack, so subsequent spawns
+    /// on the same node must still succeed.
+    #[tokio::test]
+    async fn test_panicking_factory_delivers_failure_ack() {
+        init_tracing();
+
+        let mut reg = SpawnRegistry::new();
+
+        // Panicking factory
+        reg.register(
+            "orchestrator::PanicActor",
+            Box::new(|_receptionist, _label, _state_bytes: Vec<u8>| {
+                Box::pin(async move {
+                    panic!("intentional factory panic for test");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                })
+            }),
+        );
+
+        // Normal factory registered alongside to prove the drain loop survives
+        reg.register(
+            "orchestrator::SlowActor",
+            Box::new(|receptionist, label, _state_bytes: Vec<u8>| {
+                Box::pin(async move {
+                    receptionist.start(&label, StorageAgent, StorageState {
+                        root_name: label.clone(),
+                        dirs: Default::default(),
+                    });
+                    Ok(())
+                })
+            }),
+        );
+
+        let node = System::clustered(
+            node_config("panic-solo", NodeClass::Worker, vec![], &[]),
+            TypeRegistry::from_auto(),
+            reg,
+        )
+        .await
+        .unwrap();
+
+        let cluster = node.cluster_system().unwrap();
+        let coordinator_ep = bridge::start_coordinator(
+            cluster,
+            CoordinatorState::new(
+                cluster.identity().node_id_string(),
+                Box::new(LeastLoaded),
+                Box::new(OldestNode::any()),
+            ),
+        );
+
+        let dummy_state = bincode::serde::encode_to_vec(
+            &StorageState { root_name: "x".into(), dirs: Default::default() },
+            bincode::config::standard(),
+        )
+        .unwrap();
+
+        // Submit a spec whose factory will panic — result should be a placement
+        // decision (SubmitSpec succeeds) but the actor should never appear.
+        let result = coordinator_ep
+            .send(SubmitSpec {
+                spec: ActorSpec::new("panic/0", "orchestrator::PanicActor")
+                    .with_state(dummy_state.clone())
+                    .with_crash_strategy(CrashStrategy::WaitForReturn(Duration::from_secs(5))),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "placement decision should succeed: {result:?}");
+
+        // Give the panic task time to fire and the AckGuard drop to deliver the
+        // failure ack back to the Coordinator.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Subsequent spawn on the same node must work — drain loop must still be alive.
+        let result2 = coordinator_ep
+            .send(SubmitSpec {
+                spec: ActorSpec::new("after-panic/0", "orchestrator::SlowActor")
+                    .with_state(dummy_state.clone())
+                    .with_crash_strategy(CrashStrategy::WaitForReturn(Duration::from_secs(10))),
+            })
+            .await
+            .unwrap();
+        assert!(result2.is_ok(), "spawn after panic must succeed: {result2:?}");
+
+        wait_for::<StorageAgent>(&node, "after-panic/0").await;
+
+        node.shutdown().await;
+    }
 }
