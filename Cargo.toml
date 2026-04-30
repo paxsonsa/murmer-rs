@@ -8,8 +8,8 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-murmer = { path = "murmer", version = "0.2.0" }
-murmer-macros = { path = "murmer-macros", version = "0.2.0" }
+murmer = { path = "murmer", version = "0.2.1" }
+murmer-macros = { path = "murmer-macros", version = "0.2.1" }
 bincode = { version = "2.0.1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -21,7 +21,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Andrew Paxson"]
 keywords = ["actor", "distributed", "actor-model", "async"]
