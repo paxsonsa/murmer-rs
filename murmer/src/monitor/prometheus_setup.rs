@@ -138,6 +138,20 @@ fn describe_metrics() {
         "Total number of cluster membership change events"
     );
 
+    // Spawn drain loop
+    metrics::describe_histogram!(
+        "murmer_spawn_drain_dispatch_seconds",
+        "Time from SpawnSender::send_spawn enqueue to drain-loop pop (dispatch latency)"
+    );
+    metrics::describe_histogram!(
+        "murmer_spawn_drain_factory_seconds",
+        "Wall-clock time for a spawn factory (local) or send_control (remote) to complete",
+    );
+    metrics::describe_gauge!(
+        "murmer_spawn_drain_queue_depth",
+        "Number of spawn requests currently pending in the drain-loop channel"
+    );
+
     // Receptionist
     metrics::describe_counter!(
         "murmer_receptionist_lookups_total",

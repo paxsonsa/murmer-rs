@@ -16,6 +16,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cluster::ClusterSystem;
 use crate::cluster::framing::ControlMessage;
@@ -59,8 +60,9 @@ pub fn start_coordinator(
     );
     state.cluster_view.upsert_node(local_info);
 
+    let queue_depth = Arc::new(AtomicUsize::new(0));
     let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
-    let state = state.with_spawn_sender(SpawnSender::new(spawn_tx));
+    let state = state.with_spawn_sender(SpawnSender::new(spawn_tx, Arc::clone(&queue_depth)));
 
     let coordinator_ep = cluster.start_actor("coordinator", Coordinator, state);
 
@@ -85,6 +87,7 @@ pub fn start_coordinator(
         receptionist,
         ack_ep,
         spawn_rx,
+        queue_depth,
     ));
 
     coordinator_ep
@@ -177,51 +180,135 @@ async fn run_bridge_loop(
     }
 }
 
-/// Drain loop: reads spawn requests from the channel and either spawns locally
-/// (if target == local node) or sends a `SpawnActor` control message via transport.
+/// RAII guard that guarantees a `NotifySpawnAck` is always delivered.
+///
+/// On the happy path call `ack(success, error)` to consume the guard and send
+/// the ack. If the task holding the guard panics or is cancelled before
+/// reaching `ack`, `Drop` fires a detached task to send a failure ack so
+/// `pending_spawns` in the Coordinator never leaks a stale entry.
+struct AckGuard {
+    coordinator: Endpoint<Coordinator>,
+    request_id: u64,
+    sent: bool,
+}
+
+impl AckGuard {
+    fn new(coordinator: Endpoint<Coordinator>, request_id: u64) -> Self {
+        Self {
+            coordinator,
+            request_id,
+            sent: false,
+        }
+    }
+
+    fn ack(mut self, success: bool, error: Option<String>) {
+        self.sent = true;
+        let coord = self.coordinator.clone();
+        let id = self.request_id;
+        tokio::spawn(async move {
+            let _ = coord
+                .send(NotifySpawnAck {
+                    request_id: id,
+                    success,
+                    error,
+                })
+                .await;
+        });
+    }
+}
+
+impl Drop for AckGuard {
+    fn drop(&mut self) {
+        if self.sent {
+            return;
+        }
+        // Guard against dropping after the tokio runtime has shut down.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let coord = self.coordinator.clone();
+        let id = self.request_id;
+        tokio::spawn(async move {
+            let _ = coord
+                .send(NotifySpawnAck {
+                    request_id: id,
+                    success: false,
+                    error: Some("spawn task panicked or was cancelled".into()),
+                })
+                .await;
+        });
+    }
+}
+
+/// Drain loop: reads spawn requests from the channel and dispatches each one
+/// as an independent `tokio::spawn` task so factories run concurrently.
+///
+/// Requests are dequeued in receive order but execute concurrently — acks may
+/// arrive at the Coordinator in any order (which is fine: `notify_spawn_ack`
+/// keys on `request_id`). A panicking or cancelled factory task delivers a
+/// failure ack via `AckGuard::drop` so `pending_spawns` always converges.
+///
+/// Fan-out is naturally bounded by the upstream admission control on the
+/// caller's side (e.g. the supervisor semaphore in datastorekit). Murmer does
+/// not impose its own cap.
 async fn run_spawn_drain_loop(
     transport: Arc<Transport>,
     local_node_id: String,
     spawn_registry: Arc<crate::cluster::sync::SpawnRegistry>,
     receptionist: crate::receptionist::Receptionist,
     coordinator: Endpoint<Coordinator>,
-    mut rx: mpsc::UnboundedReceiver<(String, crate::cluster::framing::SpawnRequest)>,
+    mut rx: mpsc::UnboundedReceiver<crate::app::spawn_sender::SpawnItem>,
+    queue_depth: Arc<AtomicUsize>,
 ) {
-    while let Some((node_id, request)) = rx.recv().await {
+    while let Some((node_id, request, enqueued_at)) = rx.recv().await {
+        let depth = queue_depth
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        crate::instrument::spawn_drain_queue_depth(depth as f64);
+        crate::instrument::spawn_drain_dispatch(enqueued_at.elapsed());
+
         if node_id == local_node_id {
-            // Local spawn — bypass transport, invoke spawn registry directly
             tracing::debug!(
                 "Spawning actor locally: label={}, type={}",
                 request.label,
                 request.actor_type_name
             );
-            let result = spawn_registry
-                .spawn(
-                    receptionist.clone(),
-                    &request.label,
-                    &request.actor_type_name,
-                    &request.initial_state,
-                )
-                .await;
-            let _ = coordinator
-                .send(NotifySpawnAck {
-                    request_id: request.request_id,
-                    success: result.is_ok(),
-                    error: result.err().map(|e| e.to_string()),
-                })
-                .await;
+            let registry = Arc::clone(&spawn_registry);
+            let receptionist = receptionist.clone();
+            let guard = AckGuard::new(coordinator.clone(), request.request_id);
+            tokio::spawn(async move {
+                let factory_start = std::time::Instant::now();
+                let result = registry
+                    .spawn(
+                        receptionist,
+                        &request.label,
+                        &request.actor_type_name,
+                        &request.initial_state,
+                    )
+                    .await;
+                crate::instrument::spawn_drain_factory("local", factory_start.elapsed());
+                match result {
+                    Ok(()) => guard.ack(true, None),
+                    Err(e) => guard.ack(false, Some(e.to_string())),
+                }
+            });
         } else {
             tracing::debug!(
                 "Sending SpawnActor to {node_id}: label={}, type={}",
                 request.label,
                 request.actor_type_name
             );
-            if let Err(e) = transport
-                .send_control(&node_id, ControlMessage::SpawnActor(request))
-                .await
-            {
-                tracing::warn!("Failed to send spawn request to {node_id}: {e}");
-            }
+            let transport = Arc::clone(&transport);
+            tokio::spawn(async move {
+                let factory_start = std::time::Instant::now();
+                if let Err(e) = transport
+                    .send_control(&node_id, ControlMessage::SpawnActor(request))
+                    .await
+                {
+                    tracing::warn!("Failed to send spawn request to {node_id}: {e}");
+                }
+                crate::instrument::spawn_drain_factory("remote", factory_start.elapsed());
+            });
         }
     }
 }
