@@ -594,10 +594,14 @@ mod tests {
             Box::new(move |receptionist, label, _state_bytes: Vec<u8>| {
                 Box::pin(async move {
                     tokio::time::sleep(FACTORY_SLEEP).await;
-                    receptionist.start(&label, StorageAgent, StorageState {
-                        root_name: label.clone(),
-                        dirs: Default::default(),
-                    });
+                    receptionist.start(
+                        &label,
+                        StorageAgent,
+                        StorageState {
+                            root_name: label.clone(),
+                            dirs: Default::default(),
+                        },
+                    );
                     Ok(())
                 })
             }),
@@ -622,7 +626,10 @@ mod tests {
         );
 
         let dummy_state = bincode::serde::encode_to_vec(
-            &StorageState { root_name: "x".into(), dirs: Default::default() },
+            &StorageState {
+                root_name: "x".into(),
+                dirs: Default::default(),
+            },
             bincode::config::standard(),
         )
         .unwrap();
@@ -690,10 +697,14 @@ mod tests {
             "orchestrator::SlowActor",
             Box::new(|receptionist, label, _state_bytes: Vec<u8>| {
                 Box::pin(async move {
-                    receptionist.start(&label, StorageAgent, StorageState {
-                        root_name: label.clone(),
-                        dirs: Default::default(),
-                    });
+                    receptionist.start(
+                        &label,
+                        StorageAgent,
+                        StorageState {
+                            root_name: label.clone(),
+                            dirs: Default::default(),
+                        },
+                    );
                     Ok(())
                 })
             }),
@@ -718,7 +729,10 @@ mod tests {
         );
 
         let dummy_state = bincode::serde::encode_to_vec(
-            &StorageState { root_name: "x".into(), dirs: Default::default() },
+            &StorageState {
+                root_name: "x".into(),
+                dirs: Default::default(),
+            },
             bincode::config::standard(),
         )
         .unwrap();
@@ -733,7 +747,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(result.is_ok(), "placement decision should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "placement decision should succeed: {result:?}"
+        );
 
         // Give the panic task time to fire and the AckGuard drop to deliver the
         // failure ack back to the Coordinator.
@@ -748,7 +765,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(result2.is_ok(), "spawn after panic must succeed: {result2:?}");
+        assert!(
+            result2.is_ok(),
+            "spawn after panic must succeed: {result2:?}"
+        );
 
         wait_for::<StorageAgent>(&node, "after-panic/0").await;
 

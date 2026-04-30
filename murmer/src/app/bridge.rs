@@ -194,7 +194,11 @@ struct AckGuard {
 
 impl AckGuard {
     fn new(coordinator: Endpoint<Coordinator>, request_id: u64) -> Self {
-        Self { coordinator, request_id, sent: false }
+        Self {
+            coordinator,
+            request_id,
+            sent: false,
+        }
     }
 
     fn ack(mut self, success: bool, error: Option<String>) {
@@ -202,7 +206,13 @@ impl AckGuard {
         let coord = self.coordinator.clone();
         let id = self.request_id;
         tokio::spawn(async move {
-            let _ = coord.send(NotifySpawnAck { request_id: id, success, error }).await;
+            let _ = coord
+                .send(NotifySpawnAck {
+                    request_id: id,
+                    success,
+                    error,
+                })
+                .await;
         });
     }
 }
@@ -251,7 +261,9 @@ async fn run_spawn_drain_loop(
     queue_depth: Arc<AtomicUsize>,
 ) {
     while let Some((node_id, request, enqueued_at)) = rx.recv().await {
-        let depth = queue_depth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        let depth = queue_depth
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
         crate::instrument::spawn_drain_queue_depth(depth as f64);
         crate::instrument::spawn_drain_dispatch(enqueued_at.elapsed());
 

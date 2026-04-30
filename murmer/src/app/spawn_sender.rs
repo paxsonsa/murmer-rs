@@ -4,8 +4,8 @@
 //! `(node_id, SpawnRequest, enqueue_time)` tuples into it, and the bridge drain
 //! loop translates them into `transport.send_control()` calls or local spawns.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::cluster::framing::SpawnRequest;
@@ -29,7 +29,11 @@ impl SpawnSender {
     /// Queue a spawn request for the given target node.
     pub fn send_spawn(&self, target_node_id: &str, request: SpawnRequest) {
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
-        if self.tx.send((target_node_id.to_string(), request, Instant::now())).is_err() {
+        if self
+            .tx
+            .send((target_node_id.to_string(), request, Instant::now()))
+            .is_err()
+        {
             self.queue_depth.fetch_sub(1, Ordering::Relaxed);
             tracing::warn!("Spawn sender channel closed — spawn request dropped");
         }
