@@ -642,7 +642,7 @@ mod tests {
             let state = dummy_state.clone();
             js.spawn(async move {
                 ep.send(SubmitSpec {
-                    spec: ActorSpec::new(&format!("slow/{i}"), "orchestrator::SlowActor")
+                    spec: ActorSpec::new(format!("slow/{i}"), "orchestrator::SlowActor")
                         .with_state(state)
                         .with_crash_strategy(CrashStrategy::WaitForReturn(Duration::from_secs(30))),
                 })
