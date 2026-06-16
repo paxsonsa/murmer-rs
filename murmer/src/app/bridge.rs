@@ -134,15 +134,16 @@ async fn run_bridge_loop(
                         .await;
                 }
                 ClusterEvent::NodeFailed(identity) => {
+                    // async handler (re-drives owned singletons) — use send_async.
                     let _ = coordinator
-                        .send(NotifyNodeFailed {
+                        .send_async(NotifyNodeFailed {
                             node_id: identity.node_id_string(),
                         })
                         .await;
                 }
                 ClusterEvent::NodeLeft(identity) => {
                     let _ = coordinator
-                        .send(NotifyNodeLeft {
+                        .send_async(NotifyNodeLeft {
                             node_id: identity.node_id_string(),
                         })
                         .await;

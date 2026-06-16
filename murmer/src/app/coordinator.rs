@@ -469,7 +469,7 @@ impl Coordinator {
     }
 
     #[handler]
-    fn notify_node_failed(
+    async fn notify_node_failed(
         &mut self,
         ctx: &ActorContext<Self>,
         state: &mut CoordinatorState,
@@ -487,10 +487,16 @@ impl Coordinator {
                 let _ = endpoint.send(WaitForReturnTimeout { label }).await;
             });
         }
+
+        // Re-place any singleton the failed node owned. The failed owner is gone
+        // (SWIM-confirmed), so we do NOT drain it — we mint a strictly-higher
+        // term and re-spawn; a zombie ex-owner is fenced by the `(term, seq)`
+        // compare on its next write. (Graceful drain handoff is M3.)
+        state.redrive_singletons_after_loss(&msg.node_id).await;
     }
 
     #[handler]
-    fn notify_node_left(
+    async fn notify_node_left(
         &mut self,
         _ctx: &ActorContext<Self>,
         state: &mut CoordinatorState,
@@ -500,6 +506,9 @@ impl Coordinator {
         // Graceful departures never produce WaitForReturn timers (guarded by !graceful)
         let _timers = state.handle_node_departure(&msg.node_id, true);
         state.cluster_view.remove_node(&msg.node_id);
+
+        // Re-place any singleton the departed node owned (fenced by a new term).
+        state.redrive_singletons_after_loss(&msg.node_id).await;
     }
 
     #[handler]
@@ -788,6 +797,79 @@ impl CoordinatorState {
         }
     }
 
+    /// Re-place every singleton that was owned by a node that just left/failed.
+    ///
+    /// The lost owner is already excluded from the view (`mark_failed` /
+    /// `remove_node`), so `resolve_owner` lands on a survivor. Each re-drive
+    /// mints a fresh `term` (strictly greater than the lost owner's), so even a
+    /// zombie ex-owner that resurfaces is fenced by the `(term, seq)` compare.
+    async fn redrive_singletons_after_loss(&mut self, lost_node_id: &str) {
+        let affected: Vec<String> = self
+            .singletons
+            .iter()
+            .filter(|(_, rt)| {
+                rt.ownership
+                    .as_ref()
+                    .and_then(|o| o.owner_node_id.as_deref())
+                    == Some(lost_node_id)
+            })
+            .map(|(label, _)| label.clone())
+            .collect();
+
+        for label in affected {
+            let Some(spec) = self.singletons.get(&label).map(|rt| rt.spec.clone()) else {
+                continue;
+            };
+
+            let Some(new_owner) =
+                resolve_owner(&spec.anchor, &self.cluster_view, self.election.as_ref())
+            else {
+                tracing::warn!(
+                    "Singleton {label} lost owner {lost_node_id} — no eligible node remains"
+                );
+                if let Some(rt) = self.singletons.get_mut(&label)
+                    && let Some(ownership) = &mut rt.ownership
+                {
+                    ownership.owner_node_id = None;
+                }
+                continue;
+            };
+
+            let gen_source = self.generation_source.clone();
+            let generation = match gen_source.claim_term(&label, &new_owner).await {
+                Ok(generation) => generation,
+                Err(e) => {
+                    tracing::error!("claim_term failed re-driving singleton {label}: {e}");
+                    continue;
+                }
+            };
+
+            if let Some(rt) = self.singletons.get_mut(&label) {
+                rt.ownership = Some(SingletonOwnership {
+                    label: label.clone(),
+                    owner_node_id: Some(new_owner.clone()),
+                    generation,
+                    phase: SingletonPhase::Starting,
+                });
+            }
+
+            let request_id = self.next_request_id();
+            self.pending_spawns.insert(
+                request_id,
+                PendingSpawn {
+                    spec_label: label.clone(),
+                    target_node_id: new_owner.clone(),
+                    owner: Some(OwnerKey::Singleton(label.clone())),
+                },
+            );
+            self.send_singleton_spawn(&new_owner, request_id, &spec, generation.packed());
+
+            tracing::info!(
+                "Re-drove singleton {label} to {new_owner} after loss of {lost_node_id} (gen={generation:?})"
+            );
+        }
+    }
+
     /// Handle a node departure — shared logic for both failure and graceful leave.
     ///
     /// When `graceful` is true (node left voluntarily), WaitForReturn is
@@ -1033,7 +1115,7 @@ mod tests {
         let original_node = result.node_id.clone();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: original_node.clone(),
             })
             .await
@@ -1072,7 +1154,7 @@ mod tests {
             .unwrap();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: result.node_id,
             })
             .await
@@ -1109,7 +1191,7 @@ mod tests {
         let original_node = result.node_id.clone();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: original_node.clone(),
             })
             .await
@@ -1147,7 +1229,7 @@ mod tests {
         let original_node = result.node_id.clone();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: original_node.clone(),
             })
             .await
@@ -1306,5 +1388,135 @@ mod tests {
             .await
             .unwrap();
         assert!(queried.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_singleton_redrives_on_owner_failure_with_higher_term() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let before = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let original_owner = before.owner_node_id.clone().unwrap();
+        assert!(original_owner.contains("alpha"));
+        assert_eq!(before.generation, SingletonGeneration { term: 1, seq: 0 });
+
+        // The owner fails: re-drive to the survivor with a strictly-higher term
+        // (the fence), Starting until the re-spawn acks.
+        coordinator
+            .send_async(NotifyNodeFailed {
+                node_id: original_owner.clone(),
+            })
+            .await
+            .unwrap();
+
+        let after = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.owner_node_id.as_deref().unwrap().contains("beta"),
+            "must move off the failed node to beta, got {:?}",
+            after.owner_node_id
+        );
+        assert_eq!(after.generation, SingletonGeneration { term: 2, seq: 0 });
+        assert!(
+            after.generation > before.generation,
+            "term must strictly increase across failover (the fence)"
+        );
+        assert_eq!(after.phase, SingletonPhase::Starting);
+
+        // The re-drive's spawn (request_id 1) acks -> Active.
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 1,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        let active = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.phase, SingletonPhase::Active);
+    }
+
+    #[tokio::test]
+    async fn test_singleton_node_anchor_owner_loss_clears_owner() {
+        let (_system, coordinator) = make_system_and_coordinator();
+        let alpha_id = NodeIdentity {
+            name: "alpha".into(),
+            host: "127.0.0.1".into(),
+            port: 7100,
+            incarnation: 1,
+        }
+        .node_id_string();
+
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new(
+                    "catalog",
+                    "app::Catalog",
+                    SingletonAnchor::Node(alpha_id.clone()),
+                ),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        // The pinned node fails and the Node anchor cannot resolve elsewhere —
+        // ownership is cleared (no silent relocation off the pin).
+        coordinator
+            .send_async(NotifyNodeFailed { node_id: alpha_id })
+            .await
+            .unwrap();
+
+        let after = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.owner_node_id.is_none(),
+            "a Node-pinned singleton whose anchor died has no owner, got {:?}",
+            after.owner_node_id
+        );
     }
 }
