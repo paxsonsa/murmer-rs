@@ -601,6 +601,24 @@ fn spawn_event_loop(
                                 error: error.clone(),
                             });
                         }
+                        ControlMessage::StopSingleton { ref label, generation } => {
+                            // TODO(M4 step 4): stop the locally-owned singleton via the
+                            // receptionist, then on its DeregisterGuard firing send a
+                            // SingletonStoppedAck back to `node_id`. Placeholder until the
+                            // fenced handoff state machine lands.
+                            tracing::warn!(
+                                "StopSingleton from {node_id} for {label} (gen={generation}) — handler not yet wired (M4 step 4)"
+                            );
+                        }
+                        ControlMessage::SingletonStoppedAck { ref label, stopped_generation } => {
+                            tracing::info!(
+                                "SingletonStoppedAck from {node_id}: label={label}, gen={stopped_generation}"
+                            );
+                            let _ = event_tx.send(ClusterEvent::SingletonStopped {
+                                label: label.clone(),
+                                stopped_generation,
+                            });
+                        }
                         ControlMessage::Handshake(_) => {
                             tracing::warn!("Unexpected handshake from {node_id}");
                         }

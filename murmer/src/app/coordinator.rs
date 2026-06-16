@@ -575,6 +575,7 @@ impl CoordinatorState {
                     label: spec.label.clone(),
                     actor_type_name: spec.actor_type_name.clone(),
                     initial_state: spec.initial_state.clone(),
+                    singleton_generation: None,
                 },
             );
         } else {
