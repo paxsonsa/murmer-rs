@@ -28,6 +28,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,10 @@ use crate::app::election::LeaderElection;
 use crate::app::error::OrchestratorError;
 use crate::app::node_info::{ClusterView, NodeInfo};
 use crate::app::placement::{self, PlacementDecision, PlacementStrategy};
+use crate::app::singleton::{
+    CoordinatorGenerationSource, GenerationSource, SingletonOwnership, SingletonPhase,
+    SingletonSpec, resolve_owner,
+};
 use crate::app::spawn_sender::SpawnSender;
 use crate::app::spec::{ActorSpec, CrashStrategy};
 
@@ -65,10 +70,27 @@ pub struct CoordinatorState {
     pub pending_spawns: HashMap<u64, PendingSpawn>,
     /// Specs waiting for a failed node to return, keyed by label.
     pub waiting_for_return: HashMap<String, WaitingSpec>,
+    /// Cluster singletons being managed, keyed by singleton label.
+    pub singletons: HashMap<String, SingletonRuntime>,
+    /// Pluggable authority that mints `(term, seq)` generations for singletons.
+    /// Defaults to an in-RAM source (single-node/tests); inject a durable one
+    /// (e.g. catalog-backed) for multi-node write deployments.
+    pub generation_source: Arc<dyn GenerationSource>,
     /// Monotonic counter for generating unique request IDs.
     next_request_id: u64,
     /// Channel for sending spawn requests to the transport layer.
     spawn_sender: Option<SpawnSender>,
+}
+
+/// Which managed aggregate a pending spawn belongs to, so its ack can be routed
+/// to the right bookkeeping. `None` = an ordinary standalone spec.
+///
+/// (A `Group(label)` variant is added when PlacementGroup / M2 lands; unifying
+/// the back-reference here keeps `notify_spawn_ack` a single code path.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerKey {
+    /// The spawn is the active instance of this cluster singleton.
+    Singleton(String),
 }
 
 /// A spawn request that's been sent but not yet acknowledged.
@@ -76,6 +98,19 @@ pub struct CoordinatorState {
 pub struct PendingSpawn {
     pub spec_label: String,
     pub target_node_id: String,
+    /// The managed aggregate this spawn belongs to (singleton/group), if any.
+    pub owner: Option<OwnerKey>,
+}
+
+/// Coordinator-side runtime record for a managed cluster singleton.
+///
+/// `ownership` is a soft cache of the authoritative record (the durable copy
+/// lives in the [`GenerationSource`]'s backing store); it is `None` between spec
+/// registration and the first grant.
+#[derive(Debug, Clone)]
+pub struct SingletonRuntime {
+    pub spec: SingletonSpec,
+    pub ownership: Option<SingletonOwnership>,
 }
 
 /// A spec whose node failed but is using WaitForReturn strategy.
@@ -116,6 +151,23 @@ pub struct GetClusterView;
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
 #[message(result = Vec<SpecStatus>, remote = "coordinator::GetSpecs")]
 pub struct GetSpecs;
+
+/// Declare (or idempotently re-assert) a cluster singleton. The Coordinator
+/// resolves the anchor to one owner node, mints a fresh `(term, seq)`
+/// generation, and spawns the single instance there. Returns the granted
+/// ownership.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = Result<SingletonOwnership, String>, remote = "coordinator::StartSingleton")]
+pub struct StartSingleton {
+    pub spec: SingletonSpec,
+}
+
+/// Query the current ownership of a cluster singleton (`None` if unknown).
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = Option<SingletonOwnership>, remote = "coordinator::GetSingleton")]
+pub struct GetSingleton {
+    pub label: String,
+}
 
 /// Notify the coordinator that a node has joined.
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
@@ -261,6 +313,7 @@ impl Coordinator {
             PendingSpawn {
                 spec_label: label,
                 target_node_id: decision.node_id.clone(),
+                owner: None,
             },
         );
 
@@ -407,6 +460,7 @@ impl Coordinator {
                     PendingSpawn {
                         spec_label: ws.spec.label.clone(),
                         target_node_id: msg.node_id.clone(),
+                        owner: None,
                     },
                 );
                 state.send_spawn(&msg.node_id, request_id, &ws.spec);
@@ -465,12 +519,21 @@ impl Coordinator {
                 state
                     .cluster_view
                     .add_actor(&pending.target_node_id, &pending.spec_label);
+                // A singleton's instance is now running — promote it to Active.
+                if let Some(OwnerKey::Singleton(label)) = &pending.owner
+                    && let Some(rt) = state.singletons.get_mut(label)
+                    && let Some(ownership) = &mut rt.ownership
+                {
+                    ownership.phase = SingletonPhase::Active;
+                }
             } else {
                 tracing::warn!(
                     "Spawn failed for {}: {}",
                     pending.spec_label,
                     msg.error.as_deref().unwrap_or("unknown error")
                 );
+                // A failed singleton spawn stays in `Starting`; re-placement /
+                // fenced handoff retry is handled by the M4 step-4 machinery.
             }
         }
     }
@@ -501,6 +564,7 @@ impl Coordinator {
                     PendingSpawn {
                         spec_label: msg.label.clone(),
                         target_node_id: decision.node_id.clone(),
+                        owner: None,
                     },
                 );
                 state.send_spawn(&decision.node_id, request_id, &ws.spec);
@@ -518,6 +582,106 @@ impl Coordinator {
             }
         }
         // If not in waiting_for_return, the node already returned — timer is a no-op
+    }
+
+    #[handler]
+    async fn start_singleton(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: StartSingleton,
+    ) -> Result<SingletonOwnership, String> {
+        if !state.is_leader() {
+            return Err(OrchestratorError::NotLeader.to_string());
+        }
+
+        let label = msg.spec.label.clone();
+
+        // Resolve the anchor to exactly one owner node.
+        let owner = resolve_owner(
+            &msg.spec.anchor,
+            &state.cluster_view,
+            state.election.as_ref(),
+        )
+        .ok_or_else(|| {
+            OrchestratorError::NoEligibleNodes {
+                reason: format!("no node satisfies anchor for singleton {label}"),
+            }
+            .to_string()
+        })?;
+
+        // Idempotent re-assert: the same owner is already Active — bump `seq`
+        // within the term (liveness renew), do NOT spawn a second instance.
+        let reassert = state
+            .singletons
+            .get(&label)
+            .and_then(|rt| rt.ownership.as_ref())
+            .is_some_and(|own| {
+                own.owner_node_id.as_deref() == Some(owner.as_str())
+                    && own.phase == SingletonPhase::Active
+            });
+        if reassert {
+            let gen_source = state.generation_source.clone();
+            let generation = gen_source.claim_seq(&label).await?;
+            let ownership = SingletonOwnership {
+                label: label.clone(),
+                owner_node_id: Some(owner),
+                generation,
+                phase: SingletonPhase::Active,
+            };
+            if let Some(rt) = state.singletons.get_mut(&label) {
+                rt.ownership = Some(ownership.clone());
+            }
+            tracing::info!("Re-asserted singleton {label} (gen={generation:?})");
+            return Ok(ownership);
+        }
+
+        // Fresh grant: bump `term`, reset `seq` — a new ownership epoch.
+        let gen_source = state.generation_source.clone();
+        let generation = gen_source.claim_term(&label, &owner).await?;
+        let ownership = SingletonOwnership {
+            label: label.clone(),
+            owner_node_id: Some(owner.clone()),
+            generation,
+            // Active is set when the spawn ack lands (notify_spawn_ack).
+            phase: SingletonPhase::Starting,
+        };
+        state.singletons.insert(
+            label.clone(),
+            SingletonRuntime {
+                spec: msg.spec.clone(),
+                ownership: Some(ownership.clone()),
+            },
+        );
+
+        // Spawn the single instance on the owner, stamping the packed generation
+        // so the actor's fence rides the same value a downstream compare uses.
+        let request_id = state.next_request_id();
+        state.pending_spawns.insert(
+            request_id,
+            PendingSpawn {
+                spec_label: label.clone(),
+                target_node_id: owner.clone(),
+                owner: Some(OwnerKey::Singleton(label.clone())),
+            },
+        );
+        state.send_singleton_spawn(&owner, request_id, &msg.spec, generation.packed());
+
+        tracing::info!("Starting singleton {label} on {owner} (gen={generation:?})");
+        Ok(ownership)
+    }
+
+    #[handler]
+    fn get_singleton(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: GetSingleton,
+    ) -> Option<SingletonOwnership> {
+        state
+            .singletons
+            .get(&msg.label)
+            .and_then(|rt| rt.ownership.clone())
     }
 }
 
@@ -540,6 +704,8 @@ impl CoordinatorState {
             local_node_id: local_node_id.into(),
             pending_spawns: HashMap::new(),
             waiting_for_return: HashMap::new(),
+            singletons: HashMap::new(),
+            generation_source: Arc::new(CoordinatorGenerationSource::new()),
             next_request_id: 0,
             spawn_sender: None,
         }
@@ -548,6 +714,14 @@ impl CoordinatorState {
     /// Set the spawn sender for sending spawn requests to the transport layer.
     pub(crate) fn with_spawn_sender(mut self, sender: SpawnSender) -> Self {
         self.spawn_sender = Some(sender);
+        self
+    }
+
+    /// Inject a durable [`GenerationSource`] for minting singleton generations.
+    /// Multi-node write deployments MUST set this (the default in-RAM source is
+    /// not durable across a Coordinator restart).
+    pub fn with_generation_source(mut self, source: Arc<dyn GenerationSource>) -> Self {
+        self.generation_source = source;
         self
     }
 
@@ -581,6 +755,34 @@ impl CoordinatorState {
         } else {
             tracing::warn!(
                 "No spawn sender configured — spawn request for {} dropped",
+                spec.label
+            );
+        }
+    }
+
+    /// Send a spawn request for a fenced cluster singleton, stamping the packed
+    /// `(term, seq)` generation onto the request.
+    fn send_singleton_spawn(
+        &self,
+        target_node_id: &str,
+        request_id: u64,
+        spec: &SingletonSpec,
+        generation: u64,
+    ) {
+        if let Some(sender) = &self.spawn_sender {
+            sender.send_spawn(
+                target_node_id,
+                SpawnRequest {
+                    request_id,
+                    label: spec.label.clone(),
+                    actor_type_name: spec.actor_type_name.clone(),
+                    initial_state: spec.initial_state.clone(),
+                    singleton_generation: Some(generation),
+                },
+            );
+        } else {
+            tracing::warn!(
+                "No spawn sender configured — singleton spawn for {} dropped",
                 spec.label
             );
         }
@@ -670,6 +872,7 @@ impl CoordinatorState {
                             PendingSpawn {
                                 spec_label: label.clone(),
                                 target_node_id: decision.node_id.clone(),
+                                owner: None,
                             },
                         );
                         self.send_spawn(&decision.node_id, request_id, &spec);
@@ -694,6 +897,7 @@ mod tests {
     use super::*;
     use crate::app::election::OldestNode;
     use crate::app::placement::LeastLoaded;
+    use crate::app::singleton::{SingletonAnchor, SingletonGeneration, SingletonSpec};
     use crate::cluster::config::{NodeClass, NodeIdentity};
 
     fn make_system_and_coordinator() -> (crate::System, Endpoint<Coordinator>) {
@@ -967,5 +1171,140 @@ mod tests {
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 1);
         assert!(matches!(specs[0].state, SpecState::Pending));
+    }
+
+    // ── Cluster singletons (M4 step 3) ──────────────────────────────────────
+    // The harness configures no spawn_sender, so the spawn warn-drops and the
+    // ack must be injected manually; the first allocated request_id is 0.
+
+    #[tokio::test]
+    async fn test_start_singleton_grants_ownership_on_leader() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let ownership = coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Leader (oldest = alpha, incarnation 1) owns it; first grant is term 1.
+        assert!(
+            ownership
+                .owner_node_id
+                .as_deref()
+                .unwrap()
+                .contains("alpha"),
+            "leader anchor should resolve to alpha, got {:?}",
+            ownership.owner_node_id
+        );
+        assert_eq!(
+            ownership.generation,
+            SingletonGeneration { term: 1, seq: 0 }
+        );
+        // Active only lands once the spawn ack is observed.
+        assert_eq!(ownership.phase, SingletonPhase::Starting);
+
+        let queried = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queried.generation, ownership.generation);
+    }
+
+    #[tokio::test]
+    async fn test_singleton_ack_promotes_to_active() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Simulate the owner's spawn ack (request_id 0 is the first allocated).
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let queried = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queried.phase, SingletonPhase::Active);
+        assert_eq!(queried.generation, SingletonGeneration { term: 1, seq: 0 });
+    }
+
+    #[tokio::test]
+    async fn test_start_singleton_idempotent_reasserts_with_seq_bump() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let spec = SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader);
+        coordinator
+            .send_async(StartSingleton { spec: spec.clone() })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        // Re-assert against the same Active owner: bump seq within the term,
+        // no new ownership epoch, no second spawn.
+        let reasserted = coordinator
+            .send_async(StartSingleton { spec })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reasserted.generation,
+            SingletonGeneration { term: 1, seq: 1 }
+        );
+        assert_eq!(reasserted.phase, SingletonPhase::Active);
+    }
+
+    #[tokio::test]
+    async fn test_start_singleton_unsatisfiable_anchor_errors() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let result = coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new(
+                    "catalog",
+                    "app::Catalog",
+                    SingletonAnchor::Node("ghost@127.0.0.1:9999#0".into()),
+                ),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "pinning to a missing node should fail");
+
+        // And nothing was registered.
+        let queried = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap();
+        assert!(queried.is_none());
     }
 }
