@@ -86,10 +86,12 @@ pub fn select_node(
 
     for node in view.alive_nodes() {
         // Filter: must satisfy placement constraints
-        if !spec
-            .placement
-            .is_satisfied_by(&node.class, &node.metadata, &node.running_actors)
-        {
+        if !spec.placement.is_satisfied_by(
+            &node.node_id(),
+            &node.class,
+            &node.metadata,
+            &node.running_actors,
+        ) {
             continue;
         }
 
@@ -278,5 +280,82 @@ mod tests {
             "expected beta, got {}",
             decision.node_id
         );
+    }
+
+    #[test]
+    fn test_colocate_with_pins_to_anchor_node() {
+        // beta already runs the anchor "writer/c1"; alpha is emptier (would win
+        // LeastLoaded) but does not run the anchor, so colocate_with must force beta.
+        let view = make_view(vec![
+            make_node("alpha", 1, vec![]),
+            make_node("beta", 2, vec!["writer/c1".into()]),
+        ]);
+        let spec = ActorSpec::new("reader/c1/0", "app::Reader").with_constraints(
+            crate::app::spec::PlacementConstraints {
+                colocate_with: Some("writer/c1".into()),
+                ..Default::default()
+            },
+        );
+        let decision = select_node(&LeastLoaded, &spec, &view).unwrap();
+        assert!(
+            decision.node_id.contains("beta"),
+            "colocate_with should pin to the anchor's node (beta), got {}",
+            decision.node_id
+        );
+    }
+
+    #[test]
+    fn test_colocate_with_no_anchor_returns_none() {
+        // No node runs the anchor → hard filter yields NoEligibleNodes (never
+        // silently relocates), unlike the soft Pinned strategy.
+        let view = make_view(vec![
+            make_node("alpha", 1, vec![]),
+            make_node("beta", 2, vec![]),
+        ]);
+        let spec = ActorSpec::new("reader/c1/0", "app::Reader").with_constraints(
+            crate::app::spec::PlacementConstraints {
+                colocate_with: Some("writer/c1".into()),
+                ..Default::default()
+            },
+        );
+        assert!(select_node(&LeastLoaded, &spec, &view).is_none());
+    }
+
+    #[test]
+    fn test_required_node_id_pins_exactly_or_none() {
+        let alpha = make_node("alpha", 1, vec![]); // emptier → LeastLoaded would pick it
+        let beta = make_node("beta", 2, vec!["x".into()]);
+        let beta_id = beta.node_id();
+        let view = make_view(vec![alpha, beta]);
+
+        // Hard-pin to beta: chosen even though alpha is less loaded.
+        let spec = ActorSpec::new("w/0", "app::Worker").with_constraints(
+            crate::app::spec::PlacementConstraints {
+                required_node_id: Some(beta_id.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            select_node(&LeastLoaded, &spec, &view).unwrap().node_id,
+            beta_id
+        );
+
+        // Pin to a node that does not exist → NoEligibleNodes (no silent relocate).
+        let spec_missing = ActorSpec::new("w/1", "app::Worker").with_constraints(
+            crate::app::spec::PlacementConstraints {
+                required_node_id: Some("ghost@127.0.0.1:9999#0".into()),
+                ..Default::default()
+            },
+        );
+        assert!(select_node(&LeastLoaded, &spec_missing, &view).is_none());
+    }
+
+    #[test]
+    fn test_default_constraints_unchanged_backward_compat() {
+        // Empty constraints (the default) must still place anywhere — the new
+        // fields are additive Option/None and must not regress existing behavior.
+        let view = make_view(vec![make_node("alpha", 1, vec![])]);
+        let spec = ActorSpec::new("w/0", "app::Worker");
+        assert!(select_node(&LeastLoaded, &spec, &view).is_some());
     }
 }
