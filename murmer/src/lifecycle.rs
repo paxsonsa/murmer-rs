@@ -76,10 +76,10 @@ pub enum TerminationReason {
 pub struct ActorTerminated {
     pub label: String,
     pub reason: TerminationReason,
-    /// Optional tag set by [`ActorContext::watch_with_tag`] to identify the
-    /// *role* of the terminated actor without parsing the label string.
+    /// Optional tag set by [`ActorContext::watch_with_tag`](crate::actor::ActorContext::watch_with_tag)
+    /// to identify the *role* of the terminated actor without parsing the label string.
     ///
-    /// `None` when set via plain [`ActorContext::watch`].
+    /// `None` when set via plain [`ActorContext::watch`](crate::actor::ActorContext::watch).
     pub tag: Option<String>,
 }
 

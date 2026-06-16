@@ -9,7 +9,7 @@
 //! | Strategy | Behavior |
 //! |----------|----------|
 //! | [`LeastLoaded`] | Fewest running actors wins |
-//! | [`Random`] | Uniform random selection |
+//! | [`RandomPlacement`] | Uniform random selection |
 //! | [`Pinned`] | Always prefer a specific node |
 //!
 //! # Custom strategies
