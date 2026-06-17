@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-murmer = { workspace = true }
+murmer = { workspace = true, features = ["app"] }
 serde = { workspace = true }
 bincode = { workspace = true }
 tokio = { workspace = true }

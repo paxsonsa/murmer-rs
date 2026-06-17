@@ -196,3 +196,49 @@ impl ChatRoom {
             .collect()
     }
 }
+
+// =============================================================================
+// CatalogLike — a spawnable, MigratableActor-style actor for singleton tests
+// =============================================================================
+//
+// Stands in for appdata's CatalogActor: a stateful actor the Coordinator spawns
+// (via a SpawnRegistry) as a cluster singleton, and that clients can reach to
+// prove the singleton is actually running on its owner node.
+
+#[derive(Debug)]
+pub struct CatalogLike;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogState {
+    /// A stable name carried in the boot state, echoed back by `Whoami`.
+    pub name: String,
+}
+
+impl Actor for CatalogLike {
+    type State = CatalogState;
+}
+
+/// Ask the catalog singleton to identify itself (proves it is reachable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Whoami;
+
+impl Message for Whoami {
+    type Result = String;
+}
+
+impl RemoteMessage for Whoami {
+    const TYPE_ID: &'static str = "cluster_test::Whoami";
+}
+
+#[handlers]
+impl CatalogLike {
+    #[handler]
+    fn whoami(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CatalogState,
+        _msg: Whoami,
+    ) -> String {
+        state.name.clone()
+    }
+}
