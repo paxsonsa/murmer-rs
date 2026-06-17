@@ -8,7 +8,7 @@ Enable the feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-murmer = { version = "0.1", features = ["app"] }
+murmer = { version = "0.2", features = ["app"] }
 ```
 
 ## Overview
@@ -68,14 +68,20 @@ Constraints filter eligible nodes *before* the placement strategy scores them:
 PlacementConstraints {
     required_classes: vec![NodeClass::Worker],        // must be a Worker node
     required_metadata: [("gpu".into(), "true".into())].into(), // must have gpu=true
-    anti_affinity_labels: vec!["db/primary".into()],  // don't co-locate with this actor
+    anti_affinity_labels: vec!["db/primary".into()],  // repel: don't co-locate with this actor
+    colocate_with: Some("writer/c1".into()),          // attract: only where "writer/c1" already runs
+    required_node_id: None,                            // or hard-pin to exactly one node id
     ..Default::default()
 }
 ```
 
 - `required_classes` — empty means any class is acceptable.
 - `required_metadata` — the node must have all specified key-value pairs.
-- `anti_affinity_labels` — avoid placing on nodes already running these actors.
+- `anti_affinity_labels` — avoid placing on nodes already running these actors (*repel*).
+- `colocate_with` — place **only** on a node already running the named anchor actor (*attract* — the inverse of anti-affinity). Use it to pin a member next to a partner (e.g. a reader next to its writer). Because it is a hard filter, if no node runs the anchor the spec gets `NoEligibleNodes` rather than landing elsewhere.
+- `required_node_id` — hard-pin to exactly one node id; if that node is not alive the spec gets `NoEligibleNodes` (it is *never* silently relocated — unlike the soft `Pinned` strategy).
+
+> `colocate_with` and `required_node_id` are **hard filters**, not preferences — they are how you build co-located actor groups and node-pinned placement on top of the Coordinator.
 
 ## Placement strategies
 
@@ -187,6 +193,70 @@ Each node in the view carries:
 - **Metadata** — arbitrary key-value pairs (e.g., `"volume" = "photos"`)
 - **Running actors** — labels of actors currently hosted
 - **Liveness** — whether the node is reachable
+
+## Cluster singletons
+
+Some actors must have **exactly one** instance across the whole cluster — a catalog owner, a sequence minter, a lock manager. A *cluster singleton* is a Coordinator-managed actor pinned to an **anchor**, with a **fenced** handoff so two instances never run at once.
+
+```rust,ignore
+use murmer::app::singleton::{SingletonSpec, SingletonAnchor};
+use murmer::app::coordinator::{StartSingleton, GetSingleton};
+
+// Declare the singleton via the Coordinator.
+let ownership = coordinator.send_async(StartSingleton {
+    spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader)
+        .with_state(boot_bytes),
+}).await??;
+assert_eq!(ownership.generation.term, 1);
+```
+
+Or, as a convenience when the Coordinator is registered under the well-known `"coordinator"` label:
+
+```rust,ignore
+let ownership = system.start_singleton(
+    SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+).await?;
+```
+
+### Anchors
+
+`SingletonAnchor` decides which node owns the instance:
+
+| Anchor | Owner |
+|--------|-------|
+| `Leader` | Whatever the `LeaderElection` currently elects |
+| `Class(NodeClass)` | The oldest alive node of that class |
+| `Node(node_id)` | Exactly that node (no owner if it is down) |
+
+### The generation fence
+
+Every ownership grant carries a monotone `SingletonGeneration { term, seq }`:
+
+- `term` bumps **once per ownership change** (a failover or move) — an FDB-style recovery epoch.
+- `seq` bumps on a re-grant to the *same* owner (liveness renew / idempotent re-assert).
+
+`SingletonGeneration` orders lexicographically (term-major) and packs into a single `u64` via `packed()` — so a downstream fence that compares one integer (e.g. a write generation stamped on disk) rejects a stale ex-owner **with no change to that comparison**. A node that loses ownership and later returns necessarily holds a strictly-lower generation than its successor, so its first fenced write is rejected.
+
+### Failover
+
+When the owner node leaves or fails, the Coordinator re-places the singleton on a surviving node that still satisfies the anchor, minting a **strictly-higher `term`**. The old owner is gone, so there is no drain — the generation fence is what guarantees a zombie ex-owner cannot double-write:
+
+```rust,ignore
+// Owner departs → the Coordinator re-drives to a survivor with term N+1.
+let after = coordinator.send(GetSingleton { label: "catalog".into() }).await?.unwrap();
+assert!(after.generation > before.generation); // strictly higher — the fence
+```
+
+### Pluggable generation source
+
+By default the Coordinator mints generations in memory (`CoordinatorGenerationSource`), which is fine for a single node or tests but is **not durable across a Coordinator restart**. Inject a durable `GenerationSource` so the generation survives failover of the Coordinator itself:
+
+```rust,ignore
+let state = CoordinatorState::new(local_id, Box::new(LeastLoaded), Box::new(OldestNode::any()))
+    .with_generation_source(Arc::new(MyDurableGenerationSource::new()));
+```
+
+`GenerationSource` has three methods — `claim_term` (begin a new ownership epoch), `claim_seq` (re-grant within the current term), and `current` (read the authoritative ownership for cold-start rebuild after a Coordinator restart). Backing it with an external linearizable store (a database row, a consensus log) is what makes the singleton's identity the single source of truth across the whole cluster.
 
 ## Full example: Filesystem RPC
 
