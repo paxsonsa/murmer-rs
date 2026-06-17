@@ -29,7 +29,7 @@ The design draws heavy inspiration from BEAM OTP's supervision and process model
 
 ```toml
 [dependencies]
-murmer = "0.1"
+murmer = "0.3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
