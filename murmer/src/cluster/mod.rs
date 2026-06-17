@@ -602,13 +602,24 @@ fn spawn_event_loop(
                             });
                         }
                         ControlMessage::StopSingleton { ref label, generation } => {
-                            // TODO(M4 step 4): stop the locally-owned singleton via the
-                            // receptionist, then on its DeregisterGuard firing send a
-                            // SingletonStoppedAck back to `node_id`. Placeholder until the
-                            // fenced handoff state machine lands.
-                            tracing::warn!(
-                                "StopSingleton from {node_id} for {label} (gen={generation}) — handler not yet wired (M4 step 4)"
+                            // Cross-node drain: the Coordinator asked this node to
+                            // stop the singleton instance it owns. Signal the local
+                            // stop and ack. The successor is placed with a strictly
+                            // higher generation, so a briefly-lingering old instance
+                            // is fenced on its next write.
+                            tracing::info!(
+                                "StopSingleton from {node_id} for {label} (gen={generation}) — stopping local instance"
                             );
+                            receptionist.stop(label);
+                            let _ = transport
+                                .send_control(
+                                    &node_id,
+                                    ControlMessage::SingletonStoppedAck {
+                                        label: label.clone(),
+                                        stopped_generation: generation,
+                                    },
+                                )
+                                .await;
                         }
                         ControlMessage::SingletonStoppedAck { ref label, stopped_generation } => {
                             tracing::info!(
