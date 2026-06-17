@@ -17,6 +17,8 @@
 
 ---
 
+> **Built with AI.** Murmer is built and maintained with the help of AI coding tools, primarily Claude. I drive the design and review every change, but a lot of the implementation, tests, and docs are written in collaboration with AI. 
+
 Typed, location-transparent actors that communicate through message passing. Whether an actor lives in the same process or on a remote node across the network, you interact with it through the same `Endpoint<A>` API.
 
 ```text
@@ -157,6 +159,15 @@ cargo clippy -- -D warnings
 I've spent years working with Elixir and the BEAM VM, and the actor model there is something I've grown deeply fond of — the simplicity of processes, message passing, and supervision just *works*. When I looked at bringing that experience to Rust, the existing frameworks were impressive but getting a basic actor up and running was complex, and adding remote communication was even more so.
 
 Murmer is an experiment in answering: **can you build a robust distributed actor system in Rust that's actually simple to use?** The design draws from BEAM OTP, Akka's clustering, and Apple's Swift Distributed Actors — combined with Rust's performance and safety guarantees.
+
+## Other libraries to consider
+
+Murmer is still v0 and an experiment. For anything real, you should probably consider using one of these instead. They inspired Murmer and most of them are far more mature:
+
+- **[Erlang/Elixir OTP](https://www.erlang.org/doc/system/design_principles.html)** — the actor model and supervision tree that started it all for me. If you can run on the BEAM, OTP is decades of battle-tested production experience.
+- **[Apple Swift Distributed Actors](https://github.com/apple/swift-distributed-actors)** — the typed, location-transparent endpoint design that shaped Murmer's API. Worth reading even if you're not writing Swift.
+- **[Actix](https://github.com/actix/actix)** — the most established actor framework in Rust. Mature, fast, and great for in-process actors.
+- **[ractor](https://github.com/slawlor/ractor)** — a newer Rust actor library inspired by Erlang, with a clustering story of its own. Well worth a look if you're comparing options.
 
 ## License
 

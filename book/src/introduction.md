@@ -6,6 +6,8 @@
 
 # Introduction
 
+> **Built with AI.** Murmer is built and maintained with the help of AI coding tools, primarily Claude. I drive the design and review every change, but a lot of the implementation, tests, and docs are written in collaboration with AI. I'd rather you know that going in.
+
 Murmer is a distributed actor framework for Rust, built on tokio and QUIC.
 
 It provides typed, location-transparent actors that communicate through message passing. Whether an actor lives in the same process or on a remote node across the network, you interact with it through the same `Endpoint<A>` API.
@@ -169,6 +171,15 @@ Murmer works at two levels:
 <p align="center">
   <img src="diagram-core-app.svg" alt="murmer core primitives flowing into app module orchestration" style="width:100%">
 </p>
+
+## Other libraries to consider
+
+Murmer is still v0 and an experiment. For anything real, you should probably consider using one of these instead. They inspired Murmer and most of them are far more mature:
+
+- [**Erlang/Elixir OTP**](https://www.erlang.org/doc/system/design_principles.html) — the actor model and supervision tree that started it all for me. If you can run on the BEAM, OTP is decades of battle-tested production experience.
+- [**Apple Swift Distributed Actors**](https://github.com/apple/swift-distributed-actors) — the typed, location-transparent endpoint design that shaped Murmer's API. Worth reading even if you're not writing Swift.
+- [**Actix**](https://github.com/actix/actix) — the most established actor framework in Rust. Mature, fast, and great for in-process actors.
+- [**ractor**](https://github.com/slawlor/ractor) — a newer Rust actor library inspired by Erlang, with a clustering story of its own. Well worth a look if you're comparing options.
 
 ## Learn more
 
