@@ -39,3 +39,36 @@ impl SpawnSender {
         }
     }
 }
+
+/// A request to gracefully stop a cluster singleton instance on a node, so
+/// ownership can hand off.
+pub(crate) struct SingletonStopRequest {
+    /// The node currently running the singleton instance to stop.
+    pub target_node_id: String,
+    /// The singleton label.
+    pub label: String,
+    /// The packed `(term, seq)` the owner was granted — echoed in the ack so a
+    /// superseded owner's late stop is ignored.
+    pub generation: u64,
+}
+
+/// A channel-based handle the Coordinator uses to request a singleton stop
+/// (the inner half of the graceful drain handoff).
+///
+/// Not public — created internally by [`crate::app::bridge::start_coordinator`].
+pub(crate) struct SingletonStopSender {
+    tx: mpsc::UnboundedSender<SingletonStopRequest>,
+}
+
+impl SingletonStopSender {
+    pub fn new(tx: mpsc::UnboundedSender<SingletonStopRequest>) -> Self {
+        Self { tx }
+    }
+
+    /// Queue a stop request for the node currently running the singleton.
+    pub fn send_stop(&self, request: SingletonStopRequest) {
+        if self.tx.send(request).is_err() {
+            tracing::warn!("Singleton stop sender channel closed — stop request dropped");
+        }
+    }
+}

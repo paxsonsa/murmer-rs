@@ -28,6 +28,8 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -38,7 +40,11 @@ use crate::app::election::LeaderElection;
 use crate::app::error::OrchestratorError;
 use crate::app::node_info::{ClusterView, NodeInfo};
 use crate::app::placement::{self, PlacementDecision, PlacementStrategy};
-use crate::app::spawn_sender::SpawnSender;
+use crate::app::singleton::{
+    CoordinatorGenerationSource, GenerationSource, SingletonGeneration, SingletonOwnership,
+    SingletonPhase, SingletonSpec, resolve_owner,
+};
+use crate::app::spawn_sender::{SingletonStopRequest, SingletonStopSender, SpawnSender};
 use crate::app::spec::{ActorSpec, CrashStrategy};
 
 // =============================================================================
@@ -65,10 +71,29 @@ pub struct CoordinatorState {
     pub pending_spawns: HashMap<u64, PendingSpawn>,
     /// Specs waiting for a failed node to return, keyed by label.
     pub waiting_for_return: HashMap<String, WaitingSpec>,
+    /// Cluster singletons being managed, keyed by singleton label.
+    pub singletons: HashMap<String, SingletonRuntime>,
+    /// Pluggable authority that mints `(term, seq)` generations for singletons.
+    /// Defaults to an in-RAM source (single-node/tests); inject a durable one
+    /// (e.g. catalog-backed) for multi-node write deployments.
+    pub generation_source: Arc<dyn GenerationSource>,
     /// Monotonic counter for generating unique request IDs.
     next_request_id: u64,
     /// Channel for sending spawn requests to the transport layer.
     spawn_sender: Option<SpawnSender>,
+    /// Channel for sending graceful singleton-stop requests to the transport.
+    singleton_stop_sender: Option<SingletonStopSender>,
+}
+
+/// Which managed aggregate a pending spawn belongs to, so its ack can be routed
+/// to the right bookkeeping. `None` = an ordinary standalone spec.
+///
+/// (A `Group(label)` variant is added when PlacementGroup / M2 lands; unifying
+/// the back-reference here keeps `notify_spawn_ack` a single code path.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerKey {
+    /// The spawn is the active instance of this cluster singleton.
+    Singleton(String),
 }
 
 /// A spawn request that's been sent but not yet acknowledged.
@@ -76,6 +101,49 @@ pub struct CoordinatorState {
 pub struct PendingSpawn {
     pub spec_label: String,
     pub target_node_id: String,
+    /// The managed aggregate this spawn belongs to (singleton/group), if any.
+    pub owner: Option<OwnerKey>,
+}
+
+/// Coordinator-side runtime record for a managed cluster singleton.
+///
+/// `ownership` is a soft cache of the authoritative record (the durable copy
+/// lives in the [`GenerationSource`]'s backing store); it is `None` between spec
+/// registration and the first grant.
+#[derive(Debug, Clone)]
+pub struct SingletonRuntime {
+    pub spec: SingletonSpec,
+    pub ownership: Option<SingletonOwnership>,
+    /// Set while a graceful drain handoff is in flight (Draining): the old owner
+    /// has been asked to stop and we are awaiting its stopped-ack (or the drain
+    /// timeout) before placing the next owner.
+    pub pending_handoff: Option<PendingHandoff>,
+}
+
+/// In-flight graceful handoff bookkeeping for a singleton.
+///
+/// Graceful handoff is the drain-then-place path (live rebalance / explicit
+/// teardown), distinct from failover (a dead owner re-drives immediately). The
+/// new term is minted up front, so even if the old owner is abandoned on a drain
+/// timeout it is strictly-lower-fenced.
+#[derive(Debug, Clone)]
+pub struct PendingHandoff {
+    /// The owner being drained (the instance asked to stop).
+    pub old_owner: String,
+    /// The generation that owner was running — echoed in stop/ack to fence a
+    /// superseded owner, and used to ignore stale stopped-acks.
+    pub old_generation: SingletonGeneration,
+    /// Where the singleton is moving TO, with its freshly-minted (higher)
+    /// generation. `None` = teardown (no successor; the runtime is removed once
+    /// the old owner stops).
+    pub destination: Option<HandoffDestination>,
+}
+
+/// The successor of a graceful move handoff.
+#[derive(Debug, Clone)]
+pub struct HandoffDestination {
+    pub new_owner: String,
+    pub new_generation: SingletonGeneration,
 }
 
 /// A spec whose node failed but is using WaitForReturn strategy.
@@ -116,6 +184,61 @@ pub struct GetClusterView;
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
 #[message(result = Vec<SpecStatus>, remote = "coordinator::GetSpecs")]
 pub struct GetSpecs;
+
+/// Declare (or idempotently re-assert) a cluster singleton. The Coordinator
+/// resolves the anchor to one owner node, mints a fresh `(term, seq)`
+/// generation, and spawns the single instance there. Returns the granted
+/// ownership.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = Result<SingletonOwnership, String>, remote = "coordinator::StartSingleton")]
+pub struct StartSingleton {
+    pub spec: SingletonSpec,
+}
+
+/// Query the current ownership of a cluster singleton (`None` if unknown).
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = Option<SingletonOwnership>, remote = "coordinator::GetSingleton")]
+pub struct GetSingleton {
+    pub label: String,
+}
+
+/// Gracefully MOVE a singleton to wherever its anchor currently resolves: mint a
+/// higher term, drain the (live) old owner, then place the new one. A no-op if
+/// the resolved owner is unchanged. Use for rebalance / anchor changes; a dead
+/// owner is handled by failover instead.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = Result<(), String>, remote = "coordinator::MoveSingleton")]
+pub struct MoveSingleton {
+    pub label: String,
+}
+
+/// Gracefully tear down a singleton: drain the (live) owner, then forget it.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = Result<(), String>, remote = "coordinator::StopSingleton")]
+pub struct StopSingleton {
+    pub label: String,
+}
+
+/// The draining owner confirmed it has stopped (forwarded by the bridge from the
+/// `SingletonStoppedAck` control message). Advances the handoff: place the new
+/// owner, or finish a teardown. A stale-generation ack is ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = (), remote = "coordinator::NotifySingletonStopped")]
+pub struct NotifySingletonStopped {
+    pub label: String,
+    pub stopped_generation: SingletonGeneration,
+}
+
+/// Internal: a graceful drain didn't ack within `drain_timeout` — force-proceed
+/// (the abandoned old owner is strictly-lower-fenced).
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+#[message(result = (), remote = "coordinator::SingletonDrainTimeout")]
+pub struct SingletonDrainTimeout {
+    pub label: String,
+    /// The generation being drained — identifies the specific in-flight handoff
+    /// so a timer for a superseded handoff is ignored.
+    pub drained_generation: SingletonGeneration,
+}
 
 /// Notify the coordinator that a node has joined.
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
@@ -261,6 +384,7 @@ impl Coordinator {
             PendingSpawn {
                 spec_label: label,
                 target_node_id: decision.node_id.clone(),
+                owner: None,
             },
         );
 
@@ -407,6 +531,7 @@ impl Coordinator {
                     PendingSpawn {
                         spec_label: ws.spec.label.clone(),
                         target_node_id: msg.node_id.clone(),
+                        owner: None,
                     },
                 );
                 state.send_spawn(&msg.node_id, request_id, &ws.spec);
@@ -415,7 +540,7 @@ impl Coordinator {
     }
 
     #[handler]
-    fn notify_node_failed(
+    async fn notify_node_failed(
         &mut self,
         ctx: &ActorContext<Self>,
         state: &mut CoordinatorState,
@@ -433,10 +558,16 @@ impl Coordinator {
                 let _ = endpoint.send(WaitForReturnTimeout { label }).await;
             });
         }
+
+        // Re-place any singleton the failed node owned. The failed owner is gone
+        // (SWIM-confirmed), so we do NOT drain it — we mint a strictly-higher
+        // term and re-spawn; a zombie ex-owner is fenced by the `(term, seq)`
+        // compare on its next write. (Graceful drain handoff is M3.)
+        state.redrive_singletons_after_loss(&msg.node_id).await;
     }
 
     #[handler]
-    fn notify_node_left(
+    async fn notify_node_left(
         &mut self,
         _ctx: &ActorContext<Self>,
         state: &mut CoordinatorState,
@@ -446,6 +577,9 @@ impl Coordinator {
         // Graceful departures never produce WaitForReturn timers (guarded by !graceful)
         let _timers = state.handle_node_departure(&msg.node_id, true);
         state.cluster_view.remove_node(&msg.node_id);
+
+        // Re-place any singleton the departed node owned (fenced by a new term).
+        state.redrive_singletons_after_loss(&msg.node_id).await;
     }
 
     #[handler]
@@ -465,12 +599,21 @@ impl Coordinator {
                 state
                     .cluster_view
                     .add_actor(&pending.target_node_id, &pending.spec_label);
+                // A singleton's instance is now running — promote it to Active.
+                if let Some(OwnerKey::Singleton(label)) = &pending.owner
+                    && let Some(rt) = state.singletons.get_mut(label)
+                    && let Some(ownership) = &mut rt.ownership
+                {
+                    ownership.phase = SingletonPhase::Active;
+                }
             } else {
                 tracing::warn!(
                     "Spawn failed for {}: {}",
                     pending.spec_label,
                     msg.error.as_deref().unwrap_or("unknown error")
                 );
+                // A failed singleton spawn stays in `Starting`; re-placement /
+                // fenced handoff retry is handled by the M4 step-4 machinery.
             }
         }
     }
@@ -501,6 +644,7 @@ impl Coordinator {
                     PendingSpawn {
                         spec_label: msg.label.clone(),
                         target_node_id: decision.node_id.clone(),
+                        owner: None,
                     },
                 );
                 state.send_spawn(&decision.node_id, request_id, &ws.spec);
@@ -518,6 +662,271 @@ impl Coordinator {
             }
         }
         // If not in waiting_for_return, the node already returned — timer is a no-op
+    }
+
+    #[handler]
+    async fn start_singleton(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: StartSingleton,
+    ) -> Result<SingletonOwnership, String> {
+        if !state.is_leader() {
+            return Err(OrchestratorError::NotLeader.to_string());
+        }
+
+        let label = msg.spec.label.clone();
+
+        // Resolve the anchor to exactly one owner node.
+        let owner = resolve_owner(
+            &msg.spec.anchor,
+            &state.cluster_view,
+            state.election.as_ref(),
+        )
+        .ok_or_else(|| {
+            OrchestratorError::NoEligibleNodes {
+                reason: format!("no node satisfies anchor for singleton {label}"),
+            }
+            .to_string()
+        })?;
+
+        // Idempotent re-assert: the same owner is already Active — bump `seq`
+        // within the term (liveness renew), do NOT spawn a second instance.
+        let reassert = state
+            .singletons
+            .get(&label)
+            .and_then(|rt| rt.ownership.as_ref())
+            .is_some_and(|own| {
+                own.owner_node_id.as_deref() == Some(owner.as_str())
+                    && own.phase == SingletonPhase::Active
+            });
+        if reassert {
+            let gen_source = state.generation_source.clone();
+            let generation = gen_source.claim_seq(&label).await?;
+            let ownership = SingletonOwnership {
+                label: label.clone(),
+                owner_node_id: Some(owner),
+                generation,
+                phase: SingletonPhase::Active,
+            };
+            if let Some(rt) = state.singletons.get_mut(&label) {
+                rt.ownership = Some(ownership.clone());
+            }
+            tracing::info!("Re-asserted singleton {label} (gen={generation:?})");
+            return Ok(ownership);
+        }
+
+        // Fresh grant: bump `term`, reset `seq` — a new ownership epoch.
+        let gen_source = state.generation_source.clone();
+        let generation = gen_source.claim_term(&label, &owner).await?;
+        let ownership = SingletonOwnership {
+            label: label.clone(),
+            owner_node_id: Some(owner.clone()),
+            generation,
+            // Active is set when the spawn ack lands (notify_spawn_ack).
+            phase: SingletonPhase::Starting,
+        };
+        state.singletons.insert(
+            label.clone(),
+            SingletonRuntime {
+                spec: msg.spec.clone(),
+                ownership: Some(ownership.clone()),
+                pending_handoff: None,
+            },
+        );
+
+        // Spawn the single instance on the owner, stamping the packed generation
+        // so the actor's fence rides the same value a downstream compare uses.
+        let request_id = state.next_request_id();
+        state.pending_spawns.insert(
+            request_id,
+            PendingSpawn {
+                spec_label: label.clone(),
+                target_node_id: owner.clone(),
+                owner: Some(OwnerKey::Singleton(label.clone())),
+            },
+        );
+        state.send_singleton_spawn(&owner, request_id, &msg.spec, generation.packed());
+
+        tracing::info!("Starting singleton {label} on {owner} (gen={generation:?})");
+        Ok(ownership)
+    }
+
+    #[handler]
+    fn get_singleton(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: GetSingleton,
+    ) -> Option<SingletonOwnership> {
+        state
+            .singletons
+            .get(&msg.label)
+            .and_then(|rt| rt.ownership.clone())
+    }
+
+    #[handler]
+    async fn move_singleton(
+        &mut self,
+        ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: MoveSingleton,
+    ) -> Result<(), String> {
+        if !state.is_leader() {
+            return Err(OrchestratorError::NotLeader.to_string());
+        }
+        let label = msg.label;
+
+        // Snapshot what we need before any await.
+        let Some(rt) = state.singletons.get(&label) else {
+            return Err(format!("singleton {label} not found"));
+        };
+        if rt.pending_handoff.is_some() {
+            return Err(format!("singleton {label} handoff already in progress"));
+        }
+        let Some(ownership) = rt.ownership.clone() else {
+            return Err(format!("singleton {label} has no current owner to move"));
+        };
+        let Some(current) = ownership.owner_node_id.clone() else {
+            return Err(format!("singleton {label} has no current owner to move"));
+        };
+        let current_gen = ownership.generation;
+        let anchor = rt.spec.anchor.clone();
+        let drain_timeout = rt.spec.drain_timeout;
+
+        let Some(new_owner) = resolve_owner(&anchor, &state.cluster_view, state.election.as_ref())
+        else {
+            return Err(OrchestratorError::NoEligibleNodes {
+                reason: format!("no node satisfies anchor for singleton {label}"),
+            }
+            .to_string());
+        };
+        if new_owner == current {
+            return Ok(()); // anchor unchanged — nothing to move
+        }
+        // A graceful move drains a LIVE owner; a dead owner is failover's job.
+        let old_alive = state
+            .cluster_view
+            .nodes
+            .get(&current)
+            .map(|n| n.is_alive)
+            .unwrap_or(false);
+        if !old_alive {
+            return Err(format!(
+                "singleton {label} owner {current} is not alive — handled by failover, not graceful move"
+            ));
+        }
+
+        // Mint the successor generation up front (strictly higher than current).
+        let gen_source = state.generation_source.clone();
+        let new_gen = gen_source.claim_term(&label, &new_owner).await?;
+
+        // Enter Draining — ownership still points at the old, running owner.
+        if let Some(rt) = state.singletons.get_mut(&label) {
+            if let Some(own) = &mut rt.ownership {
+                own.phase = SingletonPhase::Draining;
+            }
+            rt.pending_handoff = Some(PendingHandoff {
+                old_owner: current.clone(),
+                old_generation: current_gen,
+                destination: Some(HandoffDestination {
+                    new_owner: new_owner.clone(),
+                    new_generation: new_gen,
+                }),
+            });
+        }
+        state.send_stop_singleton(&current, &label, current_gen.packed());
+        state.schedule_drain_timeout(ctx, &label, current_gen, drain_timeout);
+
+        tracing::info!(
+            "Graceful move of singleton {label}: draining {current} (gen={current_gen:?}) -> {new_owner} (gen={new_gen:?})"
+        );
+        Ok(())
+    }
+
+    #[handler]
+    fn stop_singleton(
+        &mut self,
+        ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: StopSingleton,
+    ) -> Result<(), String> {
+        if !state.is_leader() {
+            return Err(OrchestratorError::NotLeader.to_string());
+        }
+        let label = msg.label;
+
+        let Some(rt) = state.singletons.get(&label) else {
+            return Err(format!("singleton {label} not found"));
+        };
+        if rt.pending_handoff.is_some() {
+            return Err(format!("singleton {label} handoff already in progress"));
+        }
+        let current = rt.ownership.as_ref().and_then(|o| o.owner_node_id.clone());
+        let current_gen = rt.ownership.as_ref().map(|o| o.generation);
+        let drain_timeout = rt.spec.drain_timeout;
+
+        // No live owner to drain — just forget it.
+        let old_alive = current
+            .as_ref()
+            .and_then(|c| state.cluster_view.nodes.get(c))
+            .map(|n| n.is_alive)
+            .unwrap_or(false);
+        if !old_alive {
+            state.singletons.remove(&label);
+            tracing::info!("Singleton {label} torn down (no live owner to drain)");
+            return Ok(());
+        }
+        let (current, current_gen) = (current.unwrap(), current_gen.unwrap());
+
+        if let Some(rt) = state.singletons.get_mut(&label) {
+            if let Some(own) = &mut rt.ownership {
+                own.phase = SingletonPhase::Draining;
+            }
+            rt.pending_handoff = Some(PendingHandoff {
+                old_owner: current.clone(),
+                old_generation: current_gen,
+                destination: None, // teardown
+            });
+        }
+        state.send_stop_singleton(&current, &label, current_gen.packed());
+        state.schedule_drain_timeout(ctx, &label, current_gen, drain_timeout);
+        tracing::info!("Tearing down singleton {label}: draining {current} (gen={current_gen:?})");
+        Ok(())
+    }
+
+    #[handler]
+    fn notify_singleton_stopped(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: NotifySingletonStopped,
+    ) {
+        state.complete_handoff(&msg.label, msg.stopped_generation);
+    }
+
+    #[handler]
+    fn singleton_drain_timeout(
+        &mut self,
+        _ctx: &ActorContext<Self>,
+        state: &mut CoordinatorState,
+        msg: SingletonDrainTimeout,
+    ) {
+        // Only fire if this timer matches the still-in-flight handoff (a timer
+        // for a superseded handoff is ignored).
+        let still_draining = state
+            .singletons
+            .get(&msg.label)
+            .and_then(|rt| rt.pending_handoff.as_ref())
+            .map(|h| h.old_generation == msg.drained_generation)
+            .unwrap_or(false);
+        if still_draining {
+            tracing::warn!(
+                "Singleton {} drain timed out — force-proceeding; old owner abandoned (strictly-lower-fenced)",
+                msg.label
+            );
+            state.complete_handoff(&msg.label, msg.drained_generation);
+        }
     }
 }
 
@@ -540,14 +949,31 @@ impl CoordinatorState {
             local_node_id: local_node_id.into(),
             pending_spawns: HashMap::new(),
             waiting_for_return: HashMap::new(),
+            singletons: HashMap::new(),
+            generation_source: Arc::new(CoordinatorGenerationSource::new()),
             next_request_id: 0,
             spawn_sender: None,
+            singleton_stop_sender: None,
         }
     }
 
     /// Set the spawn sender for sending spawn requests to the transport layer.
     pub(crate) fn with_spawn_sender(mut self, sender: SpawnSender) -> Self {
         self.spawn_sender = Some(sender);
+        self
+    }
+
+    /// Set the channel used to request graceful singleton stops.
+    pub(crate) fn with_singleton_stop_sender(mut self, sender: SingletonStopSender) -> Self {
+        self.singleton_stop_sender = Some(sender);
+        self
+    }
+
+    /// Inject a durable [`GenerationSource`] for minting singleton generations.
+    /// Multi-node write deployments MUST set this (the default in-RAM source is
+    /// not durable across a Coordinator restart).
+    pub fn with_generation_source(mut self, source: Arc<dyn GenerationSource>) -> Self {
+        self.generation_source = source;
         self
     }
 
@@ -575,6 +1001,7 @@ impl CoordinatorState {
                     label: spec.label.clone(),
                     actor_type_name: spec.actor_type_name.clone(),
                     initial_state: spec.initial_state.clone(),
+                    singleton_generation: None,
                 },
             );
         } else {
@@ -582,6 +1009,206 @@ impl CoordinatorState {
                 "No spawn sender configured — spawn request for {} dropped",
                 spec.label
             );
+        }
+    }
+
+    /// Send a spawn request for a fenced cluster singleton, stamping the packed
+    /// `(term, seq)` generation onto the request.
+    fn send_singleton_spawn(
+        &self,
+        target_node_id: &str,
+        request_id: u64,
+        spec: &SingletonSpec,
+        generation: u64,
+    ) {
+        if let Some(sender) = &self.spawn_sender {
+            sender.send_spawn(
+                target_node_id,
+                SpawnRequest {
+                    request_id,
+                    label: spec.label.clone(),
+                    actor_type_name: spec.actor_type_name.clone(),
+                    initial_state: spec.initial_state.clone(),
+                    singleton_generation: Some(generation),
+                },
+            );
+        } else {
+            tracing::warn!(
+                "No spawn sender configured — singleton spawn for {} dropped",
+                spec.label
+            );
+        }
+    }
+
+    /// Re-place every singleton that was owned by a node that just left/failed.
+    ///
+    /// The lost owner is already excluded from the view (`mark_failed` /
+    /// `remove_node`), so `resolve_owner` lands on a survivor. Each re-drive
+    /// mints a fresh `term` (strictly greater than the lost owner's), so even a
+    /// zombie ex-owner that resurfaces is fenced by the `(term, seq)` compare.
+    async fn redrive_singletons_after_loss(&mut self, lost_node_id: &str) {
+        let affected: Vec<String> = self
+            .singletons
+            .iter()
+            .filter(|(_, rt)| {
+                rt.ownership
+                    .as_ref()
+                    .and_then(|o| o.owner_node_id.as_deref())
+                    == Some(lost_node_id)
+            })
+            .map(|(label, _)| label.clone())
+            .collect();
+
+        for label in affected {
+            let Some(spec) = self.singletons.get(&label).map(|rt| rt.spec.clone()) else {
+                continue;
+            };
+
+            let Some(new_owner) =
+                resolve_owner(&spec.anchor, &self.cluster_view, self.election.as_ref())
+            else {
+                tracing::warn!(
+                    "Singleton {label} lost owner {lost_node_id} — no eligible node remains"
+                );
+                if let Some(rt) = self.singletons.get_mut(&label)
+                    && let Some(ownership) = &mut rt.ownership
+                {
+                    ownership.owner_node_id = None;
+                }
+                continue;
+            };
+
+            let gen_source = self.generation_source.clone();
+            let generation = match gen_source.claim_term(&label, &new_owner).await {
+                Ok(generation) => generation,
+                Err(e) => {
+                    tracing::error!("claim_term failed re-driving singleton {label}: {e}");
+                    continue;
+                }
+            };
+
+            if let Some(rt) = self.singletons.get_mut(&label) {
+                rt.ownership = Some(SingletonOwnership {
+                    label: label.clone(),
+                    owner_node_id: Some(new_owner.clone()),
+                    generation,
+                    phase: SingletonPhase::Starting,
+                });
+            }
+
+            let request_id = self.next_request_id();
+            self.pending_spawns.insert(
+                request_id,
+                PendingSpawn {
+                    spec_label: label.clone(),
+                    target_node_id: new_owner.clone(),
+                    owner: Some(OwnerKey::Singleton(label.clone())),
+                },
+            );
+            self.send_singleton_spawn(&new_owner, request_id, &spec, generation.packed());
+
+            tracing::info!(
+                "Re-drove singleton {label} to {new_owner} after loss of {lost_node_id} (gen={generation:?})"
+            );
+        }
+    }
+
+    /// Queue a graceful stop of the singleton instance running on `target`.
+    fn send_stop_singleton(&self, target_node_id: &str, label: &str, generation: u64) {
+        if let Some(sender) = &self.singleton_stop_sender {
+            sender.send_stop(SingletonStopRequest {
+                target_node_id: target_node_id.to_string(),
+                label: label.to_string(),
+                generation,
+            });
+        } else {
+            tracing::warn!("No singleton stop sender configured — stop for {label} dropped");
+        }
+    }
+
+    /// Arm a drain-timeout timer for an in-flight handoff, if the spec set one.
+    /// `None` (the default) means wait indefinitely for the stopped-ack.
+    fn schedule_drain_timeout(
+        &self,
+        ctx: &ActorContext<Coordinator>,
+        label: &str,
+        drained_generation: SingletonGeneration,
+        drain_timeout: Option<Duration>,
+    ) {
+        if let Some(duration) = drain_timeout {
+            let endpoint = ctx.endpoint();
+            let label = label.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                let _ = endpoint
+                    .send(SingletonDrainTimeout {
+                        label,
+                        drained_generation,
+                    })
+                    .await;
+            });
+        }
+    }
+
+    /// Advance an in-flight graceful handoff once the old owner has stopped (or
+    /// the drain timed out). Ignores a stale ack whose generation doesn't match
+    /// the one being drained. Places the successor (move) or forgets the
+    /// singleton (teardown).
+    fn complete_handoff(&mut self, label: &str, stopped_generation: SingletonGeneration) {
+        let Some(handoff) = self
+            .singletons
+            .get(label)
+            .and_then(|rt| rt.pending_handoff.clone())
+        else {
+            return; // not draining — nothing to advance
+        };
+        if handoff.old_generation != stopped_generation {
+            tracing::debug!(
+                "Ignoring stale stopped-ack for singleton {label}: {stopped_generation:?} != draining {:?}",
+                handoff.old_generation
+            );
+            return;
+        }
+
+        match handoff.destination {
+            None => {
+                self.singletons.remove(label);
+                tracing::info!("Singleton {label} torn down (owner drained)");
+            }
+            Some(dest) => {
+                let spec = self.singletons.get(label).map(|rt| rt.spec.clone());
+                if let Some(rt) = self.singletons.get_mut(label) {
+                    rt.pending_handoff = None;
+                    rt.ownership = Some(SingletonOwnership {
+                        label: label.to_string(),
+                        owner_node_id: Some(dest.new_owner.clone()),
+                        generation: dest.new_generation,
+                        phase: SingletonPhase::Starting,
+                    });
+                }
+                let request_id = self.next_request_id();
+                self.pending_spawns.insert(
+                    request_id,
+                    PendingSpawn {
+                        spec_label: label.to_string(),
+                        target_node_id: dest.new_owner.clone(),
+                        owner: Some(OwnerKey::Singleton(label.to_string())),
+                    },
+                );
+                if let Some(spec) = spec {
+                    self.send_singleton_spawn(
+                        &dest.new_owner,
+                        request_id,
+                        &spec,
+                        dest.new_generation.packed(),
+                    );
+                }
+                tracing::info!(
+                    "Singleton {label} drained — placing new owner {} (gen={:?})",
+                    dest.new_owner,
+                    dest.new_generation
+                );
+            }
         }
     }
 
@@ -669,6 +1296,7 @@ impl CoordinatorState {
                             PendingSpawn {
                                 spec_label: label.clone(),
                                 target_node_id: decision.node_id.clone(),
+                                owner: None,
                             },
                         );
                         self.send_spawn(&decision.node_id, request_id, &spec);
@@ -693,6 +1321,7 @@ mod tests {
     use super::*;
     use crate::app::election::OldestNode;
     use crate::app::placement::LeastLoaded;
+    use crate::app::singleton::{SingletonAnchor, SingletonGeneration, SingletonSpec};
     use crate::cluster::config::{NodeClass, NodeIdentity};
 
     fn make_system_and_coordinator() -> (crate::System, Endpoint<Coordinator>) {
@@ -828,7 +1457,7 @@ mod tests {
         let original_node = result.node_id.clone();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: original_node.clone(),
             })
             .await
@@ -867,7 +1496,7 @@ mod tests {
             .unwrap();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: result.node_id,
             })
             .await
@@ -904,7 +1533,7 @@ mod tests {
         let original_node = result.node_id.clone();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: original_node.clone(),
             })
             .await
@@ -942,7 +1571,7 @@ mod tests {
         let original_node = result.node_id.clone();
 
         coordinator
-            .send(NotifyNodeFailed {
+            .send_async(NotifyNodeFailed {
                 node_id: original_node.clone(),
             })
             .await
@@ -966,5 +1595,556 @@ mod tests {
         let specs = coordinator.send(GetSpecs).await.unwrap();
         assert_eq!(specs.len(), 1);
         assert!(matches!(specs[0].state, SpecState::Pending));
+    }
+
+    // ── Cluster singletons (M4 step 3) ──────────────────────────────────────
+    // The harness configures no spawn_sender, so the spawn warn-drops and the
+    // ack must be injected manually; the first allocated request_id is 0.
+
+    #[tokio::test]
+    async fn test_start_singleton_grants_ownership_on_leader() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let ownership = coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Leader (oldest = alpha, incarnation 1) owns it; first grant is term 1.
+        assert!(
+            ownership
+                .owner_node_id
+                .as_deref()
+                .unwrap()
+                .contains("alpha"),
+            "leader anchor should resolve to alpha, got {:?}",
+            ownership.owner_node_id
+        );
+        assert_eq!(
+            ownership.generation,
+            SingletonGeneration { term: 1, seq: 0 }
+        );
+        // Active only lands once the spawn ack is observed.
+        assert_eq!(ownership.phase, SingletonPhase::Starting);
+
+        let queried = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queried.generation, ownership.generation);
+    }
+
+    #[tokio::test]
+    async fn test_singleton_ack_promotes_to_active() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Simulate the owner's spawn ack (request_id 0 is the first allocated).
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let queried = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queried.phase, SingletonPhase::Active);
+        assert_eq!(queried.generation, SingletonGeneration { term: 1, seq: 0 });
+    }
+
+    #[tokio::test]
+    async fn test_start_singleton_idempotent_reasserts_with_seq_bump() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let spec = SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader);
+        coordinator
+            .send_async(StartSingleton { spec: spec.clone() })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        // Re-assert against the same Active owner: bump seq within the term,
+        // no new ownership epoch, no second spawn.
+        let reasserted = coordinator
+            .send_async(StartSingleton { spec })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reasserted.generation,
+            SingletonGeneration { term: 1, seq: 1 }
+        );
+        assert_eq!(reasserted.phase, SingletonPhase::Active);
+    }
+
+    #[tokio::test]
+    async fn test_start_singleton_unsatisfiable_anchor_errors() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        let result = coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new(
+                    "catalog",
+                    "app::Catalog",
+                    SingletonAnchor::Node("ghost@127.0.0.1:9999#0".into()),
+                ),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "pinning to a missing node should fail");
+
+        // And nothing was registered.
+        let queried = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap();
+        assert!(queried.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_singleton_redrives_on_owner_failure_with_higher_term() {
+        let (_system, coordinator) = make_system_and_coordinator();
+
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let before = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let original_owner = before.owner_node_id.clone().unwrap();
+        assert!(original_owner.contains("alpha"));
+        assert_eq!(before.generation, SingletonGeneration { term: 1, seq: 0 });
+
+        // The owner fails: re-drive to the survivor with a strictly-higher term
+        // (the fence), Starting until the re-spawn acks.
+        coordinator
+            .send_async(NotifyNodeFailed {
+                node_id: original_owner.clone(),
+            })
+            .await
+            .unwrap();
+
+        let after = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.owner_node_id.as_deref().unwrap().contains("beta"),
+            "must move off the failed node to beta, got {:?}",
+            after.owner_node_id
+        );
+        assert_eq!(after.generation, SingletonGeneration { term: 2, seq: 0 });
+        assert!(
+            after.generation > before.generation,
+            "term must strictly increase across failover (the fence)"
+        );
+        assert_eq!(after.phase, SingletonPhase::Starting);
+
+        // The re-drive's spawn (request_id 1) acks -> Active.
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 1,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        let active = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.phase, SingletonPhase::Active);
+    }
+
+    #[tokio::test]
+    async fn test_singleton_node_anchor_owner_loss_clears_owner() {
+        let (_system, coordinator) = make_system_and_coordinator();
+        let alpha_id = NodeIdentity {
+            name: "alpha".into(),
+            host: "127.0.0.1".into(),
+            port: 7100,
+            incarnation: 1,
+        }
+        .node_id_string();
+
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new(
+                    "catalog",
+                    "app::Catalog",
+                    SingletonAnchor::Node(alpha_id.clone()),
+                ),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        // The pinned node fails and the Node anchor cannot resolve elsewhere —
+        // ownership is cleared (no silent relocation off the pin).
+        coordinator
+            .send_async(NotifyNodeFailed { node_id: alpha_id })
+            .await
+            .unwrap();
+
+        let after = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.owner_node_id.is_none(),
+            "a Node-pinned singleton whose anchor died has no owner, got {:?}",
+            after.owner_node_id
+        );
+    }
+
+    // ── Graceful drain handoff (M4 step 4b) ─────────────────────────────────
+    // The Coordinator runs on a stable coordinator-class leader ("coord", oldest
+    // overall) while the catalog singleton lives on a WORKER (Class(Worker)
+    // anchor). That lets us change the oldest-worker — the anchor target — by
+    // joining an older worker, WITHOUT flipping the leader (so the leader-gated
+    // move handlers stay valid). No stop_sender is configured, so the stop
+    // warn-drops and we inject NotifySingletonStopped manually (as the bridge would).
+
+    fn make_coord_with_workers() -> (crate::System, Endpoint<Coordinator>) {
+        let system = crate::System::local();
+        let coord = NodeIdentity {
+            name: "coord".into(),
+            host: "127.0.0.1".into(),
+            port: 7000,
+            incarnation: 0, // oldest overall → stable leader
+        };
+        let local = coord.node_id_string();
+        let mut state =
+            CoordinatorState::new(&local, Box::new(LeastLoaded), Box::new(OldestNode::any()));
+        state.cluster_view.upsert_node(NodeInfo::new(
+            coord,
+            NodeClass::Coordinator,
+            HashMap::new(),
+        ));
+        // Two workers; w2 (incarnation 3) is older than w1 (5) → oldest worker.
+        for (name, port, inc) in [("w1", 7201u16, 5u64), ("w2", 7202, 3)] {
+            state.cluster_view.upsert_node(NodeInfo::new(
+                NodeIdentity {
+                    name: name.into(),
+                    host: "127.0.0.1".into(),
+                    port,
+                    incarnation: inc,
+                },
+                NodeClass::Worker,
+                HashMap::new(),
+            ));
+        }
+        let ep = system.start("coordinator", Coordinator, state);
+        (system, ep)
+    }
+
+    /// Join a worker older than w2 so the `Class(Worker)` anchor now resolves to
+    /// it (the leader, coord@0, is unaffected). Returns its node id.
+    async fn join_older_worker(coordinator: &Endpoint<Coordinator>) -> String {
+        let id = NodeIdentity {
+            name: "w0".into(),
+            host: "127.0.0.1".into(),
+            port: 7200,
+            incarnation: 1,
+        }
+        .node_id_string();
+        coordinator
+            .send(NotifyNodeJoined {
+                node_id: id.clone(),
+                info: SerializableNodeInfo {
+                    name: "w0".into(),
+                    host: "127.0.0.1".into(),
+                    port: 7200,
+                    incarnation: 1,
+                    class: NodeClass::Worker,
+                    metadata: HashMap::new(),
+                },
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Start the catalog on the oldest worker (w2) and drive it to Active.
+    async fn start_active_catalog(coordinator: &Endpoint<Coordinator>) {
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new(
+                    "catalog",
+                    "app::Catalog",
+                    SingletonAnchor::Class(NodeClass::Worker),
+                ),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn get_catalog(coordinator: &Endpoint<Coordinator>) -> Option<SingletonOwnership> {
+        coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_singleton_graceful_move_drains_then_places_with_higher_term() {
+        let (_system, coordinator) = make_coord_with_workers();
+        start_active_catalog(&coordinator).await;
+        let w0 = join_older_worker(&coordinator).await;
+
+        // Graceful move: mint term 2 for the new owner, drain the old one.
+        coordinator
+            .send_async(MoveSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let draining = get_catalog(&coordinator).await.unwrap();
+        assert_eq!(draining.phase, SingletonPhase::Draining);
+        assert!(
+            draining.owner_node_id.as_deref().unwrap().contains("w2"),
+            "ownership stays on the old owner while draining"
+        );
+        assert_eq!(draining.generation, SingletonGeneration { term: 1, seq: 0 });
+
+        // Old owner confirms stopped → place the new owner with the higher term.
+        coordinator
+            .send(NotifySingletonStopped {
+                label: "catalog".into(),
+                stopped_generation: SingletonGeneration { term: 1, seq: 0 },
+            })
+            .await
+            .unwrap();
+
+        let placing = get_catalog(&coordinator).await.unwrap();
+        assert_eq!(placing.owner_node_id.as_deref(), Some(w0.as_str()));
+        assert_eq!(placing.generation, SingletonGeneration { term: 2, seq: 0 });
+        assert_eq!(placing.phase, SingletonPhase::Starting);
+
+        // The new spawn acks (request_id 1) → Active.
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 1,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            get_catalog(&coordinator).await.unwrap().phase,
+            SingletonPhase::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn test_singleton_graceful_move_ignores_stale_stopped_ack() {
+        let (_system, coordinator) = make_coord_with_workers();
+        start_active_catalog(&coordinator).await;
+        let w0 = join_older_worker(&coordinator).await;
+        coordinator
+            .send_async(MoveSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A stopped-ack with the wrong generation must NOT advance the handoff.
+        coordinator
+            .send(NotifySingletonStopped {
+                label: "catalog".into(),
+                stopped_generation: SingletonGeneration { term: 99, seq: 0 },
+            })
+            .await
+            .unwrap();
+        let still = get_catalog(&coordinator).await.unwrap();
+        assert_eq!(still.phase, SingletonPhase::Draining);
+        assert!(still.owner_node_id.as_deref().unwrap().contains("w2"));
+
+        // The matching ack advances it.
+        coordinator
+            .send(NotifySingletonStopped {
+                label: "catalog".into(),
+                stopped_generation: SingletonGeneration { term: 1, seq: 0 },
+            })
+            .await
+            .unwrap();
+        let placing = get_catalog(&coordinator).await.unwrap();
+        assert_eq!(placing.owner_node_id.as_deref(), Some(w0.as_str()));
+        assert_eq!(placing.generation, SingletonGeneration { term: 2, seq: 0 });
+    }
+
+    #[tokio::test]
+    async fn test_singleton_graceful_teardown_removes_after_drain() {
+        let (_system, coordinator) = make_coord_with_workers();
+        start_active_catalog(&coordinator).await;
+
+        coordinator
+            .send(StopSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            get_catalog(&coordinator).await.unwrap().phase,
+            SingletonPhase::Draining
+        );
+
+        coordinator
+            .send(NotifySingletonStopped {
+                label: "catalog".into(),
+                stopped_generation: SingletonGeneration { term: 1, seq: 0 },
+            })
+            .await
+            .unwrap();
+        assert!(
+            get_catalog(&coordinator).await.is_none(),
+            "a torn-down singleton is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_singleton_move_is_noop_when_anchor_unchanged() {
+        let (_system, coordinator) = make_coord_with_workers();
+        start_active_catalog(&coordinator).await;
+
+        // Oldest worker is still w2 → move resolves to the current owner → no-op.
+        coordinator
+            .send_async(MoveSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let after = get_catalog(&coordinator).await.unwrap();
+        assert_eq!(after.phase, SingletonPhase::Active);
+        assert_eq!(after.generation, SingletonGeneration { term: 1, seq: 0 });
+        assert!(after.owner_node_id.as_deref().unwrap().contains("w2"));
+    }
+
+    #[tokio::test]
+    async fn test_singleton_drain_timeout_force_proceeds() {
+        let (_system, coordinator) = make_coord_with_workers();
+        coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new(
+                    "catalog",
+                    "app::Catalog",
+                    SingletonAnchor::Class(NodeClass::Worker),
+                )
+                .with_drain_timeout(Duration::from_secs(30)),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator
+            .send(NotifySpawnAck {
+                request_id: 0,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        let w0 = join_older_worker(&coordinator).await;
+        coordinator
+            .send_async(MoveSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Simulate the drain timer firing (old owner never acked) → force-proceed.
+        coordinator
+            .send(SingletonDrainTimeout {
+                label: "catalog".into(),
+                drained_generation: SingletonGeneration { term: 1, seq: 0 },
+            })
+            .await
+            .unwrap();
+
+        let placing = get_catalog(&coordinator).await.unwrap();
+        assert_eq!(placing.owner_node_id.as_deref(), Some(w0.as_str()));
+        assert_eq!(placing.generation, SingletonGeneration { term: 2, seq: 0 });
+        assert_eq!(placing.phase, SingletonPhase::Starting);
     }
 }

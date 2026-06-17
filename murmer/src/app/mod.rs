@@ -14,6 +14,7 @@
 //! - [`election`] — Pluggable leader election (default: OldestNode)
 //! - [`coordinator`] — The Coordinator actor that orchestrates placement
 //! - [`bridge`] — Cluster event bridge connecting cluster layer to Coordinator
+//! - [`singleton`] — Cluster singletons (exactly-one, anchor-pinned, fenced handoff)
 //! - [`error`] — Error types
 
 pub mod bridge;
@@ -22,5 +23,6 @@ pub mod election;
 pub mod error;
 pub mod node_info;
 pub mod placement;
+pub mod singleton;
 pub(crate) mod spawn_sender;
 pub mod spec;

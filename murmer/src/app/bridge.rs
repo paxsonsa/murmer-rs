@@ -27,10 +27,11 @@ use tokio::sync::mpsc;
 
 use crate::app::coordinator::{
     Coordinator, CoordinatorState, NotifyNodeFailed, NotifyNodeJoined, NotifyNodeLeft,
-    NotifySpawnAck, SerializableNodeInfo,
+    NotifySingletonStopped, NotifySpawnAck, SerializableNodeInfo,
 };
 use crate::app::node_info::NodeInfo;
-use crate::app::spawn_sender::SpawnSender;
+use crate::app::singleton::SingletonGeneration;
+use crate::app::spawn_sender::{SingletonStopRequest, SingletonStopSender, SpawnSender};
 
 /// Start the Coordinator actor and the cluster bridge.
 ///
@@ -62,7 +63,10 @@ pub fn start_coordinator(
 
     let queue_depth = Arc::new(AtomicUsize::new(0));
     let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
-    let state = state.with_spawn_sender(SpawnSender::new(spawn_tx, Arc::clone(&queue_depth)));
+    let (stop_tx, stop_rx) = mpsc::unbounded_channel();
+    let state = state
+        .with_spawn_sender(SpawnSender::new(spawn_tx, Arc::clone(&queue_depth)))
+        .with_singleton_stop_sender(SingletonStopSender::new(stop_tx));
 
     let coordinator_ep = cluster.start_actor("coordinator", Coordinator, state);
 
@@ -88,6 +92,19 @@ pub fn start_coordinator(
         ack_ep,
         spawn_rx,
         queue_depth,
+    ));
+
+    // Drain loop for graceful singleton stops (the inner half of the drain handoff).
+    let stop_transport = Arc::clone(cluster.transport());
+    let stop_local_node_id = cluster.identity().node_id_string();
+    let stop_receptionist = cluster.receptionist().clone();
+    let stop_ep = coordinator_ep.clone();
+    tokio::spawn(run_singleton_stop_drain_loop(
+        stop_transport,
+        stop_local_node_id,
+        stop_receptionist,
+        stop_ep,
+        stop_rx,
     ));
 
     coordinator_ep
@@ -134,15 +151,16 @@ async fn run_bridge_loop(
                         .await;
                 }
                 ClusterEvent::NodeFailed(identity) => {
+                    // async handler (re-drives owned singletons) — use send_async.
                     let _ = coordinator
-                        .send(NotifyNodeFailed {
+                        .send_async(NotifyNodeFailed {
                             node_id: identity.node_id_string(),
                         })
                         .await;
                 }
                 ClusterEvent::NodeLeft(identity) => {
                     let _ = coordinator
-                        .send(NotifyNodeLeft {
+                        .send_async(NotifyNodeLeft {
                             node_id: identity.node_id_string(),
                         })
                         .await;
@@ -162,6 +180,20 @@ async fn run_bridge_loop(
                             request_id,
                             success: false,
                             error: Some(error),
+                        })
+                        .await;
+                }
+                ClusterEvent::SingletonStopped {
+                    label,
+                    stopped_generation,
+                } => {
+                    // A drained owner confirmed it stopped — advance the handoff.
+                    let _ = coordinator
+                        .send(NotifySingletonStopped {
+                            label,
+                            stopped_generation: SingletonGeneration::from_packed(
+                                stopped_generation,
+                            ),
                         })
                         .await;
                 }
@@ -309,6 +341,52 @@ async fn run_spawn_drain_loop(
                 }
                 crate::instrument::spawn_drain_factory("remote", factory_start.elapsed());
             });
+        }
+    }
+}
+
+/// Drain loop for graceful singleton stops: reads stop requests and either stops
+/// a local instance directly (then self-notifies the Coordinator) or sends a
+/// `StopSingleton` control message to the remote owner (whose ack returns as
+/// `ClusterEvent::SingletonStopped`).
+async fn run_singleton_stop_drain_loop(
+    transport: Arc<Transport>,
+    local_node_id: String,
+    receptionist: crate::receptionist::Receptionist,
+    coordinator: Endpoint<Coordinator>,
+    mut rx: mpsc::UnboundedReceiver<SingletonStopRequest>,
+) {
+    while let Some(req) = rx.recv().await {
+        if req.target_node_id == local_node_id {
+            tracing::debug!("Stopping local singleton {} for handoff", req.label);
+            receptionist.stop(&req.label);
+            let _ = coordinator
+                .send(NotifySingletonStopped {
+                    label: req.label,
+                    stopped_generation: SingletonGeneration::from_packed(req.generation),
+                })
+                .await;
+        } else {
+            tracing::debug!(
+                "Sending StopSingleton to {} for {}",
+                req.target_node_id,
+                req.label
+            );
+            if let Err(e) = transport
+                .send_control(
+                    &req.target_node_id,
+                    ControlMessage::StopSingleton {
+                        label: req.label.clone(),
+                        generation: req.generation,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send StopSingleton to {}: {e}",
+                    req.target_node_id
+                );
+            }
         }
     }
 }

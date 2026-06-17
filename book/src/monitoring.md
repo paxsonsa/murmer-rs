@@ -8,7 +8,7 @@ Add the `monitor` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-murmer = { version = "0.1", features = ["monitor"] }
+murmer = { version = "0.2", features = ["monitor"] }
 ```
 
 When the feature is **off**, all instrumentation compiles to nothing — zero overhead, zero dependencies.

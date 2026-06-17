@@ -61,12 +61,28 @@ pub struct PlacementConstraints {
     /// Actor must not be placed on a node already running actors with these labels.
     /// Useful for spreading replicas across failure domains.
     pub anti_affinity_labels: Vec<String>,
+    /// HARD positive affinity: the node must ALREADY be running an actor with
+    /// this label. The inverse of `anti_affinity_labels` — use it to co-locate
+    /// a member with an anchor (e.g. pin a reader to the node hosting its
+    /// writer). Unlike the soft `Pinned` strategy this is a filter, so if no
+    /// node runs the anchor the spec gets `NoEligibleNodes` rather than landing
+    /// elsewhere. `None` = no co-location requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colocate_with: Option<String>,
+    /// HARD pin to exactly this node id. If that node is not alive/eligible the
+    /// spec gets `NoEligibleNodes` (it is NEVER silently relocated — that is the
+    /// difference from the soft `Pinned` strategy). `None` = no node pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_node_id: Option<String>,
 }
 
 impl PlacementConstraints {
     /// Check if a node satisfies all constraints.
+    ///
+    /// `node_id` is the candidate node's id, needed for `required_node_id`.
     pub fn is_satisfied_by(
         &self,
+        node_id: &str,
         node_class: &NodeClass,
         node_metadata: &HashMap<String, String>,
         running_actors: &[String],
@@ -84,11 +100,25 @@ impl PlacementConstraints {
             }
         }
 
-        // Check anti-affinity
+        // Check anti-affinity (repel)
         for label in &self.anti_affinity_labels {
             if running_actors.contains(label) {
                 return false;
             }
+        }
+
+        // Check positive affinity (attract): node must already run the anchor.
+        if let Some(anchor) = &self.colocate_with
+            && !running_actors.iter().any(|l| l == anchor)
+        {
+            return false;
+        }
+
+        // Check hard node pin: must be exactly this node.
+        if let Some(required) = &self.required_node_id
+            && node_id != required
+        {
+            return false;
         }
 
         true
@@ -153,10 +183,13 @@ impl ActorSpec {
 mod tests {
     use super::*;
 
+    // A placeholder node id for constraints that don't exercise `required_node_id`.
+    const ANY_NODE: &str = "node-a@127.0.0.1:7100#1";
+
     #[test]
     fn test_placement_constraints_empty_allows_all() {
         let constraints = PlacementConstraints::default();
-        assert!(constraints.is_satisfied_by(&NodeClass::Worker, &HashMap::new(), &[],));
+        assert!(constraints.is_satisfied_by(ANY_NODE, &NodeClass::Worker, &HashMap::new(), &[]));
     }
 
     #[test]
@@ -165,8 +198,8 @@ mod tests {
             required_classes: vec![NodeClass::Worker],
             ..Default::default()
         };
-        assert!(constraints.is_satisfied_by(&NodeClass::Worker, &HashMap::new(), &[]));
-        assert!(!constraints.is_satisfied_by(&NodeClass::Edge, &HashMap::new(), &[]));
+        assert!(constraints.is_satisfied_by(ANY_NODE, &NodeClass::Worker, &HashMap::new(), &[]));
+        assert!(!constraints.is_satisfied_by(ANY_NODE, &NodeClass::Edge, &HashMap::new(), &[]));
     }
 
     #[test]
@@ -178,9 +211,9 @@ mod tests {
         let good_meta: HashMap<String, String> = [("region".into(), "us-west".into())].into();
         let bad_meta: HashMap<String, String> = [("region".into(), "eu-west".into())].into();
 
-        assert!(constraints.is_satisfied_by(&NodeClass::Worker, &good_meta, &[]));
-        assert!(!constraints.is_satisfied_by(&NodeClass::Worker, &bad_meta, &[]));
-        assert!(!constraints.is_satisfied_by(&NodeClass::Worker, &HashMap::new(), &[]));
+        assert!(constraints.is_satisfied_by(ANY_NODE, &NodeClass::Worker, &good_meta, &[]));
+        assert!(!constraints.is_satisfied_by(ANY_NODE, &NodeClass::Worker, &bad_meta, &[]));
+        assert!(!constraints.is_satisfied_by(ANY_NODE, &NodeClass::Worker, &HashMap::new(), &[]));
     }
 
     #[test]
@@ -190,11 +223,13 @@ mod tests {
             ..Default::default()
         };
         assert!(constraints.is_satisfied_by(
+            ANY_NODE,
             &NodeClass::Worker,
             &HashMap::new(),
             &["worker/1".into()],
         ));
         assert!(!constraints.is_satisfied_by(
+            ANY_NODE,
             &NodeClass::Worker,
             &HashMap::new(),
             &["replica/0".into(), "worker/1".into()],

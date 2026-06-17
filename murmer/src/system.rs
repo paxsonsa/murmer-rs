@@ -289,6 +289,30 @@ impl System {
         self.receptionist().lookup(label)
     }
 
+    /// Convenience: declare (or idempotently re-assert) a cluster singleton via
+    /// the local Coordinator and return the granted ownership.
+    ///
+    /// Requires a `Coordinator` started under the well-known `"coordinator"`
+    /// label (see [`crate::app::bridge::start_coordinator`]). For full control —
+    /// a custom coordinator label or an injected
+    /// [`GenerationSource`](crate::app::singleton::GenerationSource) — build the
+    /// `CoordinatorState` with `with_generation_source` and drive the
+    /// `Coordinator` endpoint directly.
+    #[cfg(feature = "app")]
+    pub async fn start_singleton(
+        &self,
+        spec: crate::app::singleton::SingletonSpec,
+    ) -> Result<crate::app::singleton::SingletonOwnership, String> {
+        use crate::app::coordinator::{Coordinator, StartSingleton};
+        let coordinator = self
+            .lookup::<Coordinator>("coordinator")
+            .ok_or_else(|| "no Coordinator registered under \"coordinator\"".to_string())?;
+        match coordinator.send_async(StartSingleton { spec }).await {
+            Ok(result) => result,
+            Err(e) => Err(format!("StartSingleton send failed: {e}")),
+        }
+    }
+
     /// Check an actor into a reception key group for discovery.
     ///
     /// # Examples

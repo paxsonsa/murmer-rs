@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 [features]
 default = ["macros"]
 macros = ["dep:murmer-macros"]
-app = []
+app = ["dep:async-trait"]
 monitor = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 
 [dependencies]
@@ -41,6 +41,7 @@ tokio-util = { version = "0.7", features = ["full"] }
 linkme = "0.3"
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
+async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

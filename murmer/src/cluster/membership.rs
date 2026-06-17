@@ -51,6 +51,14 @@ pub enum ClusterEvent {
         request_id: u64,
         error: String,
     },
+    /// A cluster singleton's owner confirmed it has stopped (forwarded from the
+    /// SingletonStoppedAck control message). `stopped_generation` is the packed
+    /// `(term, seq)` the owner was running, so the Coordinator can ignore a late
+    /// ack from a superseded owner. This is the cross-node await-stopped barrier.
+    SingletonStopped {
+        label: String,
+        stopped_generation: u64,
+    },
 }
 
 // =============================================================================

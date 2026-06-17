@@ -36,6 +36,18 @@ pub enum ControlMessage {
     SpawnAckOk { request_id: u64, label: String },
     /// Node reports actor spawn failure.
     SpawnAckErr { request_id: u64, error: String },
+    /// Coordinator instructs the current owner node to stop a cluster singleton
+    /// so ownership can hand off. `generation` is the packed `(term, seq)` the
+    /// owner was granted, echoed back in the ack so a superseded owner's late
+    /// ack can be ignored.
+    StopSingleton { label: String, generation: u64 },
+    /// Owner node confirms the singleton has fully stopped (its `DeregisterGuard`
+    /// fired). This is the cross-node await-stopped barrier — the analog of a
+    /// local drain — that must complete before the new owner is started.
+    SingletonStoppedAck {
+        label: String,
+        stopped_generation: u64,
+    },
 }
 
 /// A request to spawn an actor on a remote node.
@@ -53,6 +65,16 @@ pub struct SpawnRequest {
     pub actor_type_name: String,
     /// Serialized initial state (via MigratableActor).
     pub initial_state: Vec<u8>,
+    /// Packed `(term, seq)` placement generation when this spawn is for a fenced
+    /// cluster singleton, threaded opaquely to the spawning node so it can stamp
+    /// the actor's boot config. `None` for ordinary (non-singleton) spawns.
+    ///
+    /// Note: `#[serde(default)]` is for forward-friendliness with self-describing
+    /// formats; the wire codec is bincode (positional), and all cluster nodes run
+    /// the same `PROTOCOL_VERSION`, so genuinely-older byte streams are never
+    /// decoded here — `SpawnRequest` is wire-only and never persisted.
+    #[serde(default)]
+    pub singleton_generation: Option<u64>,
 }
 
 /// The handshake payload exchanged when two nodes first connect.
@@ -378,6 +400,53 @@ mod tests {
         let decoded: ControlMessage = decode_message(payload).unwrap();
 
         assert!(matches!(decoded, ControlMessage::Ping));
+    }
+
+    #[test]
+    fn test_spawn_request_roundtrip_with_and_without_generation() {
+        // Same-version round-trip for both the singleton (Some) and ordinary
+        // (None) spawn shapes. (bincode is positional, so this is not a
+        // cross-version test — all nodes share PROTOCOL_VERSION.)
+        for generation in [None, Some((1u64 << 32) | 7)] {
+            let msg = ControlMessage::SpawnActor(SpawnRequest {
+                request_id: 42,
+                label: "catalog".into(),
+                actor_type_name: "app::Catalog".into(),
+                initial_state: vec![1, 2, 3],
+                singleton_generation: generation,
+            });
+            let frame = encode_message(&msg).unwrap();
+            let decoded: ControlMessage = decode_message(&frame[4..]).unwrap();
+            match decoded {
+                ControlMessage::SpawnActor(req) => {
+                    assert_eq!(req.request_id, 42);
+                    assert_eq!(req.singleton_generation, generation);
+                }
+                other => panic!("expected SpawnActor, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_singleton_stop_and_ack_roundtrip() {
+        let packed = (3u64 << 32) | 5;
+        let stop = ControlMessage::StopSingleton {
+            label: "catalog".into(),
+            generation: packed,
+        };
+        let decoded: ControlMessage = decode_message(&encode_message(&stop).unwrap()[4..]).unwrap();
+        assert!(
+            matches!(decoded, ControlMessage::StopSingleton { label, generation } if label == "catalog" && generation == packed)
+        );
+
+        let ack = ControlMessage::SingletonStoppedAck {
+            label: "catalog".into(),
+            stopped_generation: packed,
+        };
+        let decoded: ControlMessage = decode_message(&encode_message(&ack).unwrap()[4..]).unwrap();
+        assert!(
+            matches!(decoded, ControlMessage::SingletonStoppedAck { label, stopped_generation } if label == "catalog" && stopped_generation == packed)
+        );
     }
 
     #[test]

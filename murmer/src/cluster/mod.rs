@@ -601,6 +601,35 @@ fn spawn_event_loop(
                                 error: error.clone(),
                             });
                         }
+                        ControlMessage::StopSingleton { ref label, generation } => {
+                            // Cross-node drain: the Coordinator asked this node to
+                            // stop the singleton instance it owns. Signal the local
+                            // stop and ack. The successor is placed with a strictly
+                            // higher generation, so a briefly-lingering old instance
+                            // is fenced on its next write.
+                            tracing::info!(
+                                "StopSingleton from {node_id} for {label} (gen={generation}) — stopping local instance"
+                            );
+                            receptionist.stop(label);
+                            let _ = transport
+                                .send_control(
+                                    &node_id,
+                                    ControlMessage::SingletonStoppedAck {
+                                        label: label.clone(),
+                                        stopped_generation: generation,
+                                    },
+                                )
+                                .await;
+                        }
+                        ControlMessage::SingletonStoppedAck { ref label, stopped_generation } => {
+                            tracing::info!(
+                                "SingletonStoppedAck from {node_id}: label={label}, gen={stopped_generation}"
+                            );
+                            let _ = event_tx.send(ClusterEvent::SingletonStopped {
+                                label: label.clone(),
+                                stopped_generation,
+                            });
+                        }
                         ControlMessage::Handshake(_) => {
                             tracing::warn!("Unexpected handshake from {node_id}");
                         }
