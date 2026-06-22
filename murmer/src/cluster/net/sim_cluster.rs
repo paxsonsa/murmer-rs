@@ -51,7 +51,9 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::cluster::ClusterSystem;
-use crate::cluster::config::{ClusterConfig, ClusterConfigBuilder, Discovery, NodeClass, NodeIdentity};
+use crate::cluster::config::{
+    ClusterConfig, ClusterConfigBuilder, Discovery, NodeClass, NodeIdentity,
+};
 use crate::cluster::membership::ClusterEvent;
 use crate::cluster::sync::{SpawnRegistry, TypeRegistry};
 use crate::runtime::Runtime;
@@ -111,7 +113,10 @@ impl DrainedEvents {
     /// The set of endpoint ids that came up — the joined-identity analogue of
     /// [`failed`](Self::failed)/[`pruned`](Self::pruned), for set assertions.
     pub fn joined_ids(&self) -> BTreeSet<String> {
-        self.joined.iter().map(|id| id.endpoint_id.0.clone()).collect()
+        self.joined
+            .iter()
+            .map(|id| id.endpoint_id.0.clone())
+            .collect()
     }
 
     /// True if any failure detector fired — the "did the cluster react" check.
@@ -496,7 +501,12 @@ impl SimCluster {
     /// The bare endpoint id string for `name` (e.g. `"node-a-id"`) — the key
     /// `events` reports failures/prunes under.
     pub fn endpoint_id(&self, name: &str) -> String {
-        self.nodes[self.index(name)].system.identity().endpoint_id.0.clone()
+        self.nodes[self.index(name)]
+            .system
+            .identity()
+            .endpoint_id
+            .0
+            .clone()
     }
 
     /// The app Coordinator endpoint for `name`. Panics if the cluster was built
@@ -509,7 +519,11 @@ impl SimCluster {
         self.nodes[self.index(name)]
             .coordinator
             .clone()
-            .unwrap_or_else(|| panic!("SimCluster: node {name:?} has no Coordinator (build with .with_coordinators())"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "SimCluster: node {name:?} has no Coordinator (build with .with_coordinators())"
+                )
+            })
     }
 }
 
@@ -540,7 +554,10 @@ mod tests {
         assert_eq!(c.identity("node-b").port, BASE_PORT + 1);
         assert_eq!(c.identity("node-c").port, BASE_PORT + 2);
         // Distinct socket addrs are what foca's MemberUp guard needs.
-        assert_ne!(c.identity("node-a").socket_addr(), c.identity("node-b").socket_addr());
+        assert_ne!(
+            c.identity("node-a").socket_addr(),
+            c.identity("node-b").socket_addr()
+        );
     }
 
     #[test]
@@ -549,8 +566,7 @@ mod tests {
         // identically across seeds (event ordering is unseeded; membership is not).
         let expect = |c: &mut SimCluster, me: &str, peers: [&str; 2]| {
             let joined = c.events(me).joined_ids();
-            let want: BTreeSet<String> =
-                peers.iter().map(|p| format!("{p}-id")).collect();
+            let want: BTreeSet<String> = peers.iter().map(|p| format!("{p}-id")).collect();
             assert_eq!(joined, want, "{me} converged set");
         };
         for seed in [1u64, 2, 0xC0FFEE] {
@@ -558,6 +574,27 @@ mod tests {
             expect(&mut c, "node-a", ["node-b", "node-c"]);
             expect(&mut c, "node-b", ["node-a", "node-c"]);
             expect(&mut c, "node-c", ["node-a", "node-b"]);
+        }
+    }
+
+    #[test]
+    fn healthy_mesh_holds_under_advance() {
+        // Convergence above is pump-only, so foca's probe timers never fire. Here
+        // we advance past many probe periods on a healthy mesh: foca probes each
+        // peer, the ack crosses back in the same virtual instant, so membership
+        // holds at the full set and NOBODY is ever suspected. A failure here would
+        // be a real control-path bug (a probe or ack that failed to cross), not
+        // flakiness.
+        let mut c = converged_trio(1);
+        for n in ["node-a", "node-b", "node-c"] {
+            let _ = c.events(n); // drain convergence joins
+        }
+        c.advance(Duration::from_secs(30));
+        for n in ["node-a", "node-b", "node-c"] {
+            assert!(
+                !c.events(n).any_failed(),
+                "{n} suspected a peer on a healthy mesh — probes/acks must cross cleanly"
+            );
         }
     }
 
@@ -574,8 +611,14 @@ mod tests {
 
             for survivor in ["node-b", "node-c"] {
                 let ev = c.events(survivor);
-                assert_eq!(ev.failed, only_a, "{survivor} fails exactly A (seed {seed})");
-                assert_eq!(ev.pruned, only_a, "{survivor} prunes exactly A (seed {seed})");
+                assert_eq!(
+                    ev.failed, only_a,
+                    "{survivor} fails exactly A (seed {seed})"
+                );
+                assert_eq!(
+                    ev.pruned, only_a,
+                    "{survivor} prunes exactly A (seed {seed})"
+                );
             }
         }
     }
@@ -600,7 +643,11 @@ mod tests {
 
     #[test]
     fn full_isolation_is_detected_by_and_detects_all_peers() {
-        let (a, b, cc) = ("node-a-id".to_string(), "node-b-id".to_string(), "node-c-id".to_string());
+        let (a, b, cc) = (
+            "node-a-id".to_string(),
+            "node-b-id".to_string(),
+            "node-c-id".to_string(),
+        );
         for seed in [1u64, 2, 0xC0FFEE] {
             let mut c = converged_trio(seed);
             for n in ["node-a", "node-b", "node-c"] {
@@ -611,7 +658,10 @@ mod tests {
             assert!(c.partition("node-a", "node-c"));
             c.advance(Duration::from_secs(30));
 
-            assert_eq!(c.events("node-a").failed, BTreeSet::from([b.clone(), cc.clone()]));
+            assert_eq!(
+                c.events("node-a").failed,
+                BTreeSet::from([b.clone(), cc.clone()])
+            );
             assert_eq!(c.events("node-b").failed, BTreeSet::from([a.clone()]));
             assert_eq!(c.events("node-c").failed, BTreeSet::from([a.clone()]));
         }
@@ -622,7 +672,10 @@ mod tests {
         let mut c = converged_trio(1);
         // First drain: the convergence phase (B saw A and C come up).
         let conv = c.events("node-b");
-        assert_eq!(conv.joined_ids(), BTreeSet::from(["node-a-id".into(), "node-c-id".into()]));
+        assert_eq!(
+            conv.joined_ids(),
+            BTreeSet::from(["node-a-id".into(), "node-c-id".into()])
+        );
         assert!(conv.failed.is_empty());
 
         // Second drain with no new events is empty (drain-since-last consumed them).
@@ -632,7 +685,10 @@ mod tests {
         c.crash("node-a");
         c.advance(Duration::from_secs(30));
         let fault = c.events("node-b");
-        assert!(fault.joined.is_empty(), "no spurious joins in the fault phase");
+        assert!(
+            fault.joined.is_empty(),
+            "no spurious joins in the fault phase"
+        );
         assert_eq!(fault.failed, BTreeSet::from(["node-a-id".to_string()]));
     }
 
@@ -649,16 +705,241 @@ mod tests {
 
         // A returns as itself at incarnation 2 and re-dials the survivors.
         c.rejoin("node-a");
-        assert_eq!(c.identity("node-a").incarnation, 2, "rejoin bumps the incarnation");
+        assert_eq!(
+            c.identity("node-a").incarnation,
+            2,
+            "rejoin bumps the incarnation"
+        );
         c.dial("node-a", "node-b");
         c.dial("node-a", "node-c");
         c.advance(Duration::from_secs(30));
 
         // B and C readmit the returned A at incarnation 2 (higher incarnation wins).
         let readmitted = |ev: &DrainedEvents| {
-            ev.joined.iter().any(|id| id.endpoint_id.0 == "node-a-id" && id.incarnation == 2)
+            ev.joined
+                .iter()
+                .any(|id| id.endpoint_id.0 == "node-a-id" && id.incarnation == 2)
         };
         assert!(readmitted(&c.events("node-b")), "B readmits A@2");
         assert!(readmitted(&c.events("node-c")), "C readmits A@2");
+    }
+
+    // ── app-layer coordination backend (the Raft-decision catalog) ────────────
+    //
+    // The two 2×2 experiments that settled "durable store over Raft": per-node
+    // vs shared `GenerationSource`, crossed with the two failure modes a new
+    // leader hits — a fence collision (equal generations) and amnesia (lost
+    // spec). Each pair is a BROKEN/FIXED mirror toggled only by the source.
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn split_brain_double_grants_one_generation_to_two_owners() {
+        use crate::app::coordinator::StartSingleton;
+        use crate::app::singleton::{SingletonAnchor, SingletonGeneration, SingletonSpec};
+
+        // Default per-node sources: each Coordinator gets its OWN ticket printer.
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .node("node-b")
+            .with_coordinators()
+            .build();
+        c.mesh();
+        c.pump();
+
+        let spec =
+            |label: &str| SingletonSpec::new(label, "test::Catalog", SingletonAnchor::Leader);
+
+        // Leader A (equal incarnations → name tiebreak, "node-a" < "node-b")
+        // places the singleton: term 1, owned by A.
+        let a_id = c.identity("node-a").node_id_string();
+        let own_a = {
+            let coord = c.coordinator("node-a");
+            let msg = StartSingleton {
+                spec: spec("catalog"),
+            };
+            c.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(own_a.generation, SingletonGeneration { term: 1, seq: 0 });
+        assert_eq!(own_a.owner_node_id.as_deref(), Some(a_id.as_str()));
+
+        // Partition A|B and advance so B detects A failed → B believes it leads.
+        assert!(c.partition("node-a", "node-b"));
+        c.advance(Duration::from_secs(30));
+
+        // The client re-submits to B. B's own RAM source never saw "catalog", so
+        // it mints term 1 again, for owner B.
+        let own_b = {
+            let coord = c.coordinator("node-b");
+            let msg = StartSingleton {
+                spec: spec("catalog"),
+            };
+            c.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(own_b.generation, SingletonGeneration { term: 1, seq: 0 });
+        assert_eq!(
+            own_a.generation, own_b.generation,
+            "the per-node RAM source double-grants the SAME generation under partition"
+        );
+        assert_ne!(
+            own_a.owner_node_id, own_b.owner_node_id,
+            "two distinct owners now hold the same fence token (split brain)"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn one_shared_generation_source_fences_the_split_brain() {
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
+        use crate::app::singleton::{CoordinatorGenerationSource, SingletonAnchor, SingletonSpec};
+
+        // The only change from the split-brain test: ONE shared source.
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .node("node-b")
+            .shared_generation_source(Arc::new(CoordinatorGenerationSource::new()))
+            .build();
+        c.mesh();
+        c.pump();
+
+        let own_a = {
+            let coord = c.coordinator("node-a");
+            let msg = StartSingleton {
+                spec: SingletonSpec::new("catalog", "test::Catalog", SingletonAnchor::Leader),
+            };
+            c.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(own_a.generation.term, 1);
+
+        assert!(c.partition("node-a", "node-b"));
+        c.advance(Duration::from_secs(30));
+
+        // With the shared backend B rebuilds catalog's spec and adopts it on
+        // itself at a strictly higher term — a handoff, not a split brain.
+        let b_id = c.identity("node-b").node_id_string();
+        let on_b = {
+            let coord = c.coordinator("node-b");
+            c.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        let on_b = on_b.expect("B adopts catalog from the shared backend under partition");
+        assert_eq!(on_b.owner_node_id.as_deref(), Some(b_id.as_str()));
+        assert_eq!(on_b.generation.term, 2, "the shared source bumps B's term");
+        assert!(
+            on_b.generation > own_a.generation,
+            "B's grant strictly outranks A's — the fence rejects the stale owner A"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn singleton_is_orphaned_when_the_leader_is_lost() {
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
+        use crate::app::singleton::{SingletonAnchor, SingletonSpec};
+
+        // Per-node sources, and we crash the leader (which is also the owner).
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .node("node-b")
+            .with_coordinators()
+            .build();
+        c.mesh();
+        c.pump();
+
+        let a_id = c.identity("node-a").node_id_string();
+        let own_a = {
+            let coord = c.coordinator("node-a");
+            let msg = StartSingleton {
+                spec: SingletonSpec::new("catalog", "test::Catalog", SingletonAnchor::Leader),
+            };
+            c.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(
+            own_a.owner_node_id.as_deref(),
+            Some(a_id.as_str()),
+            "A (the leader) owns the singleton"
+        );
+
+        // Crash the leader A. B detects the failure and becomes leader.
+        c.crash("node-a");
+        c.advance(Duration::from_secs(30));
+
+        // The amnesia: B never knew the spec and there is no rebuild, so the
+        // Leader-anchored singleton is silently orphaned.
+        let on_b = {
+            let coord = c.coordinator("node-b");
+            c.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        assert!(
+            on_b.is_none(),
+            "amnesia: the new leader B never learned `catalog`, so it is orphaned (got {on_b:?})"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn shared_backend_lets_the_new_leader_adopt_the_singleton() {
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
+        use crate::app::singleton::{CoordinatorGenerationSource, SingletonAnchor, SingletonSpec};
+
+        // The amnesia fix: same crash scenario, but a shared backend the new
+        // leader rebuilds from.
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .node("node-b")
+            .shared_generation_source(Arc::new(CoordinatorGenerationSource::new()))
+            .build();
+        c.mesh();
+        c.pump();
+
+        let own_a = {
+            let coord = c.coordinator("node-a");
+            let msg = StartSingleton {
+                spec: SingletonSpec::new("catalog", "test::Catalog", SingletonAnchor::Leader),
+            };
+            c.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(own_a.generation.term, 1);
+
+        c.crash("node-a");
+        c.advance(Duration::from_secs(30));
+
+        // B rebuilt catalog from the shared backend and re-placed it on itself —
+        // owner B, strictly-higher term. No orphan.
+        let b_id = c.identity("node-b").node_id_string();
+        let on_b = {
+            let coord = c.coordinator("node-b");
+            c.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        let on_b = on_b.expect("new leader adopts catalog from the shared backend (not orphaned)");
+        assert_eq!(
+            on_b.owner_node_id.as_deref(),
+            Some(b_id.as_str()),
+            "B now owns catalog"
+        );
+        assert_eq!(on_b.generation.term, 2, "adopted at a bumped term");
+        assert!(
+            on_b.generation > own_a.generation,
+            "the adoption strictly outranks A's grant — the fence holds too"
+        );
     }
 }
