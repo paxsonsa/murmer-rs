@@ -857,7 +857,8 @@ mod tests {
 
     /// Boot one full `ClusterSystem` on the shared sim runtime, over a `SimNet`
     /// bound on `fabric`. Distinct ports give distinct `socket_addr`s, which
-    /// foca's `MemberUp` guard requires to emit `NodeJoined`.
+    /// foca's `MemberUp` guard requires to emit `NodeJoined`. Incarnation 1 — use
+    /// [`boot_with_incarnation`] to model a restart (a returning node bumps it).
     fn boot(
         fabric: &SimFabric,
         rt: &Arc<dyn Runtime>,
@@ -866,7 +867,24 @@ mod tests {
         id: &str,
         port: u16,
     ) -> (ClusterSystem, Arc<SimNet>) {
-        let identity = NodeIdentity::new_seeded(name, NodeId(id.into()), "127.0.0.1", port, 1);
+        boot_with_incarnation(fabric, rt, shutdown, name, id, port, 1)
+    }
+
+    /// Like [`boot`] but with an explicit incarnation. A node that crashed and
+    /// returns comes back with a strictly-higher incarnation (same endpoint id),
+    /// which is how foca's `win_addr_conflict` readmits it over the down instance.
+    #[allow(clippy::too_many_arguments)]
+    fn boot_with_incarnation(
+        fabric: &SimFabric,
+        rt: &Arc<dyn Runtime>,
+        shutdown: &CancellationToken,
+        name: &str,
+        id: &str,
+        port: u16,
+        incarnation: u64,
+    ) -> (ClusterSystem, Arc<SimNet>) {
+        let identity =
+            NodeIdentity::new_seeded(name, NodeId(id.into()), "127.0.0.1", port, incarnation);
         let (sim_net, incoming_rx, conn_events_rx) = fabric.bind(
             identity.clone(),
             NodeClass::Worker,
@@ -1262,6 +1280,83 @@ mod tests {
                 "C detects only A down — B↔C stays healthy (seed {seed})"
             );
         }
+    }
+
+    /// Phase 3, rejoin — completes the fault catalog (crash, partition, recover).
+    /// A is crashed (B and C detect it failed), then "restarts" as the SAME
+    /// endpoint id at incarnation 2 and re-dials the survivors. foca's
+    /// `win_addr_conflict` gives the higher incarnation the win over the down
+    /// instance (both share the endpoint-id `addr`), so B and C readmit A — a
+    /// fresh `NodeJoined` for `node-a-id` at incarnation 2. This is the
+    /// same-identity rejoin (a node returns as itself), distinct from the cluster
+    /// oracle's rejoin which uses a brand-new identity.
+    #[test]
+    fn crashed_node_rejoins_with_higher_incarnation() {
+        install_crypto();
+        let mut world = SimWorld::new(1);
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+
+        let tok_a = CancellationToken::new();
+        let tok_b = CancellationToken::new();
+        let tok_c = CancellationToken::new();
+        let (sys_a, _net_a) = boot(&fabric, &rt, &tok_a, "node-a", "node-a-id", 7001);
+        let (sys_b, _net_b) = boot(&fabric, &rt, &tok_b, "node-b", "node-b-id", 7002);
+        let (sys_c, _net_c) = boot(&fabric, &rt, &tok_c, "node-c", "node-c-id", 7003);
+
+        let peer = |s: &ClusterSystem| PeerAddr {
+            id: s.identity().endpoint_id.clone(),
+            hint: vec![],
+        };
+        // Full mesh + converge.
+        sys_a.inject_discovered(peer(&sys_b));
+        sys_a.inject_discovered(peer(&sys_c));
+        sys_b.inject_discovered(peer(&sys_c));
+        world.pump();
+
+        // Crash A; advance so B and C detect it failed.
+        tok_a.cancel();
+        world.advance(Duration::from_secs(30));
+
+        // Watch only the readmission phase.
+        let mut ev_b = sys_b.subscribe_events();
+        let mut ev_c = sys_c.subscribe_events();
+
+        // A returns: same endpoint id, incarnation 2, re-dials the survivors.
+        let tok_a2 = CancellationToken::new();
+        let (sys_a2, _net_a2) =
+            boot_with_incarnation(&fabric, &rt, &tok_a2, "node-a", "node-a-id", 7001, 2);
+        sys_a2.inject_discovered(peer(&sys_b));
+        sys_a2.inject_discovered(peer(&sys_c));
+        world.advance(Duration::from_secs(30));
+
+        // B and C readmit the returned A at incarnation 2.
+        let readmitted_a2 = |rx: &mut broadcast::Receiver<ClusterEvent>| {
+            let mut seen = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(ClusterEvent::NodeJoined(id)) => {
+                        if id.endpoint_id.0 == "node-a-id" && id.incarnation == 2 {
+                            seen = true;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            seen
+        };
+        assert!(
+            readmitted_a2(&mut ev_b),
+            "B must readmit the returned A at incarnation 2 (the higher incarnation wins)"
+        );
+        assert!(
+            readmitted_a2(&mut ev_c),
+            "C must readmit the returned A at incarnation 2 (the higher incarnation wins)"
+        );
+        // Keep the crashed and returned systems alive through the assertions.
+        let _ = (sys_a, sys_a2);
     }
 
     // ── The split-brain fence experiment (the Raft decision artifact) ─────────
