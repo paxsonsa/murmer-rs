@@ -6,14 +6,23 @@ pub enum ClusterError {
     #[error("transport error: {0}")]
     Transport(String),
 
-    #[error("QUIC connection error: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    #[error("connection error: {0}")]
+    Connection(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("TLS error: {0}")]
     Tls(String),
+
+    #[error("node key file error: {0}")]
+    KeyFile(String),
+
+    #[error("allowlist file error: {0}")]
+    AllowlistFile(String),
+
+    #[error("connection from {0} rejected: endpoint not in allowlist")]
+    NotInAllowlist(String),
 
     #[error("handshake failed: {0}")]
     HandshakeFailed(String),

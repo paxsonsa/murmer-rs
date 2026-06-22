@@ -324,6 +324,7 @@ pub enum SpecState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableNodeInfo {
     pub name: String,
+    pub endpoint_id: iroh::EndpointId,
     pub host: String,
     pub port: u16,
     pub incarnation: u64,
@@ -498,6 +499,7 @@ impl Coordinator {
         let info = NodeInfo::new(
             crate::cluster::config::NodeIdentity {
                 name: msg.info.name,
+                endpoint_id: msg.info.endpoint_id,
                 host: msg.info.host,
                 port: msg.info.port,
                 incarnation: msg.info.incarnation,
@@ -1327,12 +1329,7 @@ mod tests {
     fn make_system_and_coordinator() -> (crate::System, Endpoint<Coordinator>) {
         let system = crate::System::local();
 
-        let alpha_identity = NodeIdentity {
-            name: "alpha".into(),
-            host: "127.0.0.1".into(),
-            port: 7100,
-            incarnation: 1,
-        };
+        let alpha_identity = NodeIdentity::for_test("alpha", 1);
         let local_node_id = alpha_identity.node_id_string();
 
         let mut state = CoordinatorState::new(
@@ -1349,6 +1346,7 @@ mod tests {
         state.cluster_view.upsert_node(NodeInfo::new(
             NodeIdentity {
                 name: "beta".into(),
+                endpoint_id: NodeIdentity::test_endpoint_id("beta"),
                 host: "127.0.0.1".into(),
                 port: 7200,
                 incarnation: 2,
@@ -1582,6 +1580,7 @@ mod tests {
                 node_id: original_node.clone(),
                 info: SerializableNodeInfo {
                     name: "alpha".into(),
+                    endpoint_id: crate::cluster::config::NodeIdentity::test_endpoint_id("alpha"),
                     host: "127.0.0.1".into(),
                     port: 7100,
                     incarnation: 1,
@@ -1615,11 +1614,9 @@ mod tests {
 
         // Leader (oldest = alpha, incarnation 1) owns it; first grant is term 1.
         assert!(
-            ownership
-                .owner_node_id
-                .as_deref()
-                .unwrap()
-                .contains("alpha"),
+            ownership.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string()
+            ),
             "leader anchor should resolve to alpha, got {:?}",
             ownership.owner_node_id
         );
@@ -1760,7 +1757,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let original_owner = before.owner_node_id.clone().unwrap();
-        assert!(original_owner.contains("alpha"));
+        assert!(original_owner.contains(
+            &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string()
+        ));
         assert_eq!(before.generation, SingletonGeneration { term: 1, seq: 0 });
 
         // The owner fails: re-drive to the survivor with a strictly-higher term
@@ -1780,7 +1779,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            after.owner_node_id.as_deref().unwrap().contains("beta"),
+            after.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "must move off the failed node to beta, got {:?}",
             after.owner_node_id
         );
@@ -1813,13 +1814,7 @@ mod tests {
     #[tokio::test]
     async fn test_singleton_node_anchor_owner_loss_clears_owner() {
         let (_system, coordinator) = make_system_and_coordinator();
-        let alpha_id = NodeIdentity {
-            name: "alpha".into(),
-            host: "127.0.0.1".into(),
-            port: 7100,
-            incarnation: 1,
-        }
-        .node_id_string();
+        let alpha_id = NodeIdentity::for_test("alpha", 1).node_id_string();
 
         coordinator
             .send_async(StartSingleton {
@@ -1874,6 +1869,7 @@ mod tests {
         let system = crate::System::local();
         let coord = NodeIdentity {
             name: "coord".into(),
+            endpoint_id: NodeIdentity::test_endpoint_id("coord"),
             host: "127.0.0.1".into(),
             port: 7000,
             incarnation: 0, // oldest overall → stable leader
@@ -1891,6 +1887,7 @@ mod tests {
             state.cluster_view.upsert_node(NodeInfo::new(
                 NodeIdentity {
                     name: name.into(),
+                    endpoint_id: NodeIdentity::test_endpoint_id(name),
                     host: "127.0.0.1".into(),
                     port,
                     incarnation: inc,
@@ -1908,6 +1905,7 @@ mod tests {
     async fn join_older_worker(coordinator: &Endpoint<Coordinator>) -> String {
         let id = NodeIdentity {
             name: "w0".into(),
+            endpoint_id: NodeIdentity::test_endpoint_id("w0"),
             host: "127.0.0.1".into(),
             port: 7200,
             incarnation: 1,
@@ -1918,6 +1916,7 @@ mod tests {
                 node_id: id.clone(),
                 info: SerializableNodeInfo {
                     name: "w0".into(),
+                    endpoint_id: NodeIdentity::test_endpoint_id("w0"),
                     host: "127.0.0.1".into(),
                     port: 7200,
                     incarnation: 1,
@@ -1980,7 +1979,9 @@ mod tests {
         let draining = get_catalog(&coordinator).await.unwrap();
         assert_eq!(draining.phase, SingletonPhase::Draining);
         assert!(
-            draining.owner_node_id.as_deref().unwrap().contains("w2"),
+            draining.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("w2").to_string()
+            ),
             "ownership stays on the old owner while draining"
         );
         assert_eq!(draining.generation, SingletonGeneration { term: 1, seq: 0 });
@@ -2037,7 +2038,11 @@ mod tests {
             .unwrap();
         let still = get_catalog(&coordinator).await.unwrap();
         assert_eq!(still.phase, SingletonPhase::Draining);
-        assert!(still.owner_node_id.as_deref().unwrap().contains("w2"));
+        assert!(
+            still.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("w2").to_string()
+            )
+        );
 
         // The matching ack advances it.
         coordinator
@@ -2098,7 +2103,11 @@ mod tests {
         let after = get_catalog(&coordinator).await.unwrap();
         assert_eq!(after.phase, SingletonPhase::Active);
         assert_eq!(after.generation, SingletonGeneration { term: 1, seq: 0 });
-        assert!(after.owner_node_id.as_deref().unwrap().contains("w2"));
+        assert!(
+            after.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("w2").to_string()
+            )
+        );
     }
 
     #[tokio::test]

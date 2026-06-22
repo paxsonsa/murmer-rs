@@ -141,6 +141,7 @@ async fn run_bridge_loop(
                             node_id,
                             info: SerializableNodeInfo {
                                 name: identity.name,
+                                endpoint_id: identity.endpoint_id,
                                 host: identity.host,
                                 port: identity.port,
                                 incarnation: identity.incarnation,

@@ -53,15 +53,17 @@
 //! the first sync.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use iroh::{EndpointAddr, SecretKey};
+
 use crate::actor::Actor;
-use crate::cluster::config::{NodeClass, TransportTuning};
+use crate::cluster::allowlist::Allowlist;
+use crate::cluster::config::{NodeClass, NodeIdentity, TransportTuning};
 use crate::cluster::error::ClusterError;
 use crate::cluster::framing::ControlMessage;
 use crate::cluster::membership::ClusterEvent;
@@ -120,15 +122,16 @@ impl MurmerClient {
     /// public actors. Use [`lookup`](Self::lookup) after connecting, or
     /// [`lookup_wait`](Self::lookup_wait) if the actor may not be registered yet.
     pub async fn connect(
-        addr: SocketAddr,
+        addr: EndpointAddr,
         cookie: impl Into<String>,
     ) -> Result<Self, ClusterError> {
         Self::connect_with_options(addr, cookie.into(), ClientOptions::default()).await
     }
 
-    /// Connect with custom options.
+    /// Connect with custom options. `addr` is the server's iroh endpoint address
+    /// (its endpoint id plus a direct-address hint) — edge clients dial by key.
     pub async fn connect_with_options(
-        addr: SocketAddr,
+        addr: EndpointAddr,
         cookie: String,
         options: ClientOptions,
     ) -> Result<Self, ClusterError> {
@@ -139,11 +142,25 @@ impl MurmerClient {
                 .unwrap_or_else(TypeRegistry::from_auto),
         );
 
+        // Edge clients use an ephemeral identity: a fresh key each run. They only
+        // dial out, so their own allowlist is open — the *server* enforces the
+        // allowlist against this client's key.
+        let secret_key = SecretKey::generate();
+        let identity = NodeIdentity::new(
+            format!("edge-{}", rand::random::<u32>()),
+            secret_key.public(),
+            "0.0.0.0",
+            0,
+        );
+
         let (transport, _conn_events) = Transport::connect_only(
+            identity,
+            secret_key,
             cookie,
             NodeClass::Edge,
             HashMap::new(),
             options.transport_tuning,
+            Allowlist::open(),
             shutdown.clone(),
         )
         .await?;
@@ -324,7 +341,7 @@ impl MurmerClient {
 /// - Ignores all cluster-specific messages (SWIM, spawn, departure)
 #[allow(clippy::too_many_arguments)]
 fn spawn_edge_event_loop(
-    control_recv: quinn::RecvStream,
+    control_recv: iroh::endpoint::RecvStream,
     transport: Arc<Transport>,
     receptionist: Receptionist,
     type_registry: Arc<TypeRegistry>,

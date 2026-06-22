@@ -184,12 +184,7 @@ mod tests {
 
     fn make_node(name: &str, incarnation: u64, actors: Vec<String>) -> NodeInfo {
         NodeInfo {
-            identity: NodeIdentity {
-                name: name.into(),
-                host: "127.0.0.1".into(),
-                port: 7100,
-                incarnation,
-            },
+            identity: NodeIdentity::for_test(name, incarnation),
             class: NodeClass::Worker,
             metadata: HashMap::new(),
             running_actors: actors,
@@ -217,7 +212,9 @@ mod tests {
 
         // Beta has 0 actors, alpha has 2 — beta should win
         assert!(
-            decision.node_id.contains("beta"),
+            decision.node_id.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "expected beta, got {}",
             decision.node_id
         );
@@ -266,7 +263,11 @@ mod tests {
         let alpha_id = view
             .nodes
             .keys()
-            .find(|k| k.contains("alpha"))
+            .find(|k| {
+                k.contains(
+                    &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string(),
+                )
+            })
             .unwrap()
             .clone();
         view.mark_failed(&alpha_id);
@@ -276,7 +277,9 @@ mod tests {
 
         // Only beta is alive
         assert!(
-            decision.node_id.contains("beta"),
+            decision.node_id.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "expected beta, got {}",
             decision.node_id
         );
@@ -298,7 +301,9 @@ mod tests {
         );
         let decision = select_node(&LeastLoaded, &spec, &view).unwrap();
         assert!(
-            decision.node_id.contains("beta"),
+            decision.node_id.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "colocate_with should pin to the anchor's node (beta), got {}",
             decision.node_id
         );

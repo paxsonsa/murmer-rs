@@ -171,12 +171,7 @@ mod tests {
     use super::*;
 
     fn test_identity(name: &str, incarnation: u64) -> NodeIdentity {
-        NodeIdentity {
-            name: name.into(),
-            host: "127.0.0.1".into(),
-            port: 7100,
-            incarnation,
-        }
+        NodeIdentity::for_test(name, incarnation)
     }
 
     #[test]

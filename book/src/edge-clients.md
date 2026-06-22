@@ -2,17 +2,30 @@
 
 Not everything that talks to a murmer cluster needs to be a cluster member. A REST API gateway, a CLI tool, a monitoring dashboard, or an integration test runner just needs to *call* actors — it doesn't need to run any, participate in SWIM gossip, or store a registry.
 
-**Edge clients** fill that role. A `MurmerClient` connects to any cluster node via QUIC, pulls the set of public actors, and exposes the same `Endpoint<A>` API you already know — without any of the cluster machinery behind it.
+**Edge clients** fill that role. A `MurmerClient` connects to any cluster node, pulls the set of public actors, and exposes the same `Endpoint<A>` API you already know — without any of the cluster machinery behind it.
+
+Like every connection in murmer, an edge client dials the server **by key**: you give it the server node's iroh endpoint address (its endpoint id plus a host:port hint), not a bare socket address. Get the server's endpoint id by running `murmer id` on it.
 
 ```rust,ignore
 use murmer::MurmerClient;
 use std::time::Duration;
 
-let client = MurmerClient::connect("10.0.0.5:9000".parse()?, "cluster-cookie").await?;
+// The server's endpoint address = its endpoint id + a host:port hint.
+let server = iroh::EndpointAddr::from_parts(
+    server_endpoint_id,                       // from `murmer id` on the server
+    [iroh::TransportAddr::Ip("10.0.0.5:9000".parse()?)],
+);
+
+let client = MurmerClient::connect(server, "cluster-cookie").await?;
 let ep = client.lookup::<UserService>("api/users").unwrap();
 let user = ep.send(GetUser { id: 42 }).await?;
 client.disconnect().await;
 ```
+
+> The edge client generates a fresh ephemeral key on each run. If the server runs
+> with an [enforced allowlist](./administration.md#the-allowlist), that ephemeral
+> key won't be admitted. Either run edge clients against `Open`-mode nodes, or
+> give the client a persistent, allowlisted key.
 
 ## Visibility: controlling what Edge clients see
 
@@ -42,11 +55,9 @@ let metrics = system.start_private("node/metrics", MetricsCollector, state);
 Edge clients connect to any node in the cluster. The node you connect to acts as your sync source — it responds to pull requests with the current set of public actors.
 
 ```rust,ignore
-// Short-lived: connect, call, disconnect
-let client = MurmerClient::connect(
-    "10.0.0.5:9000".parse()?,
-    "cluster-cookie",
-).await?;
+// Short-lived: connect, call, disconnect. `server` is an iroh::EndpointAddr
+// (endpoint id + host:port), built as shown above.
+let client = MurmerClient::connect(server, "cluster-cookie").await?;
 ```
 
 The cluster cookie must match the server's cookie or the handshake will be rejected.

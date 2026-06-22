@@ -10,6 +10,7 @@ serde = { workspace = true }
 bincode = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+iroh = "1.0.0"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

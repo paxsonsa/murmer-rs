@@ -444,4 +444,28 @@ impl System {
             SystemInner::Clustered { cluster } => Some(cluster.local_addr()),
         }
     }
+
+    /// This node's iroh endpoint id, if clustered. Combine with [`local_addr`]
+    /// to build an [`iroh::EndpointAddr`] other nodes can use as a seed.
+    ///
+    /// [`local_addr`]: Self::local_addr
+    pub fn endpoint_id(&self) -> Option<iroh::EndpointId> {
+        match &self.inner {
+            SystemInner::Local { .. } => None,
+            SystemInner::Clustered { cluster } => Some(cluster.identity().endpoint_id),
+        }
+    }
+
+    /// This node's iroh [`EndpointAddr`](iroh::EndpointAddr) (endpoint id +
+    /// bound address) — a ready-made seed for other nodes to dial. `None` if not
+    /// clustered.
+    pub fn endpoint_addr(&self) -> Option<iroh::EndpointAddr> {
+        match &self.inner {
+            SystemInner::Local { .. } => None,
+            SystemInner::Clustered { cluster } => Some(iroh::EndpointAddr::from_parts(
+                cluster.identity().endpoint_id,
+                [iroh::TransportAddr::Ip(cluster.local_addr())],
+            )),
+        }
+    }
 }

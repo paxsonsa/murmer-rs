@@ -5,3 +5,7 @@ CLAUDE.md
 thoughts/
 nohup.out
 book/build/
+
+# murmer node key files (generated at runtime — never commit secret keys)
+keys/
+*.key

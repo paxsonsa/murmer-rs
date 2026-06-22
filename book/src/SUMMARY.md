@@ -8,6 +8,7 @@
 - [Supervision](./supervision.md)
 - [Clustering](./clustering.md)
 - [Edge Clients](./edge-clients.md)
+- [Administration & Security](./administration.md)
 - [Monitoring](./monitoring.md)
 - [Proc Macro Reference](./macros.md)
 - [Application Orchestration](./murmer-app.md)

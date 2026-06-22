@@ -32,12 +32,13 @@ name = "supervisor"
 path = "src/supervisor.rs"
 
 [dependencies]
+iroh = "1.0.0"
 murmer = { workspace = true, features = ["app"] }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true }
 bincode = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }

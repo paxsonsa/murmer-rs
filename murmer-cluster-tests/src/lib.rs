@@ -112,6 +112,10 @@ impl ClusterSimBuilder {
         for spec in seed_specs {
             let config = ClusterConfigBuilder::new()
                 .name(&spec.name)
+                // Each node needs its OWN iroh identity; without an explicit key
+                // the builder would load a shared default key file and every node
+                // would collide on the same endpoint id.
+                .secret_key(iroh::SecretKey::generate())
                 .listen("127.0.0.1:0".parse::<SocketAddr>().unwrap())
                 .cookie("cluster-sim-cookie")
                 .discovery(Discovery::None)
@@ -131,18 +135,20 @@ impl ClusterSimBuilder {
             );
         }
 
-        // Start joiner nodes, resolving seed addresses.
+        // Start joiner nodes, resolving the seed's iroh endpoint address
+        // (endpoint id + bound address) — iroh dials by key, not bare address.
         for spec in joiner_specs {
             let seed_name = spec.seed_from.as_ref().unwrap();
             let seed_addr = nodes
                 .get(seed_name)
                 .unwrap_or_else(|| panic!("seed node '{}' not found (start it first)", seed_name))
                 .system
-                .local_addr()
+                .endpoint_addr()
                 .expect("seed node must be clustered");
 
             let config = ClusterConfigBuilder::new()
                 .name(&spec.name)
+                .secret_key(iroh::SecretKey::generate())
                 .listen("127.0.0.1:0".parse::<SocketAddr>().unwrap())
                 .cookie("cluster-sim-cookie")
                 .seed_nodes([seed_addr])

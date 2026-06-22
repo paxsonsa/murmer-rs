@@ -315,12 +315,7 @@ mod tests {
 
     fn make_node(name: &str, incarnation: u64, class: NodeClass) -> NodeInfo {
         NodeInfo::new(
-            NodeIdentity {
-                name: name.into(),
-                host: "127.0.0.1".into(),
-                port: 7100,
-                incarnation,
-            },
+            NodeIdentity::for_test(name, incarnation),
             class,
             HashMap::new(),
         )
@@ -378,7 +373,12 @@ mod tests {
         let election = OldestNode::any();
         let owner = resolve_owner(&SingletonAnchor::Leader, &view, &election).unwrap();
         assert_eq!(owner, election.elect(&view).unwrap());
-        assert!(owner.contains("alpha"), "oldest should win, got {owner}");
+        assert!(
+            owner.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string()
+            ),
+            "oldest should win, got {owner}"
+        );
     }
 
     #[test]
@@ -398,7 +398,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            owner.contains("beta"),
+            owner.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "oldest Coordinator should win, got {owner}"
         );
     }

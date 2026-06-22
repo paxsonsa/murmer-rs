@@ -16,6 +16,12 @@ default = ["macros"]
 macros = ["dep:murmer-macros"]
 app = ["dep:async-trait"]
 monitor = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+# The `murmer` CLI (key + allowlist management). Pulls in clap.
+cli = ["dep:clap"]
+
+[[bin]]
+name = "murmer"
+required-features = ["cli"]
 
 [dependencies]
 bincode = { workspace = true }
@@ -26,10 +32,7 @@ tokio = { workspace = true }
 murmer-macros = { workspace = true, optional = true }
 
 # Networking & clustering
-quinn = { version = "0.11", features = ["rustls"] }
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2.0"
-rcgen = "0.13"
 foca = { version = "0.19", features = ["bincode-codec"] }
 mdns-sd = "0.18"
 rand = { workspace = true }
@@ -42,6 +45,8 @@ linkme = "0.3"
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 async-trait = { version = "0.1", optional = true }
+iroh = "1.0.0"
+clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -1,8 +1,9 @@
-pub mod certs;
+pub mod allowlist;
 pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod framing;
+pub mod identity_key;
 pub mod membership;
 pub mod remote;
 pub mod sync;
@@ -28,6 +29,12 @@ use framing::ControlMessage;
 use membership::{ClusterEvent, ClusterMembership, FocaRuntime, TimerEvent, spawn_timer_manager};
 use sync::{SpawnRegistry, TypeRegistry};
 use transport::{ConnectionEvent, Transport};
+
+/// Parse the iroh `EndpointId` out of a `node_id_string` of the form
+/// `endpoint_id#incarnation`.
+fn parse_endpoint_id(node_id: &str) -> Option<iroh::EndpointId> {
+    node_id.split('#').next()?.parse().ok()
+}
 
 // =============================================================================
 // NODE REGISTRY — tracks node class and metadata from handshakes
@@ -144,14 +151,19 @@ impl ClusterSystem {
         // Type manifest from the registry
         let type_manifest = type_registry.known_types();
 
-        // Bind QUIC transport with tuned parameters
+        // Build the zero-trust allowlist (hot-reloaded in Enforced mode).
+        let allowlist = allowlist::Allowlist::new(config.allowlist.clone(), shutdown.clone())?;
+
+        // Bind the iroh transport with tuned parameters and the allowlist hook.
         let (transport, incoming_rx, connection_events_rx) = Transport::bind(
             identity.clone(),
+            config.secret_key.clone(),
             config.cookie.clone(),
             type_manifest,
             config.node_class.clone(),
             config.node_metadata.clone(),
             config.transport.clone(),
+            allowlist,
             shutdown.clone(),
         )
         .await?;
@@ -354,9 +366,9 @@ fn spawn_event_loop(
     // Periodic sync interval
     let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
 
-    // Track addresses we're currently connecting to, to avoid duplicates
+    // Track endpoint ids we're currently connecting to, to avoid duplicates.
     let connecting = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<
-        SocketAddr,
+        iroh::EndpointId,
     >::new()));
 
     tokio::spawn(async move {
@@ -397,13 +409,14 @@ fn spawn_event_loop(
                 Some(event) = discovery_rx.recv() => {
                     match event {
                         discovery::DiscoveryEvent::PeerDiscovered(addr) => {
+                            let endpoint_id = addr.id;
                             let transport = Arc::clone(&transport);
                             let connecting = Arc::clone(&connecting);
                             let mut lock = connecting.lock().await;
-                            if lock.contains(&addr) {
+                            if lock.contains(&endpoint_id) {
                                 continue;
                             }
-                            lock.insert(addr);
+                            lock.insert(endpoint_id);
                             drop(lock);
 
                             let connecting2 = Arc::clone(&connecting);
@@ -411,15 +424,15 @@ fn spawn_event_loop(
                             tokio::spawn(async move {
                                 match transport.connect(addr).await {
                                     Ok(ic) => {
-                                        tracing::info!("Connected to discovered peer: {addr}");
+                                        tracing::info!("Connected to discovered peer: {endpoint_id}");
                                         // Feed back into event loop for stream-accept handling
                                         let _ = connected_tx.send(ic);
                                     }
                                     Err(e) => {
-                                        tracing::debug!("Failed to connect to {addr}: {e}");
+                                        tracing::debug!("Failed to connect to {endpoint_id}: {e}");
                                     }
                                 }
-                                connecting2.lock().await.remove(&addr);
+                                connecting2.lock().await.remove(&endpoint_id);
                             });
                         }
                     }
@@ -474,34 +487,48 @@ fn spawn_event_loop(
                                     if connected.contains(&op.node_id) {
                                         continue;
                                     }
-                                    if let Ok(addr) = origin_addr.parse::<SocketAddr>() {
+                                    // The op's node_id is `endpoint_id#incarnation`; the
+                                    // origin_addr is a host:port hint. Reconstruct the iroh
+                                    // EndpointAddr to dial. Gossip carries addressing hints
+                                    // only — the allowlist hook decides authorization, so a
+                                    // gossiped peer that isn't allowlisted is rejected on dial.
+                                    let Some(endpoint_id) = parse_endpoint_id(&op.node_id) else {
+                                        continue;
+                                    };
+                                    let Ok(sock) = origin_addr.parse::<SocketAddr>() else {
+                                        continue;
+                                    };
+                                    let endpoint_addr = iroh::EndpointAddr::from_parts(
+                                        endpoint_id,
+                                        [iroh::TransportAddr::Ip(sock)],
+                                    );
+                                    {
                                         let mut lock = connecting.lock().await;
-                                        if lock.contains(&addr) {
+                                        if lock.contains(&endpoint_id) {
                                             continue;
                                         }
-                                        lock.insert(addr);
-                                        drop(lock);
-
-                                        let transport_clone = Arc::clone(&transport);
-                                        let connecting_clone = Arc::clone(&connecting);
-                                        let connected_tx = connected_tx.clone();
-                                        tokio::spawn(async move {
-                                            match transport_clone.connect(addr).await {
-                                                Ok(ic) => {
-                                                    tracing::info!(
-                                                        "Eager connect to {addr} succeeded"
-                                                    );
-                                                    let _ = connected_tx.send(ic);
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!(
-                                                        "Eager connect to {addr} failed: {e}"
-                                                    );
-                                                }
-                                            }
-                                            connecting_clone.lock().await.remove(&addr);
-                                        });
+                                        lock.insert(endpoint_id);
                                     }
+
+                                    let transport_clone = Arc::clone(&transport);
+                                    let connecting_clone = Arc::clone(&connecting);
+                                    let connected_tx = connected_tx.clone();
+                                    tokio::spawn(async move {
+                                        match transport_clone.connect(endpoint_addr).await {
+                                            Ok(ic) => {
+                                                tracing::info!(
+                                                    "Eager connect to {endpoint_id} succeeded"
+                                                );
+                                                let _ = connected_tx.send(ic);
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    "Eager connect to {endpoint_id} failed: {e}"
+                                                );
+                                            }
+                                        }
+                                        connecting_clone.lock().await.remove(&endpoint_id);
+                                    });
                                 }
                             }
                         }
@@ -792,8 +819,8 @@ async fn handle_new_connection(
 /// distinctive, while ControlMessages have different structure.
 async fn handle_incoming_stream(
     receptionist: Receptionist,
-    send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     control_tx: mpsc::UnboundedSender<(String, ControlMessage)>,
     node_id: String,
 ) {
@@ -837,8 +864,8 @@ async fn handle_incoming_stream(
 /// Handle an actor stream where StreamInit has already been consumed.
 async fn handle_actor_stream_after_init(
     receptionist: Receptionist,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     mut codec: framing::FrameCodec,
     actor_label: &str,
 ) {
@@ -886,7 +913,7 @@ async fn handle_actor_stream_after_init(
 /// response, and write it back. Returns false if the stream should be closed.
 async fn dispatch_and_respond(
     dispatch_tx: &mpsc::UnboundedSender<DispatchRequest>,
-    send: &mut quinn::SendStream,
+    send: &mut iroh::endpoint::SendStream,
     frame: &[u8],
     actor_label: &str,
 ) -> bool {
@@ -1066,6 +1093,10 @@ mod tests {
     fn test_config(name: &str) -> ClusterConfig {
         ClusterConfigBuilder::new()
             .name(name)
+            // Each test node needs its OWN identity. Without an explicit key the
+            // builder loads a shared default key file, so every node would get
+            // the same endpoint id and the cluster couldn't tell them apart.
+            .secret_key(iroh::SecretKey::generate())
             .listen("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
             .cookie("test-cookie")
             .discovery(Discovery::None)
@@ -1073,12 +1104,24 @@ mod tests {
             .unwrap()
     }
 
-    fn test_config_with_seed(name: &str, seed: std::net::SocketAddr) -> ClusterConfig {
+    fn test_config_with_seed(
+        name: &str,
+        seed_id: iroh::EndpointId,
+        seed: std::net::SocketAddr,
+    ) -> ClusterConfig {
+        // Build the seed as a full iroh EndpointAddr: the seed node's real,
+        // cryptographically-authenticated endpoint id (so the dial actually
+        // resolves to it) plus its real OS-assigned bound address. We must use
+        // the seed system's true endpoint id here — these are live connectivity
+        // tests that assert the nodes actually connect — not a derived test key.
+        let seed_addr = iroh::EndpointAddr::from_parts(seed_id, [iroh::TransportAddr::Ip(seed)]);
         ClusterConfigBuilder::new()
             .name(name)
+            // Distinct per-node identity (see `test_config`).
+            .secret_key(iroh::SecretKey::generate())
             .listen("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
             .cookie("test-cookie")
-            .seed_nodes([seed])
+            .seed_nodes([seed_addr])
             .build()
             .unwrap()
     }
@@ -1121,7 +1164,7 @@ mod tests {
         let addr_a = system_a.local_addr();
 
         // Node B uses A as a seed
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1163,7 +1206,7 @@ mod tests {
         assert_eq!(result, 5);
 
         // Start node B with A as seed
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1204,7 +1247,7 @@ mod tests {
 
         system_a.start_actor("counter/a", TestCounter, TestCounterState { count: 100 });
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1257,7 +1300,7 @@ mod tests {
             TestCounterState { count: 42 },
         );
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1314,7 +1357,7 @@ mod tests {
             TestCounterState { count: 77 },
         );
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1366,7 +1409,7 @@ mod tests {
             TestCounterState { count: 10 },
         );
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1390,7 +1433,7 @@ mod tests {
         .await;
 
         // Now start a NEW node A and connect it to B (rejoin)
-        let config_a2 = test_config_with_seed("node-a-2", addr_b);
+        let config_a2 = test_config_with_seed("node-a-2", system_b.identity().endpoint_id, addr_b);
         let system_a2 = ClusterSystem::start(config_a2, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1524,7 +1567,7 @@ mod tests {
         system_a.start_actor("counter/r2", TestCounter, TestCounterState { count: 0 });
 
         // Node B: connect to A as seed
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1597,7 +1640,7 @@ mod tests {
         );
 
         // Node B: start "ref-receiver/main" (RefReceiver)
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b =
             ClusterSystem::start(config_b, extended_type_registry(), SpawnRegistry::new())
                 .await
@@ -1666,7 +1709,7 @@ mod tests {
         system_a.start_actor("counter/on-a", TestCounter, TestCounterState { count: 10 });
 
         // Node B: seed = A, start "counter/on-b"
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id, addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1700,7 +1743,7 @@ mod tests {
         assert_eq!(count, 20, "A reads B's counter directly");
 
         // Node C: seed = B only (no direct connection to A)
-        let config_c = test_config_with_seed("node-c", addr_b);
+        let config_c = test_config_with_seed("node-c", system_b.identity().endpoint_id, addr_b);
         let system_c = ClusterSystem::start(config_c, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();

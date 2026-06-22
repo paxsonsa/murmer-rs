@@ -111,7 +111,7 @@ pub async fn run_actor_stream_writer(
 /// When the stream closes or errors, any remaining pending responses are
 /// failed so callers don't hang.
 async fn read_responses(
-    mut recv: quinn::RecvStream,
+    mut recv: iroh::endpoint::RecvStream,
     response_registry: ResponseRegistry,
     actor_label: String,
 ) {
@@ -164,8 +164,8 @@ async fn read_responses(
 /// 3. Reads RemoteInvocations, dispatches to the actor, sends responses back
 pub async fn handle_actor_stream(
     receptionist: Receptionist,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
 ) {
     let mut codec = FrameCodec::new();
     let mut buf = vec![0u8; 8192];

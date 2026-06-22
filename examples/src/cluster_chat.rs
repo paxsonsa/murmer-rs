@@ -116,12 +116,10 @@ impl ChatRoom {
 // INTERACTIVE COMMAND LOOP — works the same in local and clustered modes
 // =============================================================================
 
-/// Run the interactive command loop against a System.
-///
-/// This function doesn't know or care whether the system is local or
-/// clustered. It uses the same `System` API either way.
-async fn run_interactive(system: &System, default_rooms: &[&str]) {
-    // Create default rooms
+/// Start one `ChatRoom` actor per name. Registering these actors is what gives
+/// the cluster something to replicate, which in turn drives transitive discovery
+/// (so every node connects to every other, not just to the seed).
+fn start_default_rooms(system: &System, default_rooms: &[&str]) {
     for room_name in default_rooms {
         let label = format!("room/{room_name}");
         system.start(
@@ -134,6 +132,14 @@ async fn run_interactive(system: &System, default_rooms: &[&str]) {
         );
         println!("  Started room: #{room_name}");
     }
+}
+
+/// Run the interactive command loop against a System.
+///
+/// This function doesn't know or care whether the system is local or
+/// clustered. It uses the same `System` API either way.
+async fn run_interactive(system: &System, default_rooms: &[&str]) {
+    start_default_rooms(system, default_rooms);
 
     println!("\nType 'help' for available commands.\n");
 
@@ -281,6 +287,15 @@ async fn run_interactive(system: &System, default_rooms: &[&str]) {
 
 #[tokio::main]
 async fn main() {
+    // Show cluster activity (connections, membership). Tune with RUST_LOG,
+    // e.g. RUST_LOG=murmer::cluster=debug. Defaults to murmer at info.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "murmer=info".into()),
+        )
+        .init();
+
     let args: Vec<String> = env::args().collect();
 
     if args.iter().any(|a| a == "--local") {
@@ -313,16 +328,19 @@ async fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(7100);
 
-        let seed: Option<SocketAddr> = args
+        // A seed is now an iroh endpoint: `<endpoint-id>@<host:port>`. iroh dials
+        // by cryptographic key, so the bare address is no longer enough. Run a
+        // seed node first and copy the `seed: <id>@<addr>` line it prints.
+        let seed: Option<iroh::EndpointAddr> = args
             .iter()
             .position(|a| a == "--seed")
             .and_then(|i| args.get(i + 1))
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| parse_seed(s));
 
-        let discovery = match seed {
+        let discovery = match &seed {
             Some(addr) => {
-                println!("Joining cluster via seed: {addr}");
-                Discovery::SeedNodes(vec![addr])
+                println!("Joining cluster via seed: {}@{:?}", addr.id, addr);
+                Discovery::SeedNodes(vec![addr.clone()])
             }
             None => {
                 println!("Starting as seed node (no peers yet)");
@@ -330,10 +348,31 @@ async fn main() {
             }
         };
 
+        // Persist a distinct key per node so its endpoint id is stable across
+        // restarts. `--key <path>` overrides the default `<node-name>.key` (used
+        // by the Docker compose setup to mount per-node keys).
+        let key_path = args
+            .iter()
+            .position(|a| a == "--key")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| format!("{node_name}.key"));
+
+        // The address other nodes use to reach this one. Defaults to loopback for
+        // single-host demos; `--advertise <host:port>` sets a routable address
+        // (the Docker entrypoint passes the container's IP so the nodes mesh).
+        let advertise = args
+            .iter()
+            .position(|a| a == "--advertise")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| resolve_addr(s))
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
+
         let config = ClusterConfig::builder()
             .name(&node_name)
+            .key_path(key_path)
             .listen(SocketAddr::from(([0, 0, 0, 0], port)))
-            .advertise(SocketAddr::from(([127, 0, 0, 1], port)))
+            .advertise(advertise)
             .cookie("chat-example-secret")
             .discovery(discovery)
             .build()
@@ -345,9 +384,49 @@ async fn main() {
             .await
             .expect("failed to start cluster");
 
-        // In cluster mode, each node hosts one room named after itself
-        run_interactive(&system, &[&node_name]).await;
+        // Print this node's seed line so other nodes can join via `--seed`.
+        if let (Some(id), Some(addr)) = (system.endpoint_id(), system.local_addr()) {
+            println!(
+                "seed: {id}@127.0.0.1:{}  (pass to another node with --seed)",
+                addr.port()
+            );
+        }
+
+        // In cluster mode, each node hosts one room named after itself.
+        // When attached to a terminal, run the interactive loop. Otherwise
+        // (e.g. under Docker, where there is no stdin) stay up and serve until
+        // the process is terminated, so the node keeps meshing.
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() {
+            run_interactive(&system, &[&node_name]).await;
+        } else {
+            // Headless (e.g. Docker): still host this node's room so the cluster
+            // has actors to replicate, then stay up until terminated.
+            start_default_rooms(&system, &[&node_name]);
+            println!("running headless ({node_name}); send SIGINT/SIGTERM to stop");
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
+}
+
+/// Parse a `--seed` argument of the form `<endpoint-id>@<host:port>` into an
+/// iroh [`EndpointAddr`]. iroh dials by key, so both parts are required. The
+/// host may be an IP or a DNS name (e.g. a Docker service name like `alpha`).
+fn parse_seed(s: &str) -> Option<iroh::EndpointAddr> {
+    let (id_str, addr_str) = s.split_once('@')?;
+    let id: iroh::EndpointId = id_str.parse().ok()?;
+    let addr = resolve_addr(addr_str)?;
+    Some(iroh::EndpointAddr::from_parts(
+        id,
+        [iroh::TransportAddr::Ip(addr)],
+    ))
+}
+
+/// Resolve a `host:port` string to a `SocketAddr`, accepting both literal IPs
+/// and DNS names (via the system resolver).
+fn resolve_addr(s: &str) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    s.to_socket_addrs().ok()?.next()
 }
 
 // =============================================================================
