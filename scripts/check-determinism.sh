@@ -47,6 +47,8 @@ CORE=(
   listing.rs
   lifecycle.rs
   oplog.rs
+  router.rs
+  app/coordinator.rs
 )
 
 # Tokens that reintroduce nondeterminism if used outside the Runtime seam:
@@ -88,6 +90,8 @@ fi
 echo "✓ determinism gate: clean across ${#CORE[@]} core modules."
 
 # Informational: the not-yet-routed surface, so it stays visible and shrinks.
-deferred=$(rg -n -e "$BANNED" "$SRC/router.rs" "$SRC/app" 2>/dev/null \
+deferred=$(rg -n -e "$BANNED" "$SRC/app/bridge.rs" "$SRC/app/spawn_sender.rs" "$SRC/app/placement.rs" 2>/dev/null \
   | rg -v 'determinism-gate: allow' | rg -v '^\s*//' | wc -l | tr -d ' ')
-echo "  ($deferred Tokio/RNG sites remain in deferred modules: router.rs, app/* — tracked follow-ups)"
+echo "  ($deferred Tokio/RNG sites remain in deferred modules — app/bridge.rs +"
+echo "   app/spawn_sender.rs are cluster-path (need a live ClusterSystem, not the"
+echo "   local sim path); app/placement.rs RandomPlacement needs a seeded strategy.)"

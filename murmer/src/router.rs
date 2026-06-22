@@ -25,6 +25,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -32,6 +33,7 @@ use crate::actor::{Actor, Handler, RemoteMessage};
 use crate::endpoint::Endpoint;
 use crate::listing::{ListingEvent, ReceptionKey, WatchedListing};
 use crate::receptionist::Receptionist;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::wire::SendError;
 
 /// Strategy for how a Router distributes messages across its endpoints.
@@ -50,14 +52,31 @@ pub struct Router<A: Actor> {
     endpoints: Vec<Endpoint<A>>,
     strategy: RoutingStrategy,
     counter: AtomicUsize,
+    /// Runtime seam for Random selection, timers, and spawns — so a router can
+    /// run deterministically under the sim runtime.
+    runtime: Arc<dyn Runtime>,
 }
 
 impl<A: Actor + 'static> Router<A> {
+    /// Create a router on the default (Tokio) runtime. For a deterministic sim,
+    /// use [`with_runtime`](Self::with_runtime) and pass the sim runtime.
     pub fn new(endpoints: Vec<Endpoint<A>>, strategy: RoutingStrategy) -> Self {
+        Self::with_runtime(endpoints, strategy, Arc::new(TokioRuntime))
+    }
+
+    /// Create a router on a specific runtime (e.g. a `SimWorld`'s runtime), so
+    /// Random selection, `scatter_gather` timeouts, and `fan_out` spawns are
+    /// deterministic.
+    pub fn with_runtime(
+        endpoints: Vec<Endpoint<A>>,
+        strategy: RoutingStrategy,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
         Self {
             endpoints,
             strategy,
             counter: AtomicUsize::new(0),
+            runtime,
         }
     }
 
@@ -78,8 +97,7 @@ impl<A: Actor + 'static> Router<A> {
                 self.endpoints[idx].send(msg).await
             }
             RoutingStrategy::Random => {
-                use rand::Rng;
-                let idx = rand::rng().random_range(0..self.endpoints.len());
+                let idx = (self.runtime.rng_u64() % self.endpoints.len() as u64) as usize;
                 self.endpoints[idx].send(msg).await
             }
             RoutingStrategy::Broadcast => {
@@ -123,27 +141,28 @@ impl<A: Actor + 'static> Router<A> {
             return vec![Err(SendError::MailboxClosed)];
         }
 
-        let mut join_set = tokio::task::JoinSet::new();
+        // FuturesUnordered (not JoinSet): polls all sends concurrently within
+        // this task without spawning, so it runs under any executor including
+        // the deterministic sim runtime.
+        let mut inflight = FuturesUnordered::new();
         for ep in &self.endpoints {
             let ep = ep.clone();
             let msg = msg.clone();
-            join_set.spawn(async move { ep.send(msg).await });
+            inflight.push(async move { ep.send(msg).await });
         }
 
         let target = k.min(self.endpoints.len());
         let mut results = Vec::with_capacity(target);
         let mut successes = 0;
 
-        while let Some(join_result) = join_set.join_next().await {
-            let result = join_result.unwrap_or(Err(SendError::ResponseDropped));
+        while let Some(result) = inflight.next().await {
             if result.is_ok() {
                 successes += 1;
             }
             results.push(result);
 
             if successes >= target {
-                // Quorum reached — abort remaining tasks
-                join_set.abort_all();
+                // Quorum reached — drop the rest (cancels remaining sends).
                 break;
             }
         }
@@ -170,27 +189,29 @@ impl<A: Actor + 'static> Router<A> {
             return vec![Err(SendError::MailboxClosed)];
         }
 
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut inflight = FuturesUnordered::new();
         for ep in &self.endpoints {
             let ep = ep.clone();
             let msg = msg.clone();
-            join_set.spawn(async move { ep.send(msg).await });
+            inflight.push(async move { ep.send(msg).await });
         }
 
         let mut results = Vec::with_capacity(self.endpoints.len());
-        let deadline = tokio::time::Instant::now() + timeout;
+        // Timer on the runtime seam (virtual time under sim). Created once so the
+        // deadline is stable across loop iterations.
+        let mut timeout_fut = self.runtime.sleep(timeout);
 
         loop {
             tokio::select! {
-                Some(join_result) = join_set.join_next() => {
-                    results.push(join_result.unwrap_or(Err(SendError::ResponseDropped)));
+                biased;
+                Some(result) = inflight.next() => {
+                    results.push(result);
                     if results.len() == self.endpoints.len() {
                         break;
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => {
-                    join_set.abort_all();
-                    break;
+                _ = &mut timeout_fut => {
+                    break; // dropping `inflight` cancels remaining sends
                 }
             }
         }
@@ -212,18 +233,18 @@ impl<A: Actor + 'static> Router<A> {
             return Err(SendError::MailboxClosed);
         }
 
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut inflight = FuturesUnordered::new();
         for ep in &self.endpoints {
             let ep = ep.clone();
             let msg = msg.clone();
-            join_set.spawn(async move { ep.send(msg).await });
+            inflight.push(async move { ep.send(msg).await });
         }
 
         let mut last_error = SendError::MailboxClosed;
-        while let Some(join_result) = join_set.join_next().await {
-            match join_result.unwrap_or(Err(SendError::ResponseDropped)) {
+        while let Some(result) = inflight.next().await {
+            match result {
                 Ok(result) => {
-                    join_set.abort_all();
+                    // First success — drop the rest (cancels remaining sends).
                     return Ok(result);
                 }
                 Err(e) => last_error = e,
@@ -246,9 +267,9 @@ impl<A: Actor + 'static> Router<A> {
         for ep in &self.endpoints {
             let ep = ep.clone();
             let msg = msg.clone();
-            tokio::spawn(async move {
+            self.runtime.spawn(Box::pin(async move {
                 let _ = ep.send(msg).await;
-            });
+            }));
         }
     }
 
@@ -297,32 +318,46 @@ pub struct PoolRouter<A: Actor> {
     pool: Pool<A>,
     strategy: RoutingStrategy,
     counter: AtomicUsize,
+    runtime: Arc<dyn Runtime>,
 }
 
 impl<A: Actor + 'static> PoolRouter<A> {
     /// Create a reactive pool router that tracks all actors checked in with the
-    /// given key. Spawns a background task to consume the watched listing.
+    /// given key. Runs a background task (on the receptionist's runtime) to
+    /// consume the watched listing — so under a sim runtime the pool updates
+    /// deterministically.
     pub fn new(
         receptionist: &Receptionist,
         key: ReceptionKey<A>,
         strategy: RoutingStrategy,
     ) -> Self {
         let watched = receptionist.watched_listing(key);
-        Self::from_watched_listing(watched, strategy)
+        Self::build(watched, strategy, receptionist.runtime().clone())
     }
 
-    /// Create a pool router from an already-obtained watched listing.
+    /// Create a pool router from an already-obtained watched listing, on the
+    /// default (Tokio) runtime. Prefer [`new`](Self::new) for sim — it picks up
+    /// the receptionist's runtime automatically.
     pub fn from_watched_listing(watched: WatchedListing<A>, strategy: RoutingStrategy) -> Self {
+        Self::build(watched, strategy, Arc::new(TokioRuntime))
+    }
+
+    fn build(
+        watched: WatchedListing<A>,
+        strategy: RoutingStrategy,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
         let pool: Pool<A> = Arc::new(RwLock::new(Vec::new()));
 
-        // Spawn background task to consume the watched listing
+        // Background task to consume the watched listing, on the runtime seam.
         let pool_clone = Arc::clone(&pool);
-        tokio::spawn(Self::run_watcher(pool_clone, watched));
+        runtime.spawn(Box::pin(Self::run_watcher(pool_clone, watched)));
 
         Self {
             pool,
             strategy,
             counter: AtomicUsize::new(0),
+            runtime,
         }
     }
 
@@ -362,8 +397,7 @@ impl<A: Actor + 'static> PoolRouter<A> {
                     self.counter.fetch_add(1, Ordering::Relaxed) % pool.len()
                 }
                 RoutingStrategy::Random => {
-                    use rand::Rng;
-                    rand::rng().random_range(0..pool.len())
+                    (self.runtime.rng_u64() % pool.len() as u64) as usize
                 }
                 RoutingStrategy::Broadcast => 0,
             };
@@ -386,15 +420,15 @@ impl<A: Actor + 'static> PoolRouter<A> {
             pool.iter().map(|(_, ep)| ep.clone()).collect()
         };
 
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut inflight = FuturesUnordered::new();
         for ep in endpoints {
             let msg = msg.clone();
-            join_set.spawn(async move { ep.send(msg).await });
+            inflight.push(async move { ep.send(msg).await });
         }
 
         let mut results = Vec::new();
-        while let Some(join_result) = join_set.join_next().await {
-            results.push(join_result.unwrap_or(Err(SendError::ResponseDropped)));
+        while let Some(result) = inflight.next().await {
+            results.push(result);
         }
         results
     }

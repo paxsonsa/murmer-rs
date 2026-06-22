@@ -555,11 +555,13 @@ impl Coordinator {
         state.cluster_view.mark_failed(&msg.node_id);
         let timers = state.handle_node_departure(&msg.node_id, false);
 
-        // Spawn timeout tasks for WaitForReturn specs
+        // Spawn timeout tasks for WaitForReturn specs (on the runtime seam, so
+        // the timeout fires on virtual time under a sim runtime).
         for (label, duration) in timers {
             let endpoint = ctx.endpoint();
-            tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
+            let runtime = ctx.receptionist().runtime().clone();
+            ctx.spawn(async move {
+                runtime.sleep(duration).await;
                 let _ = endpoint.send(WaitForReturnTimeout { label }).await;
             });
         }
@@ -1143,8 +1145,9 @@ impl CoordinatorState {
         if let Some(duration) = drain_timeout {
             let endpoint = ctx.endpoint();
             let label = label.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
+            let runtime = ctx.receptionist().runtime().clone();
+            ctx.spawn(async move {
+                runtime.sleep(duration).await;
                 let _ = endpoint
                     .send(SingletonDrainTimeout {
                         label,

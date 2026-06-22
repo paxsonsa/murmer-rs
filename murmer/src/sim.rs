@@ -619,6 +619,39 @@ mod tests {
     }
 
     #[test]
+    fn pool_router_fills_deterministically_under_sim() {
+        let mut world = SimWorld::new(5);
+        let key = ReceptionKey::<Counter>::new("pool");
+        let mut kept = Vec::new();
+        for label in ["p/charlie", "p/alpha", "p/bravo"] {
+            let ep = world
+                .system()
+                .start(label, Counter, CounterState::default());
+            world.system().check_in(label, key.clone());
+            kept.push(ep);
+        }
+
+        // PoolRouter spawns its membership watcher on the receptionist's runtime.
+        // Before routing was on the seam this called tokio::spawn directly and
+        // would panic under sim (no tokio runtime). Now it runs on the sim
+        // runtime; pump so the watcher drains the backfill into the pool.
+        let router = PoolRouter::new(
+            world.system().receptionist(),
+            key,
+            RoutingStrategy::RoundRobin,
+        );
+        world.pump();
+
+        assert_eq!(router.len(), 3, "watcher ran under sim and filled the pool");
+        assert_eq!(
+            router.labels(),
+            vec!["p/alpha", "p/bravo", "p/charlie"],
+            "pool order is deterministic (sorted by label, not hash-random)"
+        );
+        let _ = kept;
+    }
+
+    #[test]
     fn same_seed_same_rng_sequence() {
         let a = SimWorld::new(42);
         let b = SimWorld::new(42);
