@@ -60,7 +60,7 @@ where
                 match msg {
                     Some(envelope) => {
                         #[cfg(feature = "monitor")]
-                        let start = std::time::Instant::now();
+                        let start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (measurement, not control flow)
 
                         let fut = envelope.handle(&ctx, &mut actor, &mut state);
                         let result = AssertUnwindSafe(fut).catch_unwind().await;
@@ -86,7 +86,7 @@ where
                 match req {
                     Some(request) => {
                         #[cfg(feature = "monitor")]
-                        let start = std::time::Instant::now();
+                        let start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (measurement, not control flow)
 
                         let fut = actor.dispatch_remote(
                             &ctx,

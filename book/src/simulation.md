@@ -110,14 +110,21 @@ non-network bugs live.
 Scheduling order within a tick is plain FIFO today. A pluggable order policy,
 for exploring adversarial interleavings, is a planned addition.
 
-Determinism today covers scheduling, virtual time, and the seeded RNG. One thing
-it does not yet cover: logic whose result depends on the iteration order of an
-internal `HashMap` or `HashSet`. Rust seeds those hashers from process entropy
-per instance, which the runtime does not control, so a decision driven by
-iteration order is not reproducible yet. Routing those collections through a
-fixed-seed hasher, with a lint to keep them out of decision paths, is the next
-step. Lookups by key, message order, timers, and `rng_u64` are all
-reproducible now.
+Determinism covers scheduling, virtual time, the seeded RNG, and the iteration
+order of the registries that drive decisions. Those registries (the
+receptionist's actor table, placement and coordinator maps) are `BTreeMap`s, so
+they iterate in sorted key order instead of the per-process-random order a
+`HashMap` would give. A check script, `scripts/check-determinism.sh`, keeps
+Tokio and unseeded-RNG calls off the core path so the guarantee does not quietly
+erode.
+
+The real boundary right now is which features are wired to the runtime seam. The
+basic actor path is: start and prepare, send and reply, `ctx.spawn`,
+`schedule_once`/`schedule_repeat`, and restart. Two higher-level features are not
+sim-ready yet: `PoolRouter`/`Router` and the `app` orchestration actors (the
+Coordinator's drain and timeout loops). They still spawn on Tokio directly, so
+they would panic under `SimWorld`. Routing them through the seam is the next
+step, tracked in the check script's deferred list.
 
 ## How it fits together
 

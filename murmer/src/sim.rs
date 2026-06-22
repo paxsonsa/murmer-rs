@@ -26,14 +26,20 @@
 //! next event"). v1 scheduling is plain FIFO; a pluggable ready-order policy
 //! (for adversarial interleaving / buggify) is a deliberate later seam.
 //!
-//! **Scope of determinism today:** task scheduling, virtual-time timers, and the
-//! seeded RNG are reproducible. What is *not* yet pinned is logic whose outcome
-//! depends on the iteration order of internal `HashMap`/`HashSet`s (e.g. some
-//! receptionist/listing paths): `std`'s `RandomState` seeds those per-instance
-//! from process entropy, outside this runtime's control. Routing decision-path
-//! collections through a fixed-seed hasher (plus a CI gate) is the planned
-//! follow-up. So: scheduling/time/randomness replay exactly; iteration-order
-//! dependent decisions do not yet.
+//! **Scope of determinism today:** task scheduling, virtual-time timers, the
+//! seeded RNG, and decision-path collection iteration order are all
+//! reproducible. The decision-bearing registries (receptionist `entries`,
+//! placement/coordinator maps) are `BTreeMap`s, so iteration is sorted-by-key
+//! rather than `HashMap`'s per-process-random order, and a CI gate
+//! (`scripts/check-determinism.sh`) keeps Tokio/RNG escape hatches off the core
+//! local path.
+//!
+//! The remaining boundary is *feature coverage*, not nondeterminism: the basic
+//! actor path (start/prepare, send/reply, `ctx.spawn`, `schedule_*`, restart)
+//! is fully on the runtime seam. Higher-level features — `PoolRouter`/`Router`
+//! and the `app` orchestration actors (Coordinator drain/timeout loops) — still
+//! spawn on Tokio directly, so they are not sim-ready yet (they would panic
+//! under `SimWorld`). Routing them is a tracked follow-up.
 //!
 //! # Example
 //!
@@ -509,9 +515,8 @@ mod tests {
     #[test]
     fn replay_is_stable_across_runs() {
         // Replay covers what SimWorld controls: task scheduling, virtual-time
-        // timer firing, and the seeded RNG stream. (It does not yet exercise
-        // logic that depends on internal collection iteration order — that is
-        // the pending iteration-discipline pass; see the module/book docs.)
+        // timer firing, and the seeded RNG stream. (Iteration-order determinism
+        // is covered separately by `listing_backfill_order_is_deterministic`.)
         // Same seed → identical observable outcome across independent runs.
         fn run(seed: u64) -> (i64, i64) {
             let mut world = SimWorld::new(seed);
@@ -531,6 +536,65 @@ mod tests {
         }
 
         assert_eq!(run(99), run(99), "same seed must replay identically");
+    }
+
+    #[test]
+    fn listing_backfill_order_is_deterministic() {
+        // The receptionist registry is a BTreeMap, so listing() backfill emits
+        // matching actors in sorted-label order. Before that fix the order came
+        // from HashMap memory layout (random per process) and a deterministic
+        // runtime could not pin it. This is the multi-actor iteration-order case
+        // the single-actor replay test cannot exercise.
+        fn collect_counts(seed: u64) -> Vec<i64> {
+            let mut world = SimWorld::new(seed);
+            let key = ReceptionKey::<Counter>::new("workers");
+
+            // Insert in scrambled label order; the count encodes sorted position
+            // (alpha=1, bravo=2, charlie=3), so a correct sorted backfill yields
+            // [1, 2, 3] regardless of insertion or hash order.
+            let mut kept = Vec::new();
+            for (label, count) in [("w/charlie", 3), ("w/alpha", 1), ("w/bravo", 2)] {
+                let ep = world.system().start(
+                    label,
+                    Counter,
+                    CounterState {
+                        count,
+                        ..Default::default()
+                    },
+                );
+                world.system().check_in(label, key.clone());
+                kept.push(ep); // keep endpoints alive for the duration
+            }
+
+            // Backfill is enqueued synchronously when the listing is created.
+            let mut listing = world.system().listing(key);
+            let mut eps = Vec::new();
+            while let Some(ep) = listing.try_next() {
+                eps.push(ep);
+            }
+
+            let counts = eps
+                .iter()
+                .map(|ep| {
+                    let ep = ep.clone();
+                    world.block_on(async move { ep.send(Get).await.unwrap() })
+                })
+                .collect();
+            let _ = kept;
+            counts
+        }
+
+        let a = collect_counts(1);
+        let b = collect_counts(2);
+        assert_eq!(
+            a,
+            vec![1, 2, 3],
+            "backfill must follow sorted label order (alpha, bravo, charlie)"
+        );
+        assert_eq!(
+            a, b,
+            "backfill order is identical across seeds — it is deterministic, not hash-random"
+        );
     }
 
     #[test]

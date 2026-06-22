@@ -8,7 +8,7 @@
 //! [`NodeInfo`] describes a single node: its identity, class, metadata,
 //! and what actors it's currently running.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::cluster::config::{NodeClass, NodeIdentity};
 
@@ -72,7 +72,12 @@ impl NodeInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ClusterView {
     /// All known nodes, keyed by node_id_string().
-    pub nodes: HashMap<String, NodeInfo>,
+    ///
+    /// BTreeMap (not HashMap): placement's tie-break in `select_node` is
+    /// first-encountered-wins over `alive_nodes()`, so iteration order decides
+    /// which node wins a fitness tie. Sorted-by-key iteration makes that choice
+    /// deterministic under simulation. Key is `String: Ord`.
+    pub nodes: BTreeMap<String, NodeInfo>,
     /// Reverse index: actor label → node_id for O(1) lookups.
     actor_locations: HashMap<String, String>,
 }

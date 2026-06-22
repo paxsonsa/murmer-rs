@@ -20,12 +20,11 @@
 //! This design means the receptionist never needs to be generic over actor types.
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -254,7 +253,11 @@ struct PendingListingNotification {
 
 struct ReceptionistInner {
     config: ReceptionistConfig,
-    entries: Mutex<HashMap<String, ActorEntry>>,
+    // BTreeMap (not HashMap): iteration order over entries is observable — the
+    // listing()/watched_listing() backfill loops emit endpoints into the listing
+    // channel in iteration order, which a deterministic sim must reproduce.
+    // Keyed by label (String: Ord), so by-key access is unchanged.
+    entries: Mutex<BTreeMap<String, ActorEntry>>,
     event_subscribers: Mutex<Vec<mpsc::UnboundedSender<ActorEvent>>>,
     listing_subscribers: Mutex<Vec<Box<dyn ErasedListingSender>>>,
     watched_listing_subscribers: Mutex<Vec<Box<dyn ErasedWatchedListingSender>>>,
@@ -327,7 +330,7 @@ impl Receptionist {
         let receptionist = Self {
             inner: Arc::new(ReceptionistInner {
                 config,
-                entries: Mutex::new(HashMap::new()),
+                entries: Mutex::new(BTreeMap::new()),
                 event_subscribers: Mutex::new(Vec::new()),
                 listing_subscribers: Mutex::new(Vec::new()),
                 watched_listing_subscribers: Mutex::new(Vec::new()),
@@ -789,7 +792,10 @@ impl Receptionist {
         let runtime = self.inner.runtime.clone();
 
         self.inner.runtime.spawn(Box::pin(async move {
-            let mut restart_times: VecDeque<Instant> = VecDeque::new();
+            // Virtual time from the runtime seam (Duration since start), not
+            // wall-clock Instant — so restart-rate limiting is deterministic
+            // under simulation.
+            let mut restart_times: VecDeque<Duration> = VecDeque::new();
             let mut backoff_duration = config.backoff.initial;
 
             // First run uses the actor/state/channels created above
@@ -816,10 +822,10 @@ impl Receptionist {
             // Restart loop with limits and backoff
             loop {
                 // Prune timestamps outside the rolling window
-                let now = Instant::now();
+                let now = runtime.now();
                 while restart_times
                     .front()
-                    .is_some_and(|t| now.duration_since(*t) > config.window)
+                    .is_some_and(|t| now.saturating_sub(*t) > config.window)
                 {
                     restart_times.pop_front();
                 }
@@ -1542,8 +1548,11 @@ impl Receptionist {
             let key_ids = key_ids.to_vec();
 
             let label_for_insert = label_owned.clone();
-            let handle = tokio::spawn(async move {
-                tokio::time::sleep(window).await;
+            // Blip debounce is gated on blip_window (cluster config), off the
+            // default single-node sim path. Routing it through the runtime seam
+            // is a tracked follow-up.
+            let handle = tokio::spawn(async move { // determinism-gate: allow — blip debounce
+                tokio::time::sleep(window).await; // determinism-gate: allow — blip debounce
 
                 // If the actor is still registered after the window, commit the op
                 let still_exists = receptionist

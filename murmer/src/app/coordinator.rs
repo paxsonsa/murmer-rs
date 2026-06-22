@@ -27,7 +27,10 @@
 //! }).await?;
 //! ```
 
-use std::collections::HashMap;
+// BTreeMap for the label-keyed maps whose iteration order is observable
+// (redrive/respawn emit order + request_id assignment); HashMap stays for the
+// request_id-keyed, by-key-only pending_spawns. See the determinism audit.
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,7 +63,7 @@ pub struct CoordinatorState {
     /// Snapshot of the cluster topology.
     pub cluster_view: ClusterView,
     /// All submitted actor specs, keyed by label.
-    pub specs: HashMap<String, ActorSpec>,
+    pub specs: BTreeMap<String, ActorSpec>,
     /// Placement strategy for deciding which node gets which actor.
     pub placement_strategy: Box<dyn PlacementStrategy>,
     /// Leader election algorithm.
@@ -70,9 +73,9 @@ pub struct CoordinatorState {
     /// Pending spawn requests awaiting acks, keyed by request_id.
     pub pending_spawns: HashMap<u64, PendingSpawn>,
     /// Specs waiting for a failed node to return, keyed by label.
-    pub waiting_for_return: HashMap<String, WaitingSpec>,
+    pub waiting_for_return: BTreeMap<String, WaitingSpec>,
     /// Cluster singletons being managed, keyed by singleton label.
-    pub singletons: HashMap<String, SingletonRuntime>,
+    pub singletons: BTreeMap<String, SingletonRuntime>,
     /// Pluggable authority that mints `(term, seq)` generations for singletons.
     /// Defaults to an in-RAM source (single-node/tests); inject a durable one
     /// (e.g. catalog-backed) for multi-node write deployments.
@@ -945,13 +948,13 @@ impl CoordinatorState {
     ) -> Self {
         Self {
             cluster_view: ClusterView::new(),
-            specs: HashMap::new(),
+            specs: BTreeMap::new(),
             placement_strategy,
             election,
             local_node_id: local_node_id.into(),
             pending_spawns: HashMap::new(),
-            waiting_for_return: HashMap::new(),
-            singletons: HashMap::new(),
+            waiting_for_return: BTreeMap::new(),
+            singletons: BTreeMap::new(),
             generation_source: Arc::new(CoordinatorGenerationSource::new()),
             next_request_id: 0,
             spawn_sender: None,
