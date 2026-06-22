@@ -376,4 +376,51 @@ mod tests {
         }
         assert_eq!(order, vec![2, 3, 1], "earliest deadline first");
     }
+
+    /// The linchpin of the pump-only multi-node convergence proof: foca emits
+    /// `MemberUp` **synchronously** during `apply_many` (it takes `&mut runtime`
+    /// precisely so it can `notify` inline). There is no `announce` call anywhere
+    /// in the cluster — production learns a peer exactly this way, on each
+    /// handshake — so a node's `NodeJoined` needs no timer or gossip round to
+    /// fire. This is why the 3-node `MemberUp` simulation converges on `pump()`
+    /// alone, without advancing the virtual clock (which would instead start the
+    /// failure detector — Phase 3 territory).
+    #[cfg(feature = "sim")]
+    #[test]
+    fn apply_many_emits_member_up_synchronously_under_sim() {
+        use crate::cluster::net::NodeId;
+        use crate::sim::SimRuntime;
+
+        let rt: Arc<dyn SeamRuntime> = Arc::new(SimRuntime::new(1));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let local =
+            NodeIdentity::new_seeded("local", NodeId("local-id".into()), "127.0.0.1", 7001, 1);
+        let mut membership =
+            ClusterMembership::new(local.clone(), event_tx.clone(), rt.derive_seed("foca-prng"));
+
+        let (swim_tx, _swim_rx) = mpsc::unbounded_channel();
+        let (timer_tx, _timer_rx) = mpsc::unbounded_channel();
+        let timer_cmd_tx = spawn_timer_manager(Arc::clone(&rt), timer_tx);
+        let mut foca_rt = FocaRuntime::new(local, event_tx, swim_tx, timer_cmd_tx);
+
+        let other =
+            NodeIdentity::new_seeded("other", NodeId("other-id".into()), "127.0.0.1", 7002, 1);
+        membership
+            .foca
+            .apply_many(
+                std::iter::once(foca::Member::alive(other.clone())),
+                false,
+                &mut foca_rt,
+            )
+            .expect("apply_many succeeds");
+
+        // No pump, no advance: the notification is already on the channel.
+        match event_rx.try_recv() {
+            Ok(ClusterEvent::NodeJoined(id)) => {
+                assert_eq!(id.endpoint_id, other.endpoint_id, "joined peer is `other`");
+            }
+            got => panic!("expected NodeJoined synchronously, got {got:?}"),
+        }
+    }
 }
