@@ -79,11 +79,19 @@ type Peers = Arc<Mutex<BTreeMap<String, SimDialTarget>>>;
 /// it (or finishing) lets the peer's reads observe EOF once the channel drains.
 struct SimSend {
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// The connection's liveness token. Cancelled by partition/close → writes
+    /// fail fast (a severed link cannot deliver).
+    severed: CancellationToken,
 }
 
 #[async_trait]
 impl SendHalf for SimSend {
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), ClusterError> {
+        // A severed link (partition/close) cannot deliver — fail fast so the
+        // control writer breaks instead of silently buffering into a dead peer.
+        if self.severed.is_cancelled() {
+            return Err(ClusterError::Transport("sim link severed".into()));
+        }
         // Whole-frame delivery; `FrameCodec` on the read side reconstructs
         // message boundaries. Ordered and lossless within a live stream.
         self.tx
@@ -103,13 +111,17 @@ impl SendHalf for SimSend {
 struct SimRecv {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     leftover: Vec<u8>,
+    /// The connection's liveness token. Cancelled by partition/close → reads
+    /// return clean EOF (a severed link looks like a dropped connection).
+    severed: CancellationToken,
 }
 
 impl SimRecv {
-    fn new(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+    fn new(rx: mpsc::UnboundedReceiver<Vec<u8>>, severed: CancellationToken) -> Self {
         Self {
             rx,
             leftover: Vec::new(),
+            severed,
         }
     }
 }
@@ -118,9 +130,15 @@ impl SimRecv {
 impl RecvHalf for SimRecv {
     async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ClusterError> {
         if self.leftover.is_empty() {
-            match self.rx.recv().await {
-                Some(chunk) => self.leftover = chunk,
-                None => return Ok(None), // sender dropped → clean EOF
+            tokio::select! {
+                chunk = self.rx.recv() => match chunk {
+                    Some(chunk) => self.leftover = chunk,
+                    None => return Ok(None), // sender dropped → clean EOF
+                },
+                // Partition/close severs the link mid-read → present it as EOF,
+                // the same as a dropped connection (unblocks readers awaiting bytes
+                // that will never come, so advance/block_on don't hang).
+                _ = self.severed.cancelled() => return Ok(None),
             }
         }
         let n = buf.len().min(self.leftover.len());
@@ -130,14 +148,27 @@ impl RecvHalf for SimRecv {
     }
 }
 
-/// Build one bidirectional byte stream as two ordered channels. Returns
-/// `(near, far)` — opposite ends of the same stream: `near.write` is read by
-/// `far.read`, and vice versa.
-fn stream_pair() -> (Stream, Stream) {
+/// Build one bidirectional byte stream as two ordered channels, all four halves
+/// sharing one `severed` liveness token. Returns `(near, far)` — opposite ends
+/// of the same stream: `near.write` is read by `far.read`, and vice versa.
+/// Cancelling `severed` cuts both directions at once (partition/close).
+fn stream_pair(severed: CancellationToken) -> (Stream, Stream) {
     let (a_tx, b_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (b_tx, a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let near: Stream = (Box::new(SimSend { tx: a_tx }), Box::new(SimRecv::new(a_rx)));
-    let far: Stream = (Box::new(SimSend { tx: b_tx }), Box::new(SimRecv::new(b_rx)));
+    let near: Stream = (
+        Box::new(SimSend {
+            tx: a_tx,
+            severed: severed.clone(),
+        }),
+        Box::new(SimRecv::new(a_rx, severed.clone())),
+    );
+    let far: Stream = (
+        Box::new(SimSend {
+            tx: b_tx,
+            severed: severed.clone(),
+        }),
+        Box::new(SimRecv::new(b_rx, severed)),
+    );
     (near, far)
 }
 
@@ -156,7 +187,9 @@ struct SimConnection {
     peer_accept_tx: mpsc::UnboundedSender<Stream>,
     /// Streams the peer opened toward us, awaited by `accept_bi`.
     my_accept_rx: AsyncMutex<mpsc::UnboundedReceiver<Stream>>,
-    /// Cancelled by `close`; unblocks `accept_bi` so its accept loop can exit.
+    /// The connection's liveness token, shared with every stream half and the
+    /// connection-map entry. Cancelled by `close` or `partition`: it severs all
+    /// streams (control + actor) at the byte level AND unblocks `accept_bi`.
     closed: CancellationToken,
 }
 
@@ -167,7 +200,9 @@ impl Connection for SimConnection {
     }
 
     async fn open_bi(&self) -> Result<Stream, ClusterError> {
-        let (near, far) = stream_pair();
+        // Actor streams share the connection's liveness token, so a partition
+        // severs them along with the control stream.
+        let (near, far) = stream_pair(self.closed.clone());
         self.peer_accept_tx
             .send(far)
             .map_err(|_| ClusterError::Connection("sim peer not accepting streams".into()))?;
@@ -226,14 +261,18 @@ struct RawInbound {
     /// Stored in the acceptor's connection map so it can open actor streams
     /// back toward the dialer.
     peer_accept_tx: mpsc::UnboundedSender<Stream>,
+    /// The connection's shared liveness token (so the acceptor's map entry can be
+    /// severed by either side's `partition`/`close`).
+    link: CancellationToken,
 }
 
 /// A live connection from this node's point of view: where to send control
-/// messages (foca SWIM, registry sync), and where to push actor streams opened
-/// toward the peer.
+/// messages (foca SWIM, registry sync), where to push actor streams opened
+/// toward the peer, and the liveness token to sever the link on partition.
 struct SimPeerConn {
     control_tx: mpsc::UnboundedSender<ControlMessage>,
     peer_accept_tx: mpsc::UnboundedSender<Stream>,
+    severed: CancellationToken,
 }
 
 /// One in-process bus per simulated world. Hands out a [`SimNet`] per node and
@@ -372,6 +411,7 @@ async fn run_accept_loop(
             control_send,
             control_recv,
             peer_accept_tx,
+            link,
         } = raw;
         let node_key = remote_identity.node_id_string();
 
@@ -389,6 +429,7 @@ async fn run_accept_loop(
             SimPeerConn {
                 control_tx: control_out_tx.clone(),
                 peer_accept_tx,
+                severed: link,
             },
         );
 
@@ -454,6 +495,11 @@ impl Net for SimNet {
             .cloned()
             .ok_or_else(|| ClusterError::NodeNotFound(addr.id.0.clone()))?;
 
+        // One liveness token for the whole A↔B connection — both ends, both
+        // directions, control + actor streams. Cancelling it (close/partition)
+        // severs everything at once.
+        let link = CancellationToken::new();
+
         // Two accept queues, one per direction:
         //   a_to_b: streams the dialer (us) opens toward the target.
         //   b_to_a: streams the target opens toward us.
@@ -464,18 +510,19 @@ impl Net for SimNet {
             remote_id: target.identity.endpoint_id.clone(),
             peer_accept_tx: a_to_b_tx.clone(),
             my_accept_rx: AsyncMutex::new(b_to_a_rx),
-            closed: CancellationToken::new(),
+            closed: link.clone(),
         };
         let their_conn = SimConnection {
             remote_id: self.identity.endpoint_id.clone(),
             peer_accept_tx: b_to_a_tx.clone(),
             my_accept_rx: AsyncMutex::new(a_to_b_rx),
-            closed: CancellationToken::new(),
+            closed: link.clone(),
         };
 
         // The control stream: one bidirectional byte stream split across the two
-        // nodes. `near` stays with us, `far` goes to the target.
-        let (near, far) = stream_pair();
+        // nodes, sharing the connection's liveness token. `near` stays with us,
+        // `far` goes to the target.
+        let (near, far) = stream_pair(link.clone());
         let (our_ctrl_send, our_ctrl_recv) = near;
         let (their_ctrl_send, their_ctrl_recv) = far;
 
@@ -494,6 +541,7 @@ impl Net for SimNet {
             SimPeerConn {
                 control_tx: our_ctrl_tx.clone(),
                 peer_accept_tx: a_to_b_tx,
+                severed: link.clone(),
             },
         );
         let _ = self
@@ -510,6 +558,7 @@ impl Net for SimNet {
             control_send: their_ctrl_send,
             control_recv: their_ctrl_recv,
             peer_accept_tx: b_to_a_tx,
+            link,
         };
         target
             .raw_inbound_tx
@@ -555,15 +604,17 @@ impl Net for SimNet {
     }
 
     async fn open_actor_stream(&self, node_id: &str) -> Result<Stream, ClusterError> {
-        // Phase 2: route over an established connection if one exists.
-        let peer_accept_tx = self
+        // Phase 2: route over an established connection if one exists. The new
+        // stream shares that connection's liveness token, so a partition severs
+        // it too.
+        let conn = self
             .connections
             .lock()
             .unwrap()
             .get(node_id)
-            .map(|c| c.peer_accept_tx.clone());
-        if let Some(peer_accept_tx) = peer_accept_tx {
-            let (near, far) = stream_pair();
+            .map(|c| (c.peer_accept_tx.clone(), c.severed.clone()));
+        if let Some((peer_accept_tx, severed)) = conn {
+            let (near, far) = stream_pair(severed);
             peer_accept_tx.send(far).map_err(|_| {
                 ClusterError::Transport(format!("node {node_id} not accepting streams"))
             })?;
@@ -572,6 +623,7 @@ impl Net for SimNet {
 
         // Phase 1 fallback: the hand-wired fabric stream table (no foca/handshake;
         // see `node`/`serve`). Kept so the two-node Phase-1 proof still routes.
+        // No connection ⇒ no link token ⇒ a fresh never-severed one.
         let target = self
             .nodes
             .lock()
@@ -579,7 +631,7 @@ impl Net for SimNet {
             .get(node_id)
             .cloned()
             .ok_or_else(|| ClusterError::NodeNotFound(node_id.to_string()))?;
-        let (near, far) = stream_pair();
+        let (near, far) = stream_pair(CancellationToken::new());
         target
             .send(far)
             .map_err(|_| ClusterError::Transport(format!("node {node_id} not accepting streams")))?;
@@ -595,6 +647,33 @@ impl Net for SimNet {
             let _ = self
                 .conn_events_tx
                 .send(ConnectionEvent::Disconnected(node_id.to_string()));
+        }
+    }
+}
+
+impl SimNet {
+    /// Sever the link to a peer — sim-only fault injection (partition). Cancels
+    /// the connection's shared liveness token, so both directions' streams fail
+    /// at the byte level: writes Err, reads clean EOF. foca then probes the peer,
+    /// gets no ack, and after `suspect_to_down_after` declares it down — UNLESS an
+    /// indirect probe via a still-connected third node refutes the suspicion
+    /// (SWIM partition tolerance). Returns `false` if there is no live connection
+    /// to `peer_node_key`.
+    ///
+    /// The shared token means one call severs *both* directions (the peer's
+    /// connection-map entry holds the same token). The connection stays in the
+    /// map (severed but present) until the event loop prunes it on `NodeFailed` —
+    /// mirroring a real partition, where the connection object outlives the lost
+    /// link until the failure detector fires. Byte-level severing (not just
+    /// map-removal) is what lets an in-flight actor `send` over a cut link fail
+    /// fast instead of hanging a `block_on` forever.
+    pub fn partition(&self, peer_node_key: &str) -> bool {
+        match self.connections.lock().unwrap().get(peer_node_key) {
+            Some(conn) => {
+                conn.severed.cancel();
+                true
+            }
+            None => false,
         }
     }
 }
@@ -786,16 +865,19 @@ mod tests {
         name: &str,
         id: &str,
         port: u16,
-    ) -> ClusterSystem {
+    ) -> (ClusterSystem, Arc<SimNet>) {
         let identity = NodeIdentity::new_seeded(name, NodeId(id.into()), "127.0.0.1", port, 1);
-        let (net, incoming_rx, conn_events_rx) = fabric.bind(
+        let (sim_net, incoming_rx, conn_events_rx) = fabric.bind(
             identity.clone(),
             NodeClass::Worker,
             HashMap::new(),
             shutdown.clone(),
         );
-        let net: Arc<dyn Net> = net;
-        ClusterSystem::start_with_net(
+        // The concrete `Arc<SimNet>` is returned too so a test can inject
+        // partitions (a sim-only fault not on the `Net` trait); the ClusterSystem
+        // gets it erased behind the seam.
+        let net: Arc<dyn Net> = sim_net.clone();
+        let system = ClusterSystem::start_with_net(
             sim_config(name, identity),
             TypeRegistry::new(),
             SpawnRegistry::new(),
@@ -804,7 +886,8 @@ mod tests {
             incoming_rx,
             conn_events_rx,
             shutdown.clone(),
-        )
+        );
+        (system, sim_net)
     }
 
     /// Drain a node's event receiver, partitioning into the peers it saw come up
@@ -870,7 +953,7 @@ mod tests {
         ];
         let sys: Vec<ClusterSystem> = spec
             .iter()
-            .map(|(name, id, port)| boot(&fabric, &rt, &shutdown, name, id, *port))
+            .map(|(name, id, port)| boot(&fabric, &rt, &shutdown, name, id, *port).0)
             .collect();
 
         // Subscribe before injecting so no NodeJoined is missed.
@@ -974,7 +1057,7 @@ mod tests {
         let sys: Vec<ClusterSystem> = spec
             .iter()
             .zip(&tokens)
-            .map(|((name, id, port), tok)| boot(&fabric, &rt, tok, name, id, *port))
+            .map(|((name, id, port), tok)| boot(&fabric, &rt, tok, name, id, *port).0)
             .collect();
 
         for &(from, to) in FULL_MESH {
@@ -1046,6 +1129,127 @@ mod tests {
             assert_eq!(
                 pruned, only_a,
                 "the cluster reacts: exactly A is pruned (seed {seed})"
+            );
+        }
+    }
+
+    /// Boot a converged full mesh (all nodes alive), then sever each `(from, to)`
+    /// link in `cuts` with `SimNet::partition` — a byte-level cut: both
+    /// directions' streams fail, but both nodes keep running. Advance past foca's
+    /// detection budget and return, per node (in a/b/c order), the set of peers it
+    /// declared failed. Receivers are subscribed AFTER convergence, so they
+    /// capture only the post-partition phase.
+    fn partition_scenario(seed: u64, cuts: &[(usize, usize)]) -> Vec<BTreeSet<String>> {
+        install_crypto();
+        let mut world = SimWorld::new(seed);
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+        let shutdown = CancellationToken::new();
+
+        let spec = [
+            ("node-a", "node-a-id", 7001u16),
+            ("node-b", "node-b-id", 7002),
+            ("node-c", "node-c-id", 7003),
+        ];
+        // Keep both the systems and their concrete SimNets (the latter to inject
+        // partitions).
+        let booted: Vec<(ClusterSystem, Arc<SimNet>)> = spec
+            .iter()
+            .map(|(name, id, port)| boot(&fabric, &rt, &shutdown, name, id, *port))
+            .collect();
+
+        for &(from, to) in FULL_MESH {
+            booted[from].0.inject_discovered(PeerAddr {
+                id: booted[to].0.identity().endpoint_id.clone(),
+                hint: vec![],
+            });
+        }
+        world.pump(); // converge
+
+        let mut ev: Vec<_> = booted.iter().map(|(s, _)| s.subscribe_events()).collect();
+
+        // Sever the links. One `partition` cancels the connection's shared token,
+        // cutting BOTH directions, so a single call per unordered pair suffices.
+        for &(from, to) in cuts {
+            let peer_key = booted[to].0.identity().node_id_string();
+            assert!(
+                booted[from].1.partition(&peer_key),
+                "partitioning a live connection {from}→{to}"
+            );
+        }
+
+        // Advance past foca's budget so suspicion resolves (down, or refuted by
+        // indirect probing). Same as the crash test: 30s >> ~<10s worst case.
+        world.advance(Duration::from_secs(30));
+
+        booted
+            .iter()
+            .zip(ev.iter_mut())
+            .map(|(_, rx)| {
+                let mut failed = BTreeSet::new();
+                loop {
+                    match rx.try_recv() {
+                        Ok(ClusterEvent::NodeFailed(id)) => {
+                            failed.insert(id.endpoint_id.0);
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                failed
+            })
+            .collect()
+    }
+
+    /// Phase 3: a single-link partition is *masked* by SWIM indirect probing —
+    /// partition tolerance. Cut only A–B (A–C and B–C stay up). foca on B suspects
+    /// A (its direct probe is severed), asks C to probe A on its behalf, C reaches
+    /// A and relays the ack — so B never declares A down, and vice versa. The
+    /// assertion is that NOBODY sees a failure: a partial cut must not partition
+    /// the cluster. This also proves foca's indirect-probe machinery (PingReq →
+    /// relay → ack) round-trips correctly over the sim control stream.
+    #[test]
+    fn single_link_partition_is_masked_by_indirect_probing() {
+        for seed in [1u64, 2, 0xC0FFEE] {
+            let failed = partition_scenario(seed, &[(0, 1)]);
+            for (idx, set) in failed.iter().enumerate() {
+                assert!(
+                    set.is_empty(),
+                    "node {idx} saw a failure {set:?} — a single A–B cut must be masked by \
+                     indirect probing via C (seed {seed})"
+                );
+            }
+        }
+    }
+
+    /// Phase 3: a fully isolated node is detected by, and detects, every peer.
+    /// Cut BOTH of A's links (A–B and A–C); B–C stays healthy. With no path left,
+    /// indirect probing cannot refute: B and C each declare exactly A down, A
+    /// declares both B and C down, and the healthy B–C pair never falsely fail
+    /// each other. The mirror image of the masked case — full isolation is what
+    /// actually produces failure.
+    #[test]
+    fn fully_isolated_node_is_detected_by_and_detects_all_peers() {
+        let a = "node-a-id".to_string();
+        let b = "node-b-id".to_string();
+        let c = "node-c-id".to_string();
+        for seed in [1u64, 2, 0xC0FFEE] {
+            let failed = partition_scenario(seed, &[(0, 1), (0, 2)]);
+            assert_eq!(
+                failed[0],
+                BTreeSet::from([b.clone(), c.clone()]),
+                "isolated A detects both peers down (seed {seed})"
+            );
+            assert_eq!(
+                failed[1],
+                BTreeSet::from([a.clone()]),
+                "B detects only A down — B↔C stays healthy (seed {seed})"
+            );
+            assert_eq!(
+                failed[2],
+                BTreeSet::from([a.clone()]),
+                "C detects only A down — B↔C stays healthy (seed {seed})"
             );
         }
     }
