@@ -51,6 +51,11 @@ where
 
     loop {
         tokio::select! {
+            // Deterministic branch priority: under a deterministic runtime,
+            // `select!`'s default random branch order would break replay. The
+            // ordering here (shutdown-ish signals after messages) is a
+            // deliberate, stable policy.
+            biased;
             msg = mailbox_rx.recv() => {
                 match msg {
                     Some(envelope) => {
@@ -71,7 +76,7 @@ where
 
                         msg_count += 1;
                         if msg_count.is_multiple_of(64) {
-                            tokio::task::yield_now().await;
+                            crate::runtime::yield_now().await;
                         }
                     }
                     None => break,
@@ -117,7 +122,7 @@ where
                         }
                         msg_count += 1;
                         if msg_count.is_multiple_of(64) {
-                            tokio::task::yield_now().await;
+                            crate::runtime::yield_now().await;
                         }
                     }
                     None => break,

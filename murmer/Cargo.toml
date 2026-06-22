@@ -18,6 +18,8 @@ app = ["dep:async-trait"]
 monitor = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 # The `murmer` CLI (key + allowlist management). Pulls in clap.
 cli = ["dep:clap"]
+# Deterministic simulation runtime + single-node SimWorld harness.
+sim = ["dep:futures-executor", "dep:rand_chacha"]
 
 [[bin]]
 name = "murmer"
@@ -47,6 +49,10 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 async-trait = { version = "0.1", optional = true }
 iroh = "1.0.0"
 clap = { version = "4", features = ["derive"], optional = true }
+# Simulation runtime (feature = "sim"): single-threaded cooperative executor +
+# deterministic, seedable PRNG. Kept out of the default build.
+futures-executor = { version = "0.3", optional = true }
+rand_chacha = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

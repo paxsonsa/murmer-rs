@@ -33,7 +33,8 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -43,6 +44,7 @@ use tokio::sync::mpsc;
 use crate::endpoint::Endpoint;
 use crate::lifecycle::{ActorTerminated, SystemSignal};
 use crate::receptionist::Receptionist;
+use crate::runtime::SpawnHandle;
 use crate::wire::EnvelopeProxy;
 
 // =============================================================================
@@ -154,23 +156,32 @@ pub trait Actor: Send + 'static {
 /// }
 /// ```
 pub struct ScheduleHandle {
-    handle: tokio::task::JoinHandle<()>,
+    handle: SpawnHandle,
+    /// Set to request cancellation. The scheduled future checks this
+    /// cooperatively, so cancellation works even on a runtime (sim) whose
+    /// tasks cannot be aborted from outside.
+    cancel: Arc<AtomicBool>,
+    /// Set by the scheduled future when it finishes (once-fired or loop-exited).
+    done: Arc<AtomicBool>,
 }
 
 impl ScheduleHandle {
     /// Cancel the scheduled timer explicitly.
     pub fn cancel(self) {
+        self.cancel.store(true, Ordering::Relaxed);
         self.handle.abort();
     }
 
-    /// Returns `true` if the timer has not yet fired or been cancelled.
+    /// Returns `true` if the timer has not yet fired/exited and has not been
+    /// cancelled.
     pub fn is_active(&self) -> bool {
-        !self.handle.is_finished()
+        !self.cancel.load(Ordering::Relaxed) && !self.done.load(Ordering::Relaxed)
     }
 }
 
 impl Drop for ScheduleHandle {
     fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
         self.handle.abort();
     }
 }
@@ -343,16 +354,28 @@ impl<A: Actor + 'static> ActorContext<A> {
         A: Handler<M>,
     {
         let tx = self.mailbox_tx.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-            let envelope = crate::wire::TypedEnvelope {
-                message,
-                respond_to: reply_tx,
-            };
-            tx.send(Box::new(envelope)).ok();
-        });
-        ScheduleHandle { handle }
+        let runtime = self.receptionist.runtime().clone();
+        let timer = runtime.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (c, d) = (cancel.clone(), done.clone());
+        let handle = runtime.spawn(Box::pin(async move {
+            timer.sleep(delay).await;
+            if !c.load(Ordering::Relaxed) {
+                let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                let envelope = crate::wire::TypedEnvelope {
+                    message,
+                    respond_to: reply_tx,
+                };
+                tx.send(Box::new(envelope)).ok();
+            }
+            d.store(true, Ordering::Relaxed);
+        }));
+        ScheduleHandle {
+            handle,
+            cancel,
+            done,
+        }
     }
 
     /// Schedule a message to be delivered repeatedly at `interval`.
@@ -374,12 +397,19 @@ impl<A: Actor + 'static> ActorContext<A> {
         A: Handler<M>,
     {
         let tx = self.mailbox_tx.clone();
-        let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await; // skip the immediate first tick
+        let runtime = self.receptionist.runtime().clone();
+        let timer = runtime.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (c, d) = (cancel.clone(), done.clone());
+        let handle = runtime.spawn(Box::pin(async move {
+            // Fire after each `interval` elapses (no immediate first tick),
+            // matching the previous tokio-interval behavior.
             loop {
-                ticker.tick().await;
+                timer.sleep(interval).await;
+                if c.load(Ordering::Relaxed) {
+                    break;
+                }
                 let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
                 let envelope = crate::wire::TypedEnvelope {
                     message: message.clone(),
@@ -389,8 +419,13 @@ impl<A: Actor + 'static> ActorContext<A> {
                     break;
                 }
             }
-        });
-        ScheduleHandle { handle }
+            d.store(true, Ordering::Relaxed);
+        }));
+        ScheduleHandle {
+            handle,
+            cancel,
+            done,
+        }
     }
 
     /// Request this actor to stop itself.
@@ -406,10 +441,16 @@ impl<A: Actor + 'static> ActorContext<A> {
         let _ = self.system_tx.send(SystemSignal::Stop);
     }
 
-    /// Spawn a fire-and-forget task on the tokio runtime.
+    /// Spawn a fire-and-forget task on the actor's runtime.
     ///
     /// Use this for background work that doesn't need to block the handler.
-    /// The spawned future runs independently of the actor's lifecycle.
+    /// The spawned future runs independently of the actor's lifecycle, on the
+    /// same [`Runtime`](crate::runtime::Runtime) the system was built with — so
+    /// under a deterministic sim runtime it is scheduled deterministically too.
+    ///
+    /// The future must be fire-and-forget (`Output = ()`); to surface a result,
+    /// send it back through an endpoint. Returns a [`SpawnHandle`] that can
+    /// request cancellation.
     ///
     /// # Examples
     ///
@@ -417,17 +458,15 @@ impl<A: Actor + 'static> ActorContext<A> {
     /// fn handle(&self, ctx: &ActorContext<Self>, _state: &mut MyState, msg: Notify) -> () {
     ///     let ep = ctx.endpoint();
     ///     ctx.spawn(async move {
-    ///         tokio::time::sleep(Duration::from_secs(5)).await;
     ///         ep.send(CheckTimeout).await.ok();
     ///     });
     /// }
     /// ```
-    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    pub fn spawn<F>(&self, future: F) -> SpawnHandle
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
-        tokio::spawn(future)
+        self.receptionist.runtime().spawn(Box::pin(future))
     }
 
     /// Get a serializable reference to this actor.

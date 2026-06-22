@@ -42,6 +42,7 @@ use crate::listing::{
 };
 use crate::oplog::{Op, OpLog, OpType, VersionVector};
 use crate::ready::ReadyHandle;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::supervisor::{run_supervisor, should_restart};
 use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegistry};
 
@@ -262,6 +263,9 @@ struct ReceptionistInner {
     watches: Mutex<HashMap<String, Vec<WatchEntry>>>,
     pending_notifications: Mutex<Vec<PendingListingNotification>>,
     blip_pending: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// The runtime seam: all supervisor/background spawns and timers go through
+    /// this, so a deterministic `SimRuntime` can drive the whole node.
+    runtime: Arc<dyn Runtime>,
 }
 
 // =============================================================================
@@ -310,6 +314,13 @@ impl Receptionist {
     }
 
     pub fn with_config(config: ReceptionistConfig) -> Self {
+        Self::with_config_and_runtime(config, Arc::new(TokioRuntime))
+    }
+
+    /// Build a receptionist on a specific [`Runtime`]. The runtime drives every
+    /// supervisor task, scheduled timer, and the notification-flush loop, so a
+    /// deterministic runtime makes the whole node deterministic.
+    pub fn with_config_and_runtime(config: ReceptionistConfig, runtime: Arc<dyn Runtime>) -> Self {
         let node_id = config.node_id.clone();
         let flush_interval = config.flush_interval;
 
@@ -325,22 +336,29 @@ impl Receptionist {
                 watches: Mutex::new(HashMap::new()),
                 pending_notifications: Mutex::new(Vec::new()),
                 blip_pending: Mutex::new(HashMap::new()),
+                runtime,
             }),
         };
 
-        // Spawn the flush task if configured
+        // Spawn the flush task if configured. A self-rescheduling sleep loop
+        // (rather than a tokio interval) keeps it on the runtime seam.
         if let Some(interval) = flush_interval {
             let r = receptionist.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
+            let runtime = receptionist.inner.runtime.clone();
+            receptionist.inner.runtime.spawn(Box::pin(async move {
                 loop {
-                    ticker.tick().await;
+                    runtime.sleep(interval).await;
                     r.flush_pending_notifications();
                 }
-            });
+            }));
         }
 
         receptionist
+    }
+
+    /// The runtime seam this receptionist (and its actors) run on.
+    pub fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.inner.runtime
     }
 
     pub fn node_id(&self) -> &str {
@@ -389,7 +407,7 @@ impl Receptionist {
         };
 
         // Spawn the supervisor task
-        tokio::spawn(async move {
+        self.inner.runtime.spawn(Box::pin(async move {
             let _ = run_supervisor(
                 actor,
                 state,
@@ -402,7 +420,7 @@ impl Receptionist {
                 guard,
             )
             .await;
-        });
+        }));
 
         // Create the user's endpoint
         let endpoint = Endpoint::local(mailbox_tx.clone());
@@ -509,7 +527,7 @@ impl Receptionist {
             reply_token: std::sync::Mutex::new(None),
         };
 
-        tokio::spawn(async move {
+        self.inner.runtime.spawn(Box::pin(async move {
             let _ = run_supervisor(
                 actor,
                 state,
@@ -522,7 +540,7 @@ impl Receptionist {
                 guard,
             )
             .await;
-        });
+        }));
 
         let endpoint = Endpoint::local(mailbox_tx.clone());
 
@@ -768,8 +786,9 @@ impl Receptionist {
         let receptionist = self.clone();
         let label_owned = label.to_string();
         let node_id = self.inner.config.node_id.clone();
+        let runtime = self.inner.runtime.clone();
 
-        tokio::spawn(async move {
+        self.inner.runtime.spawn(Box::pin(async move {
             let mut restart_times: VecDeque<Instant> = VecDeque::new();
             let mut backoff_duration = config.backoff.initial;
 
@@ -841,7 +860,7 @@ impl Receptionist {
                 restart_times.push_back(now);
 
                 // Apply backoff delay
-                tokio::time::sleep(backoff_duration).await;
+                runtime.sleep(backoff_duration).await;
                 backoff_duration = Duration::from_secs_f64(
                     (backoff_duration.as_secs_f64() * config.backoff.multiplier)
                         .min(config.backoff.max.as_secs_f64()),
@@ -919,7 +938,7 @@ impl Receptionist {
                     break;
                 }
             }
-        });
+        }));
 
         endpoint
     }

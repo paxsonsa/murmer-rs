@@ -192,6 +192,9 @@ pub mod oplog;
 pub mod ready;
 pub mod receptionist;
 pub mod router;
+pub mod runtime;
+#[cfg(feature = "sim")]
+pub mod sim;
 pub mod supervisor;
 pub mod system;
 pub mod wire;
@@ -291,6 +294,9 @@ pub use oplog::{Op, OpType, VersionVector};
 pub use ready::ReadyHandle;
 pub use receptionist::{ActorEvent, Receptionist, ReceptionistConfig, Visibility};
 pub use router::{PoolRouter, Router, RoutingStrategy};
+pub use runtime::{Runtime, SpawnHandle, TokioRuntime};
+#[cfg(feature = "sim")]
+pub use sim::{SimRuntime, SimWorld};
 pub use system::System;
 pub use wire::{
     DispatchRequest, RemoteInvocation, RemoteResponse, ReplySender, ResponseRegistry, SendError,

@@ -96,6 +96,24 @@ impl System {
         }
     }
 
+    /// Create a local system on a custom [`Runtime`](crate::runtime::Runtime).
+    ///
+    /// Behaves exactly like [`local()`](Self::local) but routes every supervisor
+    /// task, scheduled timer, and background loop through the supplied runtime.
+    /// Pair it with a deterministic `SimRuntime` (feature `sim`) to drive the
+    /// whole node from a seed — this is what [`SimWorld`](crate::sim::SimWorld)
+    /// uses under the hood.
+    pub fn with_runtime(runtime: std::sync::Arc<dyn crate::runtime::Runtime>) -> Self {
+        Self {
+            inner: SystemInner::Local {
+                receptionist: Receptionist::with_config_and_runtime(
+                    crate::receptionist::ReceptionistConfig::default(),
+                    runtime,
+                ),
+            },
+        }
+    }
+
     /// Create a clustered system with QUIC transport and automatic discovery.
     ///
     /// Binds a QUIC listener, starts SWIM membership, and begins peer
