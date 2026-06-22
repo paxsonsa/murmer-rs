@@ -19,12 +19,17 @@
 //!
 //! # Determinism model
 //!
-//! The executor core is [`futures_executor::LocalPool`], which schedules ready
-//! tasks in FIFO order on one thread — deterministic given deterministic input.
-//! `SimWorld` owns only the timer heap and virtual clock: when no task can make
+//! The executor core is [`SimExecutor`], a minimal single-threaded task pool: a
+//! task store keyed by a monotonic id, plus a ready set the wakers feed. The
+//! driver consults a pluggable [`ReadyPolicy`] to choose which ready task to poll
+//! next. The default [`FifoPolicy`] polls in wake order (a plain FIFO pool, and
+//! the behavior the old `futures_executor::LocalPool` gave us) and draws no
+//! randomness — so it is deterministic given deterministic input. `SimWorld` owns
+//! the executor alongside the timer heap and virtual clock: when no task can make
 //! progress, it jumps the clock to the next timer (FDB's "no work → advance to
-//! next event"). v1 scheduling is plain FIFO; a pluggable ready-order policy
-//! (for adversarial interleaving / buggify) is a deliberate later seam.
+//! next event"). The policy seam is what adversarial interleaving / buggify plugs
+//! into: a seeded policy can deliberately pick nasty ready-orders the FIFO default
+//! would never reach.
 //!
 //! **Scope of determinism today:** task scheduling, virtual-time timers, the
 //! seeded RNG, and decision-path collection iteration order are all
@@ -51,14 +56,15 @@
 //! world.advance(Duration::from_secs(1)); // fire any scheduled timers
 //! ```
 
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use futures_executor::LocalPool;
-use futures_util::task::LocalSpawnExt;
+use futures_util::future::LocalBoxFuture;
+use futures_util::task::{ArcWake, waker};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -84,7 +90,7 @@ struct SimShared {
     rng: ChaCha8Rng,
     /// Futures handed to `Runtime::spawn`, awaiting drain into the executor by
     /// the driver. Decouples spawning (`Send`, called from anywhere) from the
-    /// `!Send` `LocalPool` that actually owns the tasks.
+    /// `!Send` [`SimExecutor`] that actually owns the tasks.
     inbox: Vec<BoxFuture<'static, ()>>,
     timers: Vec<Timer>,
 }
@@ -186,15 +192,152 @@ impl Future for Sleep {
     }
 }
 
+// =============================================================================
+// DETERMINISTIC EXECUTOR — a minimal single-threaded task pool with a pluggable
+// ready-order policy (the seam adversarial scheduling / buggify plugs into).
+// =============================================================================
+
+/// Monotonic, never-reused task id. Never recycling ids is a safety invariant: a
+/// timer's `Waker` captures the id at poll time, so if an id were reused after a
+/// task completed, a stale wake could land on a different task (an ABA bug). A
+/// wake for an absent id is simply a no-op.
+type TaskId = u64;
+
+/// A spawned task: its future plus the one `Waker` reused across polls (the waker
+/// only carries an id + the shared ready handle, so one per task suffices).
+struct SimTask {
+    future: LocalBoxFuture<'static, ()>,
+    waker: Waker,
+}
+
+/// The `Send + Sync` half of the executor: the ready set, shared with every
+/// `Waker`. Wakers only `push`; the driver thread is the sole drainer. It carries
+/// task ids only — never the (`!Send`) futures.
+struct ReadyState {
+    /// Ready ids in wake order (first-wake order); [`FifoPolicy`] pops the front.
+    queue: VecDeque<TaskId>,
+    /// Dedup: an id already queued is not enqueued twice. Covers double-wakes and
+    /// a task waking itself mid-poll (`yield_now`).
+    queued: HashSet<TaskId>,
+}
+
+impl ReadyState {
+    fn push(&mut self, id: TaskId) {
+        if self.queued.insert(id) {
+            self.queue.push_back(id);
+        }
+    }
+
+    /// Take all currently-ready ids for the policy to order. Clears the dedup set:
+    /// a task re-woken while its id is already in the driver's working batch will
+    /// be re-enqueued — at worst one extra, harmless poll (futures tolerate
+    /// spurious polls).
+    fn drain(&mut self) -> Vec<TaskId> {
+        self.queued.clear();
+        self.queue.drain(..).collect()
+    }
+}
+
+/// Wakes a task by pushing its id into the shared ready set. Implementing
+/// [`ArcWake`] gives correct clone/wake/drop refcounting without a hand-rolled
+/// `RawWakerVTable`.
+struct SimWaker {
+    id: TaskId,
+    ready: Arc<Mutex<ReadyState>>,
+}
+
+impl ArcWake for SimWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.ready.lock().unwrap().push(arc_self.id);
+    }
+}
+
+/// Decides which ready task to poll next: given the currently-ready ids, return
+/// the index of the one to poll. The default ([`FifoPolicy`]) reproduces a plain
+/// FIFO pool; a seeded adversarial policy is how the sim deliberately explores
+/// nasty interleavings. Implementations must be deterministic given their own
+/// state, and must not spawn tasks or touch the runtime — they only choose order.
+pub trait ReadyPolicy {
+    /// `ready` is always non-empty. The returned index must be in bounds.
+    fn pick(&mut self, ready: &[TaskId]) -> usize;
+}
+
+/// The default policy: always poll the earliest-woken ready task. Draws no
+/// randomness, so swapping the old `LocalPool` for this executor is observably a
+/// no-op for every existing test.
+pub struct FifoPolicy;
+
+impl ReadyPolicy for FifoPolicy {
+    fn pick(&mut self, _ready: &[TaskId]) -> usize {
+        0
+    }
+}
+
+/// A minimal single-threaded executor: a task store keyed by id, plus the shared
+/// ready set the wakers feed. `!Send` (it owns the futures); lives inside
+/// [`SimWorld`] on the driver thread.
+struct SimExecutor {
+    tasks: BTreeMap<TaskId, SimTask>,
+    next_id: TaskId,
+    ready: Arc<Mutex<ReadyState>>,
+}
+
+impl SimExecutor {
+    fn new() -> Self {
+        Self {
+            tasks: BTreeMap::new(),
+            next_id: 0,
+            ready: Arc::new(Mutex::new(ReadyState {
+                queue: VecDeque::new(),
+                queued: HashSet::new(),
+            })),
+        }
+    }
+
+    /// Admit a future as a fresh task, immediately ready for its first poll.
+    fn spawn(&mut self, future: LocalBoxFuture<'static, ()>) -> TaskId {
+        let id = self.next_id;
+        self.next_id += 1;
+        let w = waker(Arc::new(SimWaker {
+            id,
+            ready: Arc::clone(&self.ready),
+        }));
+        self.tasks.insert(id, SimTask { future, waker: w });
+        self.ready.lock().unwrap().push(id);
+        id
+    }
+
+    /// Poll one task. A missing id (already completed) is a no-op — that is how a
+    /// stale timer wake for a finished task is absorbed. A `Ready` task is removed.
+    fn poll_task(&mut self, id: TaskId) {
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return;
+        };
+        let w = task.waker.clone();
+        let mut cx = Context::from_waker(&w);
+        if task.future.as_mut().poll(&mut cx).is_ready() {
+            self.tasks.remove(&id);
+        }
+    }
+
+    /// Take the currently-ready ids (drains the shared ready set).
+    fn take_ready(&self) -> Vec<TaskId> {
+        self.ready.lock().unwrap().drain()
+    }
+}
+
 /// A single-node deterministic harness: a `System` on a [`SimRuntime`], plus the
 /// executor that drives it.
 ///
-/// `SimWorld` is `!Send` (it owns the `LocalPool`); it lives on the test thread
-/// and is stepped explicitly. All time is virtual: nothing here sleeps in real
-/// wall-clock time.
+/// `SimWorld` is `!Send` (it owns the [`SimExecutor`]); it lives on the test
+/// thread and is stepped explicitly. All time is virtual: nothing here sleeps in
+/// real wall-clock time.
 pub struct SimWorld {
     runtime: SimRuntime,
-    pool: LocalPool,
+    executor: SimExecutor,
+    /// The ready-order policy. Defaults to [`FifoPolicy`]; swap it to drive
+    /// adversarial scheduling.
+    policy: Box<dyn ReadyPolicy>,
     system: crate::System,
 }
 
@@ -206,7 +349,8 @@ impl SimWorld {
         let system = crate::System::with_runtime(Arc::new(runtime.clone()));
         Self {
             runtime,
-            pool: LocalPool::new(),
+            executor: SimExecutor::new(),
+            policy: Box::new(FifoPolicy),
             system,
         }
     }
@@ -258,15 +402,16 @@ impl SimWorld {
 
     /// Move every queued task from the runtime inbox into the executor.
     fn drain_inbox(&mut self) {
-        let spawner = self.pool.spawner();
-        let futs: Vec<_> = {
+        let futs: Vec<BoxFuture<'static, ()>> = {
             let mut s = self.runtime.shared.lock().unwrap();
             s.inbox.drain(..).collect()
         };
         for fut in futs {
-            // `spawn_local` accepts the (Send) boxed future; ignore the
-            // SpawnError that only occurs once the pool is shut down.
-            let _ = spawner.spawn_local(fut);
+            // The inbox holds `Send` futures (`BoxFuture`); the executor stores
+            // them as `!Send` `LocalBoxFuture`s. Every `Send + 'static` future
+            // satisfies the looser `'static` bound, so this coercion is sound.
+            let local: LocalBoxFuture<'static, ()> = fut;
+            self.executor.spawn(local);
         }
     }
 
@@ -310,12 +455,29 @@ impl SimWorld {
     /// Run all ready tasks to quiescence *without* advancing time. Drains any
     /// tasks they spawn. Returns when no task can make progress at the current
     /// virtual instant.
+    ///
+    /// Each step drains the inbox into the executor, then runs the ready batch:
+    /// the [`ReadyPolicy`] picks the next task, it is polled, and any tasks it
+    /// wakes are folded into the batch. When the batch empties and nothing new was
+    /// spawned, the world has quiesced.
     pub fn pump(&mut self) {
         loop {
             self.drain_inbox();
-            self.pool.run_until_stalled();
-            if !self.inbox_nonempty() {
+            let mut ready = self.executor.take_ready();
+            if ready.is_empty() {
+                // A poll may have spawned more via `Runtime::spawn` → drain again;
+                // otherwise we have reached quiescence.
+                if self.inbox_nonempty() {
+                    continue;
+                }
                 break;
+            }
+            while !ready.is_empty() {
+                let idx = self.policy.pick(&ready);
+                let id = ready.remove(idx);
+                self.executor.poll_task(id);
+                // Fold in anything this poll woke before picking the next task.
+                ready.extend(self.executor.take_ready());
             }
         }
     }
@@ -332,13 +494,12 @@ impl SimWorld {
     {
         let out: Arc<Mutex<Option<F::Output>>> = Arc::new(Mutex::new(None));
         let sink = out.clone();
-        self.pool
-            .spawner()
-            .spawn_local(async move {
-                let r = fut.await;
-                *sink.lock().unwrap() = Some(r);
-            })
-            .expect("sim executor accepts the block_on task");
+        // Inject the sink task straight into the executor (we hold `&mut self`, so
+        // no inbox round-trip is needed).
+        self.executor.spawn(Box::pin(async move {
+            let r = fut.await;
+            *sink.lock().unwrap() = Some(r);
+        }));
 
         loop {
             self.pump();
@@ -464,8 +625,7 @@ mod tests {
             state: &mut CounterState,
             msg: StartTicking,
         ) {
-            state.timer =
-                Some(ctx.schedule_repeat(Duration::from_millis(msg.every_ms), Tick));
+            state.timer = Some(ctx.schedule_repeat(Duration::from_millis(msg.every_ms), Tick));
         }
     }
 
