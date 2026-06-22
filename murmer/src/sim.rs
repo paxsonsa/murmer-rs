@@ -273,6 +273,34 @@ impl ReadyPolicy for FifoPolicy {
     }
 }
 
+/// A seeded adversarial policy: pick a uniformly-random ready task each step,
+/// deliberately exploring interleavings a FIFO run never reaches. Seed it from
+/// [`SimWorld::derive_seed`]`("scheduler")` (see
+/// [`use_random_scheduling`](SimWorld::use_random_scheduling)) so the scheduling
+/// RNG is isolated from the actor-visible stream — turning it on never shifts an
+/// `rng_u64()` draw a test or actor sees, so the same workload can be replayed
+/// under FIFO and random scheduling and the observable outcome compared.
+pub struct RandomPolicy {
+    rng: ChaCha8Rng,
+}
+
+impl RandomPolicy {
+    /// Seed the scheduler RNG. The same seed reproduces the same interleaving.
+    pub fn new(seed: u64) -> Self {
+        Self {
+            rng: ChaCha8Rng::seed_from_u64(seed),
+        }
+    }
+}
+
+impl ReadyPolicy for RandomPolicy {
+    fn pick(&mut self, ready: &[TaskId]) -> usize {
+        // Modulo over a tiny ready set; the negligible bias is irrelevant to a
+        // fault explorer (it only needs to reach orderings, not sample uniformly).
+        (self.rng.next_u64() % ready.len() as u64) as usize
+    }
+}
+
 /// A minimal single-threaded executor: a task store keyed by id, plus the shared
 /// ready set the wakers feed. `!Send` (it owns the futures); lives inside
 /// [`SimWorld`] on the driver thread.
@@ -398,6 +426,23 @@ impl SimWorld {
     /// stack descends from one seed without cross-coupling.
     pub fn derive_seed(&self, label: &str) -> u64 {
         self.runtime.derive_seed(label)
+    }
+
+    /// Install a ready-order [`ReadyPolicy`], replacing the default
+    /// [`FifoPolicy`]. This is the adversarial-scheduling seam — see
+    /// [`use_random_scheduling`](Self::use_random_scheduling) for the common case.
+    pub fn set_policy(&mut self, policy: Box<dyn ReadyPolicy>) {
+        self.policy = policy;
+    }
+
+    /// Switch to seeded-random scheduling: an adversarial [`RandomPolicy`] seeded
+    /// off this world's root seed (via `derive_seed("scheduler")`, a stream
+    /// isolated from the actor RNG so enabling it perturbs nothing an actor or
+    /// test observes). Reproducible from the world seed: the same seed replays the
+    /// same interleaving. Call before driving the world.
+    pub fn use_random_scheduling(&mut self) {
+        let seed = self.derive_seed("scheduler");
+        self.set_policy(Box::new(RandomPolicy::new(seed)));
     }
 
     /// Move every queued task from the runtime inbox into the executor.
@@ -847,5 +892,119 @@ mod tests {
             SimWorld::new(100).rng_u64(),
             "derive_seed must not consume from the primary rng stream"
         );
+    }
+
+    // ── adversarial scheduling (the buggify seam) ────────────────────────────
+
+    /// A future that yields exactly once: first poll wakes itself and returns
+    /// Pending (letting the scheduler interleave another ready task), second poll
+    /// returns Ready. Also exercises the executor's self-wake dedup path.
+    async fn yield_once() {
+        struct YieldOnce(bool);
+        impl std::future::Future for YieldOnce {
+            type Output = ();
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                if self.0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }
+        }
+        YieldOnce(false).await
+    }
+
+    #[test]
+    fn random_policy_reorders_ready_tasks_but_runs_them_all() {
+        use std::sync::{Arc, Mutex};
+
+        // Eight no-await tasks spawned in order 0..8 are all ready at the first
+        // pump. FIFO runs them in spawn order; RandomPolicy runs a permutation of
+        // the same set, reproducible per seed.
+        fn run(random: bool, seed: u64) -> Vec<u64> {
+            let mut world = SimWorld::new(seed);
+            if random {
+                world.use_random_scheduling();
+            }
+            let log = Arc::new(Mutex::new(Vec::new()));
+            for i in 0..8u64 {
+                let log = Arc::clone(&log);
+                world.runtime().spawn(Box::pin(async move {
+                    log.lock().unwrap().push(i);
+                }));
+            }
+            world.pump();
+            Arc::try_unwrap(log).unwrap().into_inner().unwrap()
+        }
+
+        let fifo = run(false, 1);
+        assert_eq!(
+            fifo,
+            (0..8).collect::<Vec<_>>(),
+            "FIFO runs ready tasks in spawn order"
+        );
+
+        let rnd = run(true, 1);
+        let mut as_set = rnd.clone();
+        as_set.sort();
+        assert_eq!(
+            as_set,
+            (0..8).collect::<Vec<_>>(),
+            "random scheduling runs exactly the same set of tasks"
+        );
+        assert_ne!(
+            rnd, fifo,
+            "random scheduling reorders the ready set (seed 1)"
+        );
+        assert_eq!(
+            run(true, 1),
+            run(true, 1),
+            "same seed reproduces the same interleaving"
+        );
+    }
+
+    #[test]
+    fn adversarial_scheduling_reaches_an_interleaving_fifo_misses() {
+        use std::sync::{Arc, Mutex};
+
+        // Two tasks race on a shared cell with no synchronization: each reads,
+        // yields (so the scheduler may interleave), then writes read+1. If both
+        // read before either writes, one update is lost (final 1); if one task
+        // completes before the other reads, both land (final 2). The outcome is
+        // purely a function of the interleaving at the yield point.
+        fn lost_update(seed: u64, random: bool) -> i64 {
+            let mut world = SimWorld::new(seed);
+            if random {
+                world.use_random_scheduling();
+            }
+            let cell = Arc::new(Mutex::new(0i64));
+            for _ in 0..2 {
+                let cell = Arc::clone(&cell);
+                world.runtime().spawn(Box::pin(async move {
+                    let v = *cell.lock().unwrap();
+                    yield_once().await;
+                    *cell.lock().unwrap() = v + 1;
+                }));
+            }
+            world.pump();
+            *cell.lock().unwrap()
+        }
+
+        let fifo = lost_update(1, false);
+        // Some adversarial seed must reach an outcome the FIFO schedule never does
+        // — that is the entire value of the policy seam.
+        let other = (1..50u64).find(|&s| lost_update(s, true) != fifo);
+        assert!(
+            other.is_some(),
+            "no adversarial seed in 1..50 reached an outcome different from FIFO's \
+             ({fifo}) — the scheduling policy has no teeth"
+        );
+        // And adversarial scheduling stays reproducible: same seed, same outcome.
+        assert_eq!(lost_update(7, true), lost_update(7, true));
     }
 }
