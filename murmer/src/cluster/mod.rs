@@ -199,7 +199,11 @@ impl ClusterSystem {
             discovery::start_discovery(&identity, &config.discovery, shutdown.clone());
 
         // Initialize SWIM membership
-        let membership = ClusterMembership::new(identity.clone(), event_tx.clone());
+        let membership = ClusterMembership::new(
+            identity.clone(),
+            event_tx.clone(),
+            runtime.derive_seed("foca-prng"),
+        );
 
         let type_registry = Arc::new(type_registry);
         let spawn_registry = Arc::new(spawn_registry);
@@ -386,9 +390,8 @@ fn spawn_event_loop(
     // Subscribe to cluster events for NodeLeft pruning
     let mut cluster_event_rx = event_tx.subscribe();
 
-    // Spawn centralized timer manager — replaces per-timer tokio::spawn
-    let timer_cmd_tx = spawn_timer_manager(timer_tx);
-
+    // Foca timers ride the runtime seam via the centralized timer manager.
+    let timer_cmd_tx = spawn_timer_manager(Arc::clone(&rt), timer_tx);
     let mut runtime = FocaRuntime::new(identity.clone(), event_tx.clone(), swim_tx, timer_cmd_tx);
 
     // Track node ids we're currently connecting to, to avoid duplicates.

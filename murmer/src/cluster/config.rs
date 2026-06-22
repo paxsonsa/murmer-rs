@@ -61,6 +61,27 @@ impl NodeIdentity {
         }
     }
 
+    /// Construct with an explicit [`NodeId`] and incarnation — the deterministic
+    /// path. Production [`new`](Self::new) randomizes the incarnation
+    /// (`rand::random()`); simulation passes a synthetic `NodeId` and a seeded
+    /// incarnation (e.g. `runtime.derive_seed("incarnation/<name>")`) so identity
+    /// — and thus foca's restart/dedup behavior — is reproducible from the seed.
+    pub fn new_seeded(
+        name: impl Into<String>,
+        id: NodeId,
+        host: impl Into<String>,
+        port: u16,
+        incarnation: u64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            endpoint_id: id,
+            host: host.into(),
+            port,
+            incarnation,
+        }
+    }
+
     /// Addressing hint as a `SocketAddr` (used for discovery dedup and to build
     /// the direct-address hint for iroh).
     pub fn socket_addr(&self) -> SocketAddr {
