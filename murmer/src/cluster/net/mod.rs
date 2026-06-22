@@ -30,6 +30,9 @@ pub mod iroh;
 /// In-memory deterministic fabric for multi-node simulation (`feature = "sim"`).
 #[cfg(feature = "sim")]
 pub mod sim;
+/// Ergonomic multi-node harness over the sim fabric (`feature = "sim"`).
+#[cfg(feature = "sim")]
+pub mod sim_cluster;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
