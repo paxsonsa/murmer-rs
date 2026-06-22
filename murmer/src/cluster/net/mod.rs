@@ -26,6 +26,8 @@
 //! SWIM's failure detector fires naturally when the reliable channel underneath
 //! it is cut.
 
+pub mod iroh;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
