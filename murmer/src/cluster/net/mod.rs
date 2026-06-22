@@ -27,6 +27,9 @@
 //! it is cut.
 
 pub mod iroh;
+/// In-memory deterministic fabric for multi-node simulation (`feature = "sim"`).
+#[cfg(feature = "sim")]
+pub mod sim;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

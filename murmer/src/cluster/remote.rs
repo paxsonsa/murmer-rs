@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::instrument;
+use crate::runtime::Runtime;
 use crate::{RemoteInvocation, RemoteResponse, ResponseRegistry};
 
 use super::framing::{self, FrameCodec, StreamInit};
@@ -34,6 +35,7 @@ use super::net::{Net, RecvHalf};
 /// the `Endpoint` as a `SendError`.
 pub async fn run_actor_stream_writer(
     net: Arc<dyn Net>,
+    runtime: Arc<dyn Runtime>,
     remote_node_id: String,
     actor_label: String,
     mut invocation_rx: mpsc::UnboundedReceiver<RemoteInvocation>,
@@ -72,12 +74,14 @@ pub async fn run_actor_stream_writer(
         return;
     }
 
-    // Spawn the response reader
+    // Spawn the response reader on the runtime seam (TokioRuntime in prod, the
+    // deterministic SimRuntime under simulation) so the remote path runs under
+    // either — `tokio::spawn` here would panic with no Tokio reactor in sim.
     let registry_clone = response_registry.clone();
     let label_clone = actor_label.clone();
-    let reader_handle = tokio::spawn(async move {
+    let reader_handle = runtime.spawn(Box::pin(async move {
         read_responses(recv, registry_clone, label_clone).await;
-    });
+    }));
 
     // Write invocations to the stream using the lean wire format.
     // The payload bytes are written directly — no double-serialization.

@@ -328,6 +328,7 @@ pub fn apply_remote_ops(
 
                 tokio::spawn(remote::run_actor_stream_writer(
                     Arc::clone(net),
+                    receptionist.runtime().clone(),
                     target_node_id,
                     label.clone(),
                     wire_rx,
