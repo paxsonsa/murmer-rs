@@ -51,6 +51,19 @@ pub trait Runtime: Send + Sync + 'static {
     /// reproducible in sim; OS entropy in production.
     fn rng_u64(&self) -> u64;
 
+    /// Derive an independent, reproducible seed from this runtime's root seed
+    /// and `label`.
+    ///
+    /// This is the "one seed, one root" primitive: a consumer (e.g. an external
+    /// subsystem running under the same simulation) can seed its *own* RNG or
+    /// fault stream off the same root, so the whole stack descends from one seed
+    /// without two consumers perturbing each other's draw order. Deterministic
+    /// under a seeded sim runtime (a pure function of root-seed + label);
+    /// arbitrary per call under the Tokio default, where reproducibility is not
+    /// promised. Returning a `u64` keeps murmer free of a public `rand`
+    /// dependency — the caller seeds whatever PRNG it likes.
+    fn derive_seed(&self, label: &str) -> u64;
+
     /// Run a synchronous, potentially blocking unit of work.
     ///
     /// Production offloads to a dedicated blocking thread so real I/O never
@@ -120,6 +133,12 @@ impl Runtime for TokioRuntime {
 
     #[inline]
     fn rng_u64(&self) -> u64 {
+        rand::random()
+    }
+
+    #[inline]
+    fn derive_seed(&self, _label: &str) -> u64 {
+        // Production is not reproducible by design; hand back fresh entropy.
         rand::random()
     }
 

@@ -80,6 +80,7 @@ struct Timer {
 /// ever touched from the single driver thread.
 struct SimShared {
     now: Duration,
+    seed: u64,
     rng: ChaCha8Rng,
     /// Futures handed to `Runtime::spawn`, awaiting drain into the executor by
     /// the driver. Decouples spawning (`Send`, called from anywhere) from the
@@ -105,6 +106,7 @@ impl SimRuntime {
         Self {
             shared: Arc::new(Mutex::new(SimShared {
                 now: Duration::ZERO,
+                seed,
                 rng: ChaCha8Rng::seed_from_u64(seed),
                 inbox: Vec::new(),
                 timers: Vec::new(),
@@ -135,6 +137,17 @@ impl Runtime for SimRuntime {
 
     fn rng_u64(&self) -> u64 {
         self.shared.lock().unwrap().rng.next_u64()
+    }
+
+    fn derive_seed(&self, label: &str) -> u64 {
+        // Deterministic function of (root seed, label). DefaultHasher uses fixed
+        // keys (unlike RandomState), so this is reproducible across runs.
+        use std::hash::{Hash, Hasher};
+        let seed = self.shared.lock().unwrap().seed;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut h);
+        label.hash(&mut h);
+        h.finish()
     }
 
     fn run_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()> {
@@ -233,6 +246,14 @@ impl SimWorld {
     /// test choices (which actor to message, what payload) reproducible.
     pub fn rng_u64(&self) -> u64 {
         self.runtime.rng_u64()
+    }
+
+    /// Derive an independent, reproducible seed for `label` off this world's
+    /// root seed (the "one seed, one root" primitive). A subsystem under the
+    /// same simulation seeds its own RNG/fault stream from this, so the whole
+    /// stack descends from one seed without cross-coupling.
+    pub fn derive_seed(&self, label: &str) -> u64 {
+        self.runtime.derive_seed(label)
     }
 
     /// Move every queued task from the runtime inbox into the executor.
@@ -608,5 +629,30 @@ mod tests {
         let c = SimWorld::new(43);
         let seq_c: Vec<u64> = (0..16).map(|_| c.rng_u64()).collect();
         assert_ne!(seq_a, seq_c, "different seed should diverge");
+    }
+
+    #[test]
+    fn derive_seed_is_reproducible_and_label_independent() {
+        // Same root seed + same label → same derived seed, across worlds.
+        let a = SimWorld::new(100);
+        let b = SimWorld::new(100);
+        assert_eq!(a.derive_seed("vfs"), b.derive_seed("vfs"));
+        assert_eq!(a.derive_seed("faults"), b.derive_seed("faults"));
+
+        // Distinct labels give distinct sub-streams (so consumers don't collide).
+        assert_ne!(a.derive_seed("vfs"), a.derive_seed("faults"));
+
+        // Different root seed → different derived seed for the same label.
+        let c = SimWorld::new(101);
+        assert_ne!(a.derive_seed("vfs"), c.derive_seed("vfs"));
+
+        // derive_seed must not perturb the main rng stream (independent source).
+        let d = SimWorld::new(100);
+        let _ = d.derive_seed("anything");
+        assert_eq!(
+            d.rng_u64(),
+            SimWorld::new(100).rng_u64(),
+            "derive_seed must not consume from the primary rng stream"
+        );
     }
 }

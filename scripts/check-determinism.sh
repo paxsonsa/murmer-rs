@@ -16,9 +16,24 @@
 #   spawn on Tokio directly and are not sim-ready yet. As each is routed through
 #   the runtime seam, move it into CORE below.
 # Seam implementations (allowed to touch Tokio/RNG by definition): runtime.rs, sim.rs.
+#
+# SCOPE: this is the MECHANICAL half of the determinism contract — it catches
+# Tokio/clock/RNG escape hatches by token. It does NOT catch new decision-bearing
+# HashMap/HashSet iteration (the class Phase 4 fixed): a blanket map ban has too
+# many false positives (by-key maps are fine). That half is review-only; the
+# `listing_backfill_order_is_deterministic` sim test is the one automated guard.
+# Keep decision-path registries as BTreeMap (see receptionist `entries`).
+#
+# This is a check script, not yet auto-wired into CI — run it from a pre-commit
+# hook or a CI step. It is intended to gate, but only gates where it is invoked.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+command -v rg >/dev/null 2>&1 || {
+  echo "check-determinism: ripgrep (rg) is required but not found" >&2
+  exit 2
+}
 
 SRC="murmer/src"
 CORE=(
