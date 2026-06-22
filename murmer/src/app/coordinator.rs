@@ -327,7 +327,7 @@ pub enum SpecState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableNodeInfo {
     pub name: String,
-    pub endpoint_id: iroh::EndpointId,
+    pub endpoint_id: crate::cluster::net::NodeId,
     pub host: String,
     pub port: u16,
     pub incarnation: u64,

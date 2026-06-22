@@ -470,7 +470,9 @@ impl System {
     pub fn endpoint_id(&self) -> Option<iroh::EndpointId> {
         match &self.inner {
             SystemInner::Local { .. } => None,
-            SystemInner::Clustered { cluster } => Some(cluster.identity().endpoint_id),
+            // The identity now carries a transport-neutral `NodeId`; parse it back
+            // into an iroh key for this iroh-typed convenience accessor.
+            SystemInner::Clustered { cluster } => cluster.identity().endpoint_id.0.parse().ok(),
         }
     }
 
@@ -480,10 +482,18 @@ impl System {
     pub fn endpoint_addr(&self) -> Option<iroh::EndpointAddr> {
         match &self.inner {
             SystemInner::Local { .. } => None,
-            SystemInner::Clustered { cluster } => Some(iroh::EndpointAddr::from_parts(
-                cluster.identity().endpoint_id,
-                [iroh::TransportAddr::Ip(cluster.local_addr())],
-            )),
+            SystemInner::Clustered { cluster } => cluster
+                .identity()
+                .endpoint_id
+                .0
+                .parse()
+                .ok()
+                .map(|id| {
+                    iroh::EndpointAddr::from_parts(
+                        id,
+                        [iroh::TransportAddr::Ip(cluster.local_addr())],
+                    )
+                }),
         }
     }
 }

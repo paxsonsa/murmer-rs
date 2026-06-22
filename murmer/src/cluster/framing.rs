@@ -583,12 +583,13 @@ mod tests {
 
     #[test]
     fn test_encode_decode_control_message_departure() {
-        let identity = NodeIdentity::new(
-            "test-node",
-            crate::cluster::config::NodeIdentity::test_endpoint_id("test-node"),
-            "127.0.0.1",
-            9000,
-        );
+        let identity = NodeIdentity {
+            name: "test-node".into(),
+            endpoint_id: NodeIdentity::test_endpoint_id("test-node"),
+            host: "127.0.0.1".into(),
+            port: 9000,
+            incarnation: 1,
+        };
         let msg = ControlMessage::Departure(identity.clone());
 
         // Round-trip through encode_message / decode_message

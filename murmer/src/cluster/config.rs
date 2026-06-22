@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 
+use super::net::NodeId;
+
 // =============================================================================
 // NODE IDENTITY — uniquely identifies a node in the cluster
 // =============================================================================
@@ -25,8 +27,12 @@ use serde::{Deserialize, Serialize};
 pub struct NodeIdentity {
     /// User-provided or auto-generated name (e.g. "worker-1"). Human label only.
     pub name: String,
-    /// Stable cryptographic identity — the node's iroh endpoint public key.
-    pub endpoint_id: EndpointId,
+    /// Stable, transport-neutral identity. In production this is the iroh endpoint
+    /// public key rendered as a string ([`NodeId`]); the iroh transport owns the
+    /// `EndpointId ⇄ NodeId` mapping at its boundary. Field name kept as
+    /// `endpoint_id` for continuity; the value is the same string the cluster has
+    /// always keyed on.
+    pub endpoint_id: NodeId,
     /// Addressing hint: IP or hostname iroh can dial directly.
     pub host: String,
     /// Addressing hint: UDP port iroh listens on.
@@ -36,6 +42,10 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
+    /// Construct from a production iroh [`EndpointId`]. The key is rendered to its
+    /// stable string form and stored as a [`NodeId`] — callers that already hold a
+    /// key need no conversion. (Sim builds the struct literal directly with a
+    /// synthetic `NodeId`.)
     pub fn new(
         name: impl Into<String>,
         endpoint_id: EndpointId,
@@ -44,7 +54,7 @@ impl NodeIdentity {
     ) -> Self {
         Self {
             name: name.into(),
-            endpoint_id,
+            endpoint_id: NodeId(endpoint_id.to_string()),
             host: host.into(),
             port,
             incarnation: rand::random(),
@@ -60,20 +70,33 @@ impl NodeIdentity {
 
     /// The iroh [`EndpointAddr`] used to dial this node: the authenticated
     /// endpoint id plus the direct-address hint. No relay (self-contained mode).
+    ///
+    /// This is an iroh-boundary helper: it parses the [`NodeId`] string back into
+    /// an [`EndpointId`]. In production/test the id was minted from a real key, so
+    /// the parse round-trips; it would only fail on a sim-synthesized id, which is
+    /// never dialed over iroh.
     pub fn endpoint_addr(&self) -> EndpointAddr {
-        EndpointAddr::from_parts(self.endpoint_id, [TransportAddr::Ip(self.socket_addr())])
+        let id: EndpointId = self
+            .endpoint_id
+            .0
+            .parse()
+            .expect("NodeIdentity::endpoint_addr called on a non-iroh node id");
+        EndpointAddr::from_parts(id, [TransportAddr::Ip(self.socket_addr())])
     }
 
     /// String used as node_id in OpLog / VersionVector / Receptionist.
-    /// Built from the stable endpoint id plus the incarnation counter so
-    /// restarted nodes get distinct IDs.
+    /// Built from the stable id plus the incarnation counter so restarted nodes
+    /// get distinct IDs. (Byte-identical to the old `EndpointId`-based form: the
+    /// `NodeId` holds exactly that endpoint-id string.)
     pub fn node_id_string(&self) -> String {
         format!("{}#{}", self.endpoint_id, self.incarnation)
     }
 
     /// Returns a short, human-readable identifier for logging.
     pub fn display_id(&self) -> String {
-        format!("{}@{}", self.name, self.endpoint_id.fmt_short())
+        let id = &self.endpoint_id.0;
+        let short = &id[..id.len().min(8)];
+        format!("{}@{}", self.name, short)
     }
 
     /// Construct a deterministic test identity. The endpoint id is derived from
@@ -91,16 +114,19 @@ impl NodeIdentity {
         }
     }
 
-    /// Deterministically derive an endpoint id from a name — test only.
+    /// Deterministically derive a node id from a name — test only. Returns a
+    /// [`NodeId`] (the string form of a real key derived from the name), so it
+    /// drops straight into `endpoint_id` fields; `.to_string()` on it yields the
+    /// same key string used as a route/gossip key.
     #[cfg(test)]
-    pub fn test_endpoint_id(name: &str) -> EndpointId {
+    pub fn test_endpoint_id(name: &str) -> NodeId {
         let mut seed = [0u8; 32];
         for (i, b) in name.as_bytes().iter().enumerate() {
             seed[i % 32] ^= *b;
         }
         // Ensure a non-zero seed even for the empty name.
         seed[0] = seed[0].wrapping_add(1);
-        SecretKey::from_bytes(&seed).public()
+        NodeId(SecretKey::from_bytes(&seed).public().to_string())
     }
 }
 
@@ -127,16 +153,16 @@ impl std::hash::Hash for NodeIdentity {
 /// an address for SWIM protocol communication. The address is now the iroh
 /// `EndpointId` rather than a `SocketAddr` — foca is address-generic.
 impl foca::Identity for NodeIdentity {
-    type Addr = EndpointId;
+    type Addr = NodeId;
 
-    fn addr(&self) -> EndpointId {
-        self.endpoint_id
+    fn addr(&self) -> NodeId {
+        self.endpoint_id.clone()
     }
 
     fn renew(&self) -> Option<Self> {
         Some(Self {
             name: self.name.clone(),
-            endpoint_id: self.endpoint_id,
+            endpoint_id: self.endpoint_id.clone(),
             host: self.host.clone(),
             port: self.port,
             incarnation: self.incarnation.wrapping_add(1),

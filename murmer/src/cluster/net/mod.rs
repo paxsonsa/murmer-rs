@@ -49,7 +49,10 @@ use super::framing::{self, ControlMessage, FrameCodec};
 /// Note: the cluster's pool/route key stays the `node_id_string`
 /// ("`endpoint_id#incarnation`") — `NodeId` is only the identity type that flows
 /// through discovery, handshake, and foca.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+///
+/// `Serialize`/`Deserialize` because it rides inside [`NodeIdentity`](super::config::NodeIdentity)
+/// over the handshake and foca gossip — it serializes as its inner string.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NodeId(pub String);
 
 impl std::fmt::Display for NodeId {

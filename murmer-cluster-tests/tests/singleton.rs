@@ -160,7 +160,7 @@ async fn notify_joined(
             node_id: identity.node_id_string(),
             info: SerializableNodeInfo {
                 name: name.into(),
-                endpoint_id: identity.endpoint_id,
+                endpoint_id: identity.endpoint_id.clone(),
                 host: identity.host.clone(),
                 port: identity.port,
                 incarnation: identity.incarnation,

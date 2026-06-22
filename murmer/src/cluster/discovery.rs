@@ -139,7 +139,7 @@ fn start_mdns(
                                 continue; // not a murmer/iroh peer, or missing id
                             };
                             // Don't discover ourselves.
-                            if peer_id == identity.endpoint_id {
+                            if NodeId(peer_id.to_string()) == identity.endpoint_id {
                                 continue;
                             }
                             let port = info.get_port();
@@ -189,7 +189,7 @@ fn start_seed_connector(
         // Emit each seed as a discovered peer. The ClusterSystem event loop
         // will attempt to connect and retry on failure.
         let emit = |seed: &EndpointAddr| {
-            if seed.id == identity.endpoint_id {
+            if NodeId(seed.id.to_string()) == identity.endpoint_id {
                 return; // skip ourselves
             }
             let _ = tx.send(DiscoveryEvent::PeerDiscovered(peer_addr(seed)));

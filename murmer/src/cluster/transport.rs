@@ -254,8 +254,10 @@ impl Transport {
         let authenticated_id = connection.remote_id();
 
         // The handshake's claimed identity must match the cryptographically
-        // authenticated endpoint id — a peer cannot lie about who it is.
-        if peer.identity.endpoint_id != authenticated_id {
+        // authenticated endpoint id — a peer cannot lie about who it is. The
+        // claimed id is a `NodeId`; map the iroh-authenticated key into one to
+        // compare (this is the iroh boundary that owns `EndpointId ⇄ NodeId`).
+        if peer.identity.endpoint_id != NodeId(authenticated_id.to_string()) {
             connection.close(VarInt::from_u32(4), b"identity mismatch");
             return Err(ClusterError::HandshakeFailed(format!(
                 "claimed identity {} != authenticated key {authenticated_id}",
@@ -377,9 +379,10 @@ impl Transport {
                     };
                     let keys: Vec<String> = {
                         let conns = self.connections.read().await;
+                        let revoked_id = NodeId(revoked.to_string());
                         conns
                             .iter()
-                            .filter(|(_, nc)| nc.remote_identity.endpoint_id == revoked)
+                            .filter(|(_, nc)| nc.remote_identity.endpoint_id == revoked_id)
                             .map(|(k, _)| k.clone())
                             .collect()
                     };
@@ -464,7 +467,7 @@ impl Net for Transport {
         // The stable, authenticated identity. The pool/route key elsewhere is the
         // `node_id_string` (endpoint id + incarnation); `NodeId` is the identity
         // that flows through discovery/handshake.
-        NodeId(self.identity.endpoint_id.to_string())
+        self.identity.endpoint_id.clone()
     }
 
     /// The actual bound listen address (useful when binding to port 0).
@@ -710,11 +713,18 @@ mod allowlist_tests {
         (t, incoming, identity)
     }
 
-    /// The abstract [`PeerAddr`] to dial a bound node on loopback: its endpoint
-    /// id as the [`NodeId`] plus the bound socket as the dial hint.
+    /// The bound node's identity as an iroh [`EndpointId`] — for allowlist files,
+    /// which authorize raw ed25519 keys. The `NodeId` holds the key's string form,
+    /// so it round-trips.
+    fn eid(id: &NodeIdentity) -> EndpointId {
+        id.endpoint_id.0.parse().expect("test node id is a valid key")
+    }
+
+    /// The abstract [`PeerAddr`] to dial a bound node on loopback: its node id
+    /// plus the bound socket as the dial hint.
     fn dial_addr(t: &Transport, id: &NodeIdentity) -> PeerAddr {
         PeerAddr {
-            id: NodeId(id.endpoint_id.to_string()),
+            id: id.endpoint_id.clone(),
             hint: vec![t.local_addr()],
         }
     }
@@ -752,7 +762,7 @@ mod allowlist_tests {
         // A enforces an allowlist containing B's id.
         let path = tmp("permit");
         let mut set = HashSet::new();
-        set.insert(b_id.endpoint_id);
+        set.insert(eid(&b_id));
         write_file(&path, &set).unwrap();
         let a_allow =
             Allowlist::new(AllowlistMode::Enforced(path.clone()), shutdown.clone()).unwrap();
@@ -789,7 +799,7 @@ mod allowlist_tests {
         );
 
         // Hot-add B to A's allowlist file — no restart.
-        add_to_file(&path, b_id.endpoint_id).unwrap();
+        add_to_file(&path, eid(&b_id)).unwrap();
         // Wait past the 1s file-watch poll.
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -811,7 +821,7 @@ mod allowlist_tests {
 
         let path = tmp("revoke");
         let mut set = HashSet::new();
-        set.insert(b_id.endpoint_id);
+        set.insert(eid(&b_id));
         write_file(&path, &set).unwrap();
         let a_allow =
             Allowlist::new(AllowlistMode::Enforced(path.clone()), shutdown.clone()).unwrap();
@@ -827,7 +837,7 @@ mod allowlist_tests {
         assert_eq!(a.connected_nodes().await.len(), 1, "A holds the connection");
 
         // Revoke B by removing it from the file; A's watcher drops the connection.
-        remove_from_file(&path, &b_id.endpoint_id).unwrap();
+        remove_from_file(&path, &eid(&b_id)).unwrap();
         let mut revoked = false;
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_millis(200)).await;
