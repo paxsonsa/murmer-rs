@@ -649,6 +649,7 @@ mod tests {
     use crate::sim::SimWorld;
     use crate::ResponseRegistry;
     use serde::{Deserialize, Serialize};
+    use std::time::Duration;
     use tokio::sync::broadcast;
 
     // A trivial actor that lives on node_a and is reached remotely from node_b.
@@ -821,72 +822,14 @@ mod tests {
         (joined, failed)
     }
 
-    /// Boot 3 `ClusterSystem`s on one `SimRuntime`, inject a full mesh, pump to
-    /// quiescence, and return the sorted set of `(observer, joined)` pairs each
-    /// node observed. Asserts no node ran its failure detector.
-    fn converge(seed: u64) -> Vec<(String, String)> {
-        install_crypto();
-        let mut world = SimWorld::new(seed);
-        // All three share the world's one runtime (SimRuntime clones share the
-        // inbox), so `world.pump()` drives every node's event loop.
-        let sim_rt = world.runtime().clone();
-        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
-        let fabric = SimFabric::new(sim_rt);
-        let shutdown = CancellationToken::new();
+    /// A full mesh as three directed edges, one per unordered pair. Each
+    /// handshake makes *both* endpoints apply the other as alive, so each edge
+    /// yields two MemberUps — 6 in total, no gossip round required.
+    const FULL_MESH: &[(usize, usize)] = &[(0, 1), (0, 2), (1, 2)];
 
-        let sys_a = boot(&fabric, &rt, &shutdown, "node-a", "node-a-id", 7001);
-        let sys_b = boot(&fabric, &rt, &shutdown, "node-b", "node-b-id", 7002);
-        let sys_c = boot(&fabric, &rt, &shutdown, "node-c", "node-c-id", 7003);
-
-        // Subscribe before injecting so no NodeJoined is missed.
-        let mut ev_a = sys_a.subscribe_events();
-        let mut ev_b = sys_b.subscribe_events();
-        let mut ev_c = sys_c.subscribe_events();
-
-        // A full mesh as three directed edges, one per unordered pair. Each
-        // handshake makes *both* endpoints apply the other as alive, so each
-        // edge yields two MemberUps — 6 in total, no gossip round required.
-        let peer = |s: &ClusterSystem| PeerAddr {
-            id: s.identity().endpoint_id.clone(),
-            hint: vec![],
-        };
-        sys_a.inject_discovered(peer(&sys_b));
-        sys_a.inject_discovered(peer(&sys_c));
-        sys_b.inject_discovered(peer(&sys_c));
-
-        // Drive to quiescence — NO clock advance. MemberUp is synchronous on
-        // apply_many (see the membership linchpin test); advancing would instead
-        // start foca's failure detector, which is Phase 3.
-        world.pump();
-
-        let mut pairs = Vec::new();
-        for (observer, rx) in [
-            ("node-a-id", &mut ev_a),
-            ("node-b-id", &mut ev_b),
-            ("node-c-id", &mut ev_c),
-        ] {
-            let (joined, failed) = drain_events(rx);
-            assert_eq!(
-                failed, 0,
-                "{observer} saw a NodeFailed under pump — failure detection is Phase 3"
-            );
-            for id in joined {
-                pairs.push((observer.to_string(), id.endpoint_id.0));
-            }
-        }
-        pairs.sort();
-        pairs
-    }
-
-    /// Phase 2.3 proof: three whole `ClusterSystem`s boot on the in-memory
-    /// `SimNet`, dial a full mesh via `inject_discovered`, and converge — every
-    /// node's foca SWIM reports the other two as `MemberUp` — driven entirely by
-    /// `pump()` on one deterministic runtime. This is the first time the complete
-    /// cluster substrate (event loop, handshake/accept, foca, control streams)
-    /// runs end-to-end on the simulation fabric.
-    #[test]
-    fn three_node_member_up_converges_deterministically() {
-        let expected: Vec<(String, String)> = [
+    /// The full converged set: every node sees the other two come up.
+    fn full_mesh_pairs() -> Vec<(String, String)> {
+        [
             ("node-a-id", "node-b-id"),
             ("node-a-id", "node-c-id"),
             ("node-b-id", "node-a-id"),
@@ -896,17 +839,108 @@ mod tests {
         ]
         .iter()
         .map(|(o, j)| (o.to_string(), j.to_string()))
-        .collect();
+        .collect()
+    }
 
-        // Convergence: every node sees the other two come up (the full SWIM set).
-        assert_eq!(converge(1), expected);
+    /// Boot 3 `ClusterSystem`s on one `SimRuntime`, wire `edges` (directed
+    /// `(from, to)` dials), drive to quiescence, optionally `advance` the virtual
+    /// clock, then return the sorted, de-duplicated set of `(observer, joined)`
+    /// pairs each node's foca reported. Asserts no node ran its failure detector
+    /// — on healthy sim streams, probe acks cross in the same virtual instant, so
+    /// nobody is ever suspected.
+    fn run_topology(
+        seed: u64,
+        edges: &[(usize, usize)],
+        advance: Duration,
+    ) -> Vec<(String, String)> {
+        install_crypto();
+        let mut world = SimWorld::new(seed);
+        // All nodes share the world's one runtime (SimRuntime clones share the
+        // inbox), so `world.pump()` drives every node's event loop.
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+        let shutdown = CancellationToken::new();
+
+        let spec = [
+            ("node-a", "node-a-id", 7001u16),
+            ("node-b", "node-b-id", 7002),
+            ("node-c", "node-c-id", 7003),
+        ];
+        let sys: Vec<ClusterSystem> = spec
+            .iter()
+            .map(|(name, id, port)| boot(&fabric, &rt, &shutdown, name, id, *port))
+            .collect();
+
+        // Subscribe before injecting so no NodeJoined is missed.
+        let mut ev: Vec<_> = sys.iter().map(|s| s.subscribe_events()).collect();
+
+        for &(from, to) in edges {
+            sys[from].inject_discovered(PeerAddr {
+                id: sys[to].identity().endpoint_id.clone(),
+                hint: vec![],
+            });
+        }
+
+        world.pump();
+        if advance > Duration::ZERO {
+            world.advance(advance);
+        }
+
+        let mut pairs = std::collections::BTreeSet::new();
+        for (idx, rx) in ev.iter_mut().enumerate() {
+            let (joined, failed) = drain_events(rx);
+            assert_eq!(failed, 0, "{} saw a NodeFailed on healthy streams", spec[idx].1);
+            for id in joined {
+                pairs.insert((spec[idx].1.to_string(), id.endpoint_id.0));
+            }
+        }
+        pairs.into_iter().collect()
+    }
+
+    /// Phase 2.3 proof: three whole `ClusterSystem`s boot on the in-memory
+    /// `SimNet`, dial a full mesh via `inject_discovered`, and converge — every
+    /// node's foca SWIM reports the other two as `MemberUp` — driven entirely by
+    /// `pump()` on one deterministic runtime. This is the first time the complete
+    /// cluster substrate (event loop, handshake/accept, foca, control streams)
+    /// runs end-to-end on the simulation fabric.
+    #[test]
+    fn three_node_full_mesh_member_up_converges() {
+        let expected = full_mesh_pairs();
+
+        // Convergence on pump alone: MemberUp is synchronous on apply_many (see
+        // the membership linchpin test), so no clock advance is needed.
+        assert_eq!(run_topology(1, FULL_MESH, Duration::ZERO), expected);
 
         // Determinism: the converged set is identical across seeds. We assert the
         // *set*, not per-node event ordering — the event loop's `tokio::select!`
         // picks among ready branches in an unseeded order, so ordering is not
         // reproducible, but the converged membership is, and that is what
         // convergence means.
-        assert_eq!(converge(1), converge(2));
-        assert_eq!(converge(0xC0FFEE), expected);
+        assert_eq!(
+            run_topology(1, FULL_MESH, Duration::ZERO),
+            run_topology(2, FULL_MESH, Duration::ZERO)
+        );
+        assert_eq!(run_topology(0xC0FFEE, FULL_MESH, Duration::ZERO), expected);
+    }
+
+    /// foca SWIM genuinely round-trips over the sim control stream — the
+    /// mechanism Phase 2 is named for. The convergence test above is pump-only,
+    /// so foca's probe timers never fire and *zero* SWIM frames cross (verified);
+    /// every MemberUp there comes from the connect-time `apply_many`. Here we
+    /// advance the virtual clock past many probe periods on a healthy full mesh:
+    /// foca probes each peer, `send_control(Swim)` carries the probe, the peer's
+    /// `handle_data` acks, and the ack crosses back in the same virtual instant —
+    /// so membership holds at the full set with no node ever suspected. A
+    /// `NodeFailed` here would be a real control-path bug, not flakiness (the only
+    /// way a healthy-stream member gets suspected is if a probe or ack fails to
+    /// cross).
+    #[test]
+    fn swim_holds_membership_under_advance() {
+        assert_eq!(
+            run_topology(1, FULL_MESH, Duration::from_secs(30)),
+            full_mesh_pairs(),
+            "membership must hold at the full set while foca probes a healthy mesh"
+        );
     }
 }
