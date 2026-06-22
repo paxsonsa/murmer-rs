@@ -247,16 +247,24 @@ let after = coordinator.send(GetSingleton { label: "catalog".into() }).await?.un
 assert!(after.generation > before.generation); // strictly higher — the fence
 ```
 
-### Pluggable generation source
+### The coordination backend
 
-By default the Coordinator mints generations in memory (`CoordinatorGenerationSource`), which is fine for a single node or tests but is **not durable across a Coordinator restart**. Inject a durable `GenerationSource` so the generation survives failover of the Coordinator itself:
+Singleton correctness across nodes comes from one swappable authority — the **coordination backend**, the `GenerationSource` trait — which owns two durable facts per singleton: the monotone fence generation (so two owners can never hold an equal token) and the spec (so a newly-elected leader can rebuild the managed set). Because correctness lives in the backend being a single authority, it works at **1, 2, or N nodes with no quorum among the nodes themselves**.
+
+By default the Coordinator uses an in-memory source (`CoordinatorGenerationSource`) — fine for a single node or tests, but as a *per-node* source it does not share monotonicity across writers and is not durable across a restart. For multiple nodes, inject one shared durable source that every node reaches:
 
 ```rust,ignore
 let state = CoordinatorState::new(local_id, Box::new(LeastLoaded), Box::new(OldestNode::any()))
-    .with_generation_source(Arc::new(MyDurableGenerationSource::new()));
+    .with_generation_source(my_shared_durable_source);
 ```
 
-`GenerationSource` has three methods — `claim_term` (begin a new ownership epoch), `claim_seq` (re-grant within the current term), and `current` (read the authoritative ownership for cold-start rebuild after a Coordinator restart). Backing it with an external linearizable store (a database row, a consensus log) is what makes the singleton's identity the single source of truth across the whole cluster.
+The trait's methods: `claim_term` (begin a new ownership epoch — higher term), `claim_seq` (re-grant within the term), `current` (read ownership), `put_spec` (persist the spec), and `list` (all specs + ownership, for leader rebuild). `put_spec`/`list` default to no-ops, so a source that only fences still compiles; implement them to also close the **amnesia gap** — without them a leader that fails takes its singletons' specs with it and the new leader silently orphans them. With a shared backend the new leader's `load_singletons_from_backend` reads the persisted specs and re-places each at a strictly-higher term.
+
+Pick a backend by deployment:
+
+- **In-memory** — single node, dev, tests.
+- **Durable shared store** — multi-node: a file-backed store for dev, or a real store (a database row, or appdata's catalog, which already has the atomic compare-and-swap this needs) for production. One linearization point; no node-to-node consensus.
+- **Raft** — opt-in for 3+ node, survive-a-split, no-external-store deployments. Not the default: a 2-node Raft cluster tolerates zero failures, so it does not fit the 1-to-N (including 2) goal. The trait stays async/fallible/intent-based with an opaque ticket precisely so a Raft backend can drop in later. See the [coordination backend decision record](https://github.com/paxsonsa/murmer-rs/blob/main/.llm/shared/context/2026-06-22-coordination-backend-decision.md).
 
 ## Full example: Filesystem RPC
 

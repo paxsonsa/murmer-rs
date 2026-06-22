@@ -25,14 +25,29 @@
 //! `HEAD.writer_gen` advance-or-reject) fences the stale owner with **no change
 //! to that comparison** — only *who mints* the generation changes.
 //!
-//! # Pluggable [`GenerationSource`]
+//! # The coordination backend: [`GenerationSource`]
 //!
-//! Minting is behind the [`GenerationSource`] trait so the authoritative store
-//! is swappable: a single-owner external store (e.g. appdata's catalog) today,
-//! a consensus-minted source later — without touching the downstream fence.
-//! The default [`CoordinatorGenerationSource`] keeps generations in RAM and is
-//! suitable only for single-node deployments and tests (it is **not** durable
-//! across a Coordinator restart).
+//! Both durable facts a singleton needs — the monotone fence generation AND its
+//! spec — live behind the [`GenerationSource`] trait, the swappable **coordination
+//! backend**. This is the single authority that makes "exactly one" hold across
+//! nodes, so it works at 1, 2, or N nodes with no quorum *among the nodes*.
+//!
+//! - **In-RAM default** ([`CoordinatorGenerationSource`]): single node, dev, and
+//!   simulation tests (where one shared instance models a durable store both
+//!   nodes reach). As a *per-node* source it is not safe across multiple writers.
+//! - **Durable shared store** (multi-node): one linearization point all nodes
+//!   call — a file-backed store for dev, or a real store (e.g. appdata's catalog,
+//!   which already has the atomic compare-and-swap this needs) for production.
+//! - **Raft** (opt-in, later): for 3+ node, survive-a-split, no-external-store
+//!   deployments. Parked, not the default — 2-node Raft tolerates zero failures.
+//!   See `.llm/shared/context/2026-06-22-coordination-backend-decision.md`.
+//!
+//! The backend persists the spec ([`put_spec`](GenerationSource::put_spec)) and
+//! can [`list`](GenerationSource::list) all singletons, so a newly-elected leader
+//! rebuilds the managed set from a shared backend (the Coordinator's
+//! `load_singletons_from_backend`) instead of orphaning singletons it did not
+//! place itself. Two separate guarantees, both from one backend: the fence (a
+//! higher term can never collide) and the rebuild (a new leader inherits the set).
 //!
 //! Enable with `murmer = { features = ["app"] }`.
 
