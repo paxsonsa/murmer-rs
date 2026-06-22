@@ -1479,4 +1479,84 @@ mod tests {
              owner A, so the two never write concurrently"
         );
     }
+
+    /// The SECOND, independent weakness — "amnesia" — which neither ticket-source
+    /// fix above touches. A singleton's spec lives ONLY in the Coordinator that
+    /// placed it; it is never replicated, and there is no rebuild path
+    /// (`GenerationSource::current()` has no callers). So when the *leader itself*
+    /// is lost (not just a worker owner), the new leader does not know the
+    /// singleton exists and silently fails to take it over.
+    ///
+    /// Setup: anchor = Leader, so the leader A is also the owner. A places
+    /// `catalog`, then A is crashed. B detects A's failure and becomes leader —
+    /// but B's singleton map is empty, so its failover loop does nothing. The
+    /// singleton is orphaned: it runs nowhere, with no error raised.
+    ///
+    /// (Contrast: `test_singleton_fails_over_on_owner_departure_with_higher_term`
+    /// in the cluster-tests oracle works precisely because there the Coordinator
+    /// is a *separate* surviving node that still holds the spec — failover only
+    /// works while the Coordinator outlives the owner.)
+    #[cfg(feature = "app")]
+    #[test]
+    fn singleton_is_orphaned_when_the_leader_is_lost() {
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
+        use crate::app::singleton::{SingletonAnchor, SingletonSpec};
+
+        install_crypto();
+        let mut world = SimWorld::new(1);
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+
+        // Per-node shutdown tokens so A can be crashed independently.
+        let tok_a = CancellationToken::new();
+        let tok_b = CancellationToken::new();
+        let (sys_a, _net_a, coord_a) =
+            boot_coordinator(&fabric, &rt, &tok_a, "node-a", "node-a-id", 7001, None);
+        let (sys_b, _net_b, coord_b) =
+            boot_coordinator(&fabric, &rt, &tok_b, "node-b", "node-b-id", 7002, None);
+
+        sys_a.inject_discovered(PeerAddr {
+            id: sys_b.identity().endpoint_id.clone(),
+            hint: vec![],
+        });
+        world.pump();
+
+        // Leader A places (and owns, via the Leader anchor) the singleton.
+        let own_a = {
+            let coord = coord_a.clone();
+            let msg = StartSingleton {
+                spec: SingletonSpec::new("catalog", "test::Catalog", SingletonAnchor::Leader),
+            };
+            world.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(
+            own_a.owner_node_id.as_deref(),
+            Some(sys_a.identity().node_id_string().as_str()),
+            "A (the leader) owns the singleton"
+        );
+
+        // Crash the leader A. B detects the failure and becomes leader.
+        tok_a.cancel();
+        world.advance(Duration::from_secs(30));
+
+        // The amnesia: B is now leader, the singleton is Leader-anchored (so it
+        // *should* run on B), but B never knew the spec and there is no rebuild —
+        // so B holds nothing. The singleton is silently orphaned.
+        let on_b = {
+            let coord = coord_b.clone();
+            world.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        assert!(
+            on_b.is_none(),
+            "amnesia: the new leader B never learned `catalog`, so it is orphaned (got {on_b:?})"
+        );
+    }
 }
