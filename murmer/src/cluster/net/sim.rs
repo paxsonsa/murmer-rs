@@ -1270,6 +1270,7 @@ mod tests {
     /// and the default in-RAM `GenerationSource`) on the sim runtime. Returns the
     /// system, its `SimNet` (to inject partitions), and the Coordinator endpoint.
     #[cfg(feature = "app")]
+    #[allow(clippy::type_complexity)]
     fn boot_coordinator(
         fabric: &SimFabric,
         rt: &Arc<dyn Runtime>,
@@ -1277,6 +1278,11 @@ mod tests {
         name: &str,
         id: &str,
         port: u16,
+        // `None` = the default per-node in-RAM source (each Coordinator gets its
+        // own ticket printer). `Some(shared)` = one source both Coordinators mint
+        // from (a single ticket printer reachable from both — models a durable
+        // store both sides can reach).
+        source: Option<Arc<dyn crate::app::singleton::GenerationSource>>,
     ) -> (
         ClusterSystem,
         Arc<SimNet>,
@@ -1288,14 +1294,15 @@ mod tests {
         use crate::app::placement::LeastLoaded;
 
         let (sys, net) = boot(fabric, rt, shutdown, name, id, port);
-        let coord = bridge::start_coordinator(
-            &sys,
-            CoordinatorState::new(
-                sys.identity().node_id_string(),
-                Box::new(LeastLoaded),
-                Box::new(OldestNode::any()),
-            ),
+        let mut cstate = CoordinatorState::new(
+            sys.identity().node_id_string(),
+            Box::new(LeastLoaded),
+            Box::new(OldestNode::any()),
         );
+        if let Some(src) = source {
+            cstate = cstate.with_generation_source(src);
+        }
+        let coord = bridge::start_coordinator(&sys, cstate);
         (sys, net, coord)
     }
 
@@ -1336,10 +1343,11 @@ mod tests {
         let fabric = SimFabric::new(sim_rt);
         let shutdown = CancellationToken::new();
 
+        // Default sources: each Coordinator gets its OWN in-RAM ticket printer.
         let (sys_a, net_a, coord_a) =
-            boot_coordinator(&fabric, &rt, &shutdown, "node-a", "node-a-id", 7001);
+            boot_coordinator(&fabric, &rt, &shutdown, "node-a", "node-a-id", 7001, None);
         let (sys_b, _net_b, coord_b) =
-            boot_coordinator(&fabric, &rt, &shutdown, "node-b", "node-b-id", 7002);
+            boot_coordinator(&fabric, &rt, &shutdown, "node-b", "node-b-id", 7002, None);
 
         // Mesh A↔B and let the bridges learn both nodes. A is leader (equal
         // incarnations → name tiebreak, "node-a" < "node-b").
@@ -1388,6 +1396,87 @@ mod tests {
         assert_ne!(
             own_a.owner_node_id, own_b.owner_node_id,
             "two distinct owners now hold the same fence token (split brain)"
+        );
+    }
+
+    /// The "shared ticket printer" experiment, the mirror of the split-brain test
+    /// above: the ONLY change is that both Coordinators mint from ONE shared
+    /// `GenerationSource` (a single linearization point both sides can reach —
+    /// what a durable external store, e.g. appdata's catalog, gives you) instead
+    /// of a per-node one. Run the identical partition + re-submit scenario.
+    ///
+    /// Now the clash is gone: because the shared source already recorded
+    /// `catalog` at term 1 (A's grant), B's claim bumps to term 2. The fence can
+    /// order them again — A's stale term-1 instance is outranked by B's term-2, so
+    /// the resource rejects A's writes. This is a *handoff*, not a split brain.
+    ///
+    /// What it shows for the Raft decision: swapping the per-node source for a
+    /// single shared one is enough to close the generation-collision hole, WITHOUT
+    /// any consensus/voting. Caveat the test can't show: it assumes both sides can
+    /// always reach the one source; a real durable store unreachable from the
+    /// minority side would block that side from minting (safe, but unavailable) —
+    /// which is the availability guarantee consensus adds on top.
+    #[cfg(feature = "app")]
+    #[test]
+    fn one_shared_generation_source_fences_the_split_brain() {
+        use crate::app::coordinator::StartSingleton;
+        use crate::app::singleton::{
+            CoordinatorGenerationSource, GenerationSource, SingletonAnchor, SingletonSpec,
+        };
+
+        install_crypto();
+        let mut world = SimWorld::new(1);
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+        let shutdown = CancellationToken::new();
+
+        // ONE source, shared by both Coordinators.
+        let shared: Arc<dyn GenerationSource> = Arc::new(CoordinatorGenerationSource::new());
+        let (sys_a, net_a, coord_a) = boot_coordinator(
+            &fabric, &rt, &shutdown, "node-a", "node-a-id", 7001, Some(Arc::clone(&shared)),
+        );
+        let (sys_b, _net_b, coord_b) = boot_coordinator(
+            &fabric, &rt, &shutdown, "node-b", "node-b-id", 7002, Some(Arc::clone(&shared)),
+        );
+
+        sys_a.inject_discovered(PeerAddr {
+            id: sys_b.identity().endpoint_id.clone(),
+            hint: vec![],
+        });
+        world.pump();
+
+        let start = |label: &str| StartSingleton {
+            spec: SingletonSpec::new(label, "test::Catalog", SingletonAnchor::Leader),
+        };
+
+        // Leader A places the singleton: term 1.
+        let own_a = {
+            let coord = coord_a.clone();
+            let msg = start("catalog");
+            world.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(own_a.generation.term, 1);
+
+        // Partition + advance so B believes it is leader, then the client
+        // re-submits to B — exactly as in the broken test.
+        assert!(net_a.partition(&sys_b.identity().node_id_string()));
+        world.advance(Duration::from_secs(30));
+
+        let own_b = {
+            let coord = coord_b.clone();
+            let msg = start("catalog");
+            world.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+
+        // The fix: the shared source had already seen `catalog` at term 1, so B's
+        // claim bumps to term 2. Strictly higher → the fence orders them → A is
+        // fenced out. No split brain.
+        assert_eq!(own_b.generation.term, 2, "the shared source bumps the term on B's claim");
+        assert!(
+            own_b.generation > own_a.generation,
+            "B's grant strictly outranks A's — the (term, seq) fence can now reject the stale \
+             owner A, so the two never write concurrently"
         );
     }
 }
