@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 [features]
 default = ["macros"]
 macros = ["dep:murmer-macros"]
-app = ["dep:async-trait"]
+app = []
 monitor = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 # The `murmer` CLI (key + allowlist management). Pulls in clap.
 cli = ["dep:clap"]
@@ -46,7 +46,7 @@ tokio-util = { version = "0.7", features = ["full"] }
 linkme = "0.3"
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
-async-trait = { version = "0.1", optional = true }
+async-trait = "0.1"
 iroh = "1.0.0"
 clap = { version = "4", features = ["derive"], optional = true }
 # Simulation runtime (feature = "sim"): single-threaded cooperative executor +
