@@ -1209,6 +1209,16 @@ mod tests {
     /// assertion is that NOBODY sees a failure: a partial cut must not partition
     /// the cluster. This also proves foca's indirect-probe machinery (PingReq →
     /// relay → ack) round-trips correctly over the sim control stream.
+    ///
+    /// Non-vacuity: "zero failures" alone would also hold for a no-op `partition`
+    /// (cf. `swim_holds_membership_under_advance`, a healthy mesh with the same
+    /// zero-failure result). What makes this meaningful is the pairing — the cut
+    /// genuinely engages (A and B repeatedly hit the severed link, write_all →
+    /// Err, verified) and `fully_isolated_...` below proves the *same*
+    /// `partition` call has teeth (a double cut DOES produce failure). So a
+    /// regression to a no-op partition would fail the isolation test, and the
+    /// difference between one cut (tolerated) and two (fatal) is exactly the
+    /// indirect-probe path.
     #[test]
     fn single_link_partition_is_masked_by_indirect_probing() {
         for seed in [1u64, 2, 0xC0FFEE] {
