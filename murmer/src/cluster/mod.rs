@@ -155,6 +155,12 @@ impl ClusterSystem {
     /// deterministic `SimRuntime` under simulation, so the whole cluster
     /// (event loop, timers, spawned stream handlers) runs on the virtual clock.
     /// `start` is the production path (Tokio).
+    ///
+    /// This is the iroh entry point: it owns the transport-specific setup
+    /// (allowlist + [`Transport::bind`]) and then hands the bound [`Net`] off to
+    /// [`start_with_net`](Self::start_with_net), which is transport-agnostic. To
+    /// boot on the in-memory simulation fabric, build a `SimNet` and call
+    /// `start_with_net` directly (there is no `Transport::bind` in that path).
     pub async fn start_with_runtime(
         config: ClusterConfig,
         type_registry: TypeRegistry,
@@ -163,19 +169,9 @@ impl ClusterSystem {
     ) -> Result<Self, ClusterError> {
         let identity = config.identity.clone();
         let shutdown = CancellationToken::new();
-        let (event_tx, _) = broadcast::channel(256);
 
-        // Receptionist with this node's identity, on the same runtime seam.
-        let receptionist = Receptionist::with_config_and_runtime(
-            ReceptionistConfig {
-                node_id: identity.node_id_string(),
-                origin_addr: format!("{}:{}", identity.host, identity.port),
-                ..Default::default()
-            },
-            Arc::clone(&runtime),
-        );
-
-        // Type manifest from the registry
+        // Type manifest from the registry (borrowed before the registry is moved
+        // into start_with_net below).
         let type_manifest = type_registry.known_types();
 
         // Build the zero-trust allowlist (hot-reloaded in Enforced mode).
@@ -197,6 +193,58 @@ impl ClusterSystem {
         )
         .await?;
         let net: Arc<dyn Net> = transport;
+
+        Ok(Self::start_with_net(
+            config,
+            type_registry,
+            spawn_registry,
+            runtime,
+            net,
+            incoming_rx,
+            connection_events_rx,
+            shutdown,
+        ))
+    }
+
+    /// Boot a `ClusterSystem` over an already-bound [`Net`] — the
+    /// transport-agnostic constructor that both the iroh and simulation paths
+    /// share.
+    ///
+    /// Everything here is independent of *how* the network was created: it wires
+    /// the receptionist, discovery, SWIM membership, and the main event loop onto
+    /// the supplied `net`, `incoming_rx` (handshaked inbound connections), and
+    /// `connection_events_rx` (connect/disconnect lifecycle). The caller owns the
+    /// `shutdown` token — it must be the *same* token the `Net` impl was built
+    /// with, so cancelling it tears down both the transport and the event loop
+    /// together (iroh: [`Transport::bind`] takes it; sim: `SimFabric::bind`).
+    ///
+    /// This is synchronous and infallible: all the fallible/async work (binding a
+    /// socket) lives in the impl-specific constructor. Under `SimRuntime` the
+    /// spawned event loop only enters the runtime inbox here — the world must be
+    /// pumped to actually run it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_net(
+        config: ClusterConfig,
+        type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
+        runtime: Arc<dyn Runtime>,
+        net: Arc<dyn Net>,
+        incoming_rx: mpsc::UnboundedReceiver<IncomingConnection>,
+        connection_events_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let identity = config.identity.clone();
+        let (event_tx, _) = broadcast::channel(256);
+
+        // Receptionist with this node's identity, on the same runtime seam.
+        let receptionist = Receptionist::with_config_and_runtime(
+            ReceptionistConfig {
+                node_id: identity.node_id_string(),
+                origin_addr: format!("{}:{}", identity.host, identity.port),
+                ..Default::default()
+            },
+            Arc::clone(&runtime),
+        );
 
         // Start discovery
         let (discovery_tx, discovery_rx) =
@@ -246,7 +294,7 @@ impl ClusterSystem {
 
         tracing::info!("ClusterSystem started: {}", system.identity);
 
-        Ok(system)
+        system
     }
 
     /// Start a local actor and register it with the receptionist.
