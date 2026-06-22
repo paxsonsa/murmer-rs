@@ -1,20 +1,24 @@
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use iroh::{EndpointAddr, EndpointId, TransportAddr};
+use iroh::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::config::{Discovery, NodeIdentity};
+use super::net::{NodeId, PeerAddr};
+use super::transport::peer_addr;
 
 /// Events emitted by the discovery subsystem.
 ///
-/// A discovered peer is an iroh [`EndpointAddr`]: the peer's authenticated
-/// endpoint id plus a direct-address hint. iroh dials by key, so the id is
-/// required — a bare socket address is not enough.
+/// A discovered peer is a seam-neutral [`PeerAddr`]: the peer's node id plus
+/// direct-address hints. The id is required — the cluster dials by identity,
+/// not by bare socket address — while hints are best-effort (and ignored by the
+/// in-memory sim fabric).
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
-    PeerDiscovered(EndpointAddr),
+    PeerDiscovered(PeerAddr),
 }
 
 /// TXT-record key under which a node advertises its endpoint id over mDNS.
@@ -139,18 +143,18 @@ fn start_mdns(
                                 continue;
                             }
                             let port = info.get_port();
-                            let addrs: Vec<TransportAddr> = info
+                            let hint: Vec<SocketAddr> = info
                                 .get_addresses()
                                 .iter()
-                                .map(|ip| TransportAddr::Ip(std::net::SocketAddr::new(ip.to_ip_addr(), port)))
+                                .map(|ip| SocketAddr::new(ip.to_ip_addr(), port))
                                 .collect();
-                            if addrs.is_empty() {
+                            if hint.is_empty() {
                                 continue;
                             }
                             if seen.insert(peer_id) {
-                                let endpoint_addr = EndpointAddr::from_parts(peer_id, addrs);
+                                let peer = PeerAddr { id: NodeId(peer_id.to_string()), hint };
                                 tracing::info!("mDNS discovered peer: {peer_id}");
-                                let _ = tx.send(DiscoveryEvent::PeerDiscovered(endpoint_addr));
+                                let _ = tx.send(DiscoveryEvent::PeerDiscovered(peer));
                             }
                         }
                         Ok(Ok(_)) => {} // other mDNS events, ignore
@@ -188,7 +192,7 @@ fn start_seed_connector(
             if seed.id == identity.endpoint_id {
                 return; // skip ourselves
             }
-            let _ = tx.send(DiscoveryEvent::PeerDiscovered(seed.clone()));
+            let _ = tx.send(DiscoveryEvent::PeerDiscovered(peer_addr(seed)));
         };
         for seed in &seeds {
             emit(seed);

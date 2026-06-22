@@ -67,8 +67,9 @@ use crate::cluster::config::{NodeClass, NodeIdentity, TransportTuning};
 use crate::cluster::error::ClusterError;
 use crate::cluster::framing::ControlMessage;
 use crate::cluster::membership::ClusterEvent;
+use crate::cluster::net::{Net, RecvHalf, run_control_stream_reader};
 use crate::cluster::sync::{TypeRegistry, apply_remote_ops};
-use crate::cluster::transport::{Transport, run_control_stream_reader};
+use crate::cluster::transport::{Transport, peer_addr};
 use crate::endpoint::Endpoint;
 use crate::receptionist::{ActorEvent, Receptionist, ReceptionistConfig};
 
@@ -108,7 +109,7 @@ pub struct ClientOptions {
 /// See the [module documentation](self) for usage examples and design rationale.
 pub struct MurmerClient {
     receptionist: Receptionist,
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
     #[allow(dead_code)]
     type_registry: Arc<TypeRegistry>,
     server_node_id: String,
@@ -164,11 +165,14 @@ impl MurmerClient {
             shutdown.clone(),
         )
         .await?;
+        // Erase the concrete transport behind the `Net` seam; the edge client
+        // only needs the trait surface from here on.
+        let net: Arc<dyn Net> = transport;
 
-        let ic = transport.connect(addr).await?;
+        let ic = net.connect(peer_addr(&addr)).await?;
         let server_node_id = ic.remote_identity.node_id_string();
 
-        let local_addr = transport.local_addr();
+        let local_addr = net.local_addr();
         let receptionist = Receptionist::with_config(ReceptionistConfig {
             node_id: local_addr.to_string(),
             origin_addr: local_addr.to_string(),
@@ -181,7 +185,7 @@ impl MurmerClient {
 
         spawn_edge_event_loop(
             ic.control_recv,
-            Arc::clone(&transport),
+            Arc::clone(&net),
             receptionist.clone(),
             Arc::clone(&type_registry),
             server_node_id.clone(),
@@ -192,7 +196,7 @@ impl MurmerClient {
 
         // Trigger immediate pull to populate the local receptionist with public actors
         let vv = receptionist.version_vector();
-        if let Err(e) = transport
+        if let Err(e) = net
             .send_control(&server_node_id, ControlMessage::RegistrySyncRequest(vv))
             .await
         {
@@ -201,7 +205,7 @@ impl MurmerClient {
 
         Ok(Self {
             receptionist,
-            transport,
+            net,
             type_registry,
             server_node_id,
             shutdown,
@@ -246,7 +250,7 @@ impl MurmerClient {
 
         let vv = self.receptionist.version_vector();
         if let Err(e) = self
-            .transport
+            .net
             .send_control(
                 &self.server_node_id,
                 ControlMessage::RegistrySyncRequest(vv),
@@ -303,7 +307,7 @@ impl MurmerClient {
                     // Re-pull in case the actor registered after our initial request
                     let vv = self.receptionist.version_vector();
                     if let Err(e) = self
-                        .transport
+                        .net
                         .send_control(&self.server_node_id, ControlMessage::RegistrySyncRequest(vv))
                         .await
                     {
@@ -319,7 +323,7 @@ impl MurmerClient {
     /// Closes the QUIC connection to the server node and cancels the
     /// background event loop.
     pub async fn disconnect(self) {
-        self.transport.remove_connection(&self.server_node_id).await;
+        self.net.remove_connection(&self.server_node_id).await;
         self.shutdown.cancel();
     }
 
@@ -341,8 +345,8 @@ impl MurmerClient {
 /// - Ignores all cluster-specific messages (SWIM, spawn, departure)
 #[allow(clippy::too_many_arguments)]
 fn spawn_edge_event_loop(
-    control_recv: iroh::endpoint::RecvStream,
-    transport: Arc<Transport>,
+    control_recv: Box<dyn RecvHalf>,
+    net: Arc<dyn Net>,
     receptionist: Receptionist,
     type_registry: Arc<TypeRegistry>,
     server_node_id: String,
@@ -391,7 +395,7 @@ fn spawn_edge_event_loop(
                             &type_registry,
                             &server_node_id,
                             &event_tx,
-                            &transport,
+                            &net,
                         );
                     }
                     // All other control messages (SWIM, SpawnActor, Departure, etc.)
@@ -399,7 +403,7 @@ fn spawn_edge_event_loop(
                 }
                 Some(()) = sync_tick_rx.recv() => {
                     let vv = receptionist.version_vector();
-                    if let Err(e) = transport
+                    if let Err(e) = net
                         .send_control(&server_node_id, ControlMessage::RegistrySyncRequest(vv))
                         .await
                     {

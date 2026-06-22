@@ -30,13 +30,14 @@ use config::{ClusterConfig, NodeClass, NodeIdentity};
 use error::ClusterError;
 use framing::ControlMessage;
 use membership::{ClusterEvent, ClusterMembership, FocaRuntime, TimerEvent, spawn_timer_manager};
+use net::{ConnectionEvent, IncomingConnection, Net, NodeId, PeerAddr};
 use sync::{SpawnRegistry, TypeRegistry};
-use transport::{ConnectionEvent, Transport};
+use transport::Transport;
 
-/// Parse the iroh `EndpointId` out of a `node_id_string` of the form
-/// `endpoint_id#incarnation`.
-fn parse_endpoint_id(node_id: &str) -> Option<iroh::EndpointId> {
-    node_id.split('#').next()?.parse().ok()
+/// Extract the endpoint-id portion (the abstract [`NodeId`]) out of a
+/// `node_id_string` of the form `endpoint_id#incarnation`.
+fn node_id_of(node_id: &str) -> Option<NodeId> {
+    node_id.split('#').next().map(|id| NodeId(id.to_string()))
 }
 
 // =============================================================================
@@ -107,7 +108,7 @@ impl NodeRegistry {
 /// membership, mDNS/seed discovery, and OpLog-based registry replication.
 pub struct ClusterSystem {
     receptionist: Receptionist,
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
     #[allow(dead_code)]
     config: ClusterConfig,
     identity: NodeIdentity,
@@ -157,7 +158,9 @@ impl ClusterSystem {
         // Build the zero-trust allowlist (hot-reloaded in Enforced mode).
         let allowlist = allowlist::Allowlist::new(config.allowlist.clone(), shutdown.clone())?;
 
-        // Bind the iroh transport with tuned parameters and the allowlist hook.
+        // Bind the iroh transport with tuned parameters and the allowlist hook,
+        // then erase it behind the `Net` seam — the rest of the system is
+        // transport-agnostic (and swappable for the in-memory sim fabric).
         let (transport, incoming_rx, connection_events_rx) = Transport::bind(
             identity.clone(),
             config.secret_key.clone(),
@@ -170,6 +173,7 @@ impl ClusterSystem {
             shutdown.clone(),
         )
         .await?;
+        let net: Arc<dyn Net> = transport;
 
         // Start discovery
         let discovery_rx =
@@ -185,7 +189,7 @@ impl ClusterSystem {
         // Spawn the main event loop
         let system = Self {
             receptionist: receptionist.clone(),
-            transport: Arc::clone(&transport),
+            net: Arc::clone(&net),
             config: config.clone(),
             identity: identity.clone(),
             event_tx: event_tx.clone(),
@@ -197,7 +201,7 @@ impl ClusterSystem {
 
         spawn_event_loop(
             receptionist,
-            transport,
+            net,
             membership,
             identity,
             event_tx,
@@ -301,14 +305,14 @@ impl ClusterSystem {
         &self.node_registry
     }
 
-    /// Access the underlying transport (for orchestration integration).
-    pub fn transport(&self) -> &Arc<Transport> {
-        &self.transport
+    /// Access the underlying network seam (for orchestration integration).
+    pub fn net(&self) -> &Arc<dyn Net> {
+        &self.net
     }
 
     /// Get the actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> std::net::SocketAddr {
-        self.transport.local_addr()
+        self.net.local_addr()
     }
 
     /// Shut down the cluster system gracefully.
@@ -318,7 +322,7 @@ impl ClusterSystem {
     pub async fn shutdown(&self) {
         // Broadcast departure to all connected peers
         let departure = ControlMessage::Departure(self.identity.clone());
-        self.transport.broadcast_control(&departure).await;
+        self.net.broadcast_control(&departure).await;
 
         // Small grace period for message delivery
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -335,16 +339,16 @@ impl ClusterSystem {
 #[allow(clippy::too_many_arguments)]
 fn spawn_event_loop(
     receptionist: Receptionist,
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
     mut membership: ClusterMembership,
     identity: NodeIdentity,
     event_tx: broadcast::Sender<ClusterEvent>,
     type_registry: Arc<TypeRegistry>,
     spawn_registry: Arc<SpawnRegistry>,
     node_registry: NodeRegistry,
-    mut incoming_rx: mpsc::UnboundedReceiver<transport::IncomingConnection>,
+    mut incoming_rx: mpsc::UnboundedReceiver<IncomingConnection>,
     mut discovery_rx: mpsc::UnboundedReceiver<discovery::DiscoveryEvent>,
-    mut conn_events: mpsc::UnboundedReceiver<transport::ConnectionEvent>,
+    mut conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     shutdown: CancellationToken,
 ) {
     // Channels for the foca runtime
@@ -355,8 +359,7 @@ fn spawn_event_loop(
     // Bridge for outbound connections: discovery spawns connect(), sends the
     // resulting IncomingConnection here so the event loop can set up stream
     // acceptance, foca membership, and initial sync — same as for inbound.
-    let (connected_tx, mut connected_rx) =
-        mpsc::unbounded_channel::<transport::IncomingConnection>();
+    let (connected_tx, mut connected_rx) = mpsc::unbounded_channel::<IncomingConnection>();
 
     // Subscribe to cluster events for NodeLeft pruning
     let mut cluster_event_rx = event_tx.subscribe();
@@ -369,10 +372,10 @@ fn spawn_event_loop(
     // Periodic sync interval
     let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
 
-    // Track endpoint ids we're currently connecting to, to avoid duplicates.
-    let connecting = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<
-        iroh::EndpointId,
-    >::new()));
+    // Track node ids we're currently connecting to, to avoid duplicates.
+    let connecting = Arc::new(tokio::sync::Mutex::new(
+        std::collections::HashSet::<NodeId>::new(),
+    ));
 
     tokio::spawn(async move {
         // Helper closure factored into an inline fn below to handle a new
@@ -389,7 +392,7 @@ fn spawn_event_loop(
                         &control_in_tx,
                         &shutdown,
                         &receptionist,
-                        &transport,
+                        &net,
                         &node_registry,
                     ).await;
                 }
@@ -403,7 +406,7 @@ fn spawn_event_loop(
                         &control_in_tx,
                         &shutdown,
                         &receptionist,
-                        &transport,
+                        &net,
                         &node_registry,
                     ).await;
                 }
@@ -412,30 +415,30 @@ fn spawn_event_loop(
                 Some(event) = discovery_rx.recv() => {
                     match event {
                         discovery::DiscoveryEvent::PeerDiscovered(addr) => {
-                            let endpoint_id = addr.id;
-                            let transport = Arc::clone(&transport);
+                            let peer_id = addr.id.clone();
+                            let net = Arc::clone(&net);
                             let connecting = Arc::clone(&connecting);
                             let mut lock = connecting.lock().await;
-                            if lock.contains(&endpoint_id) {
+                            if lock.contains(&peer_id) {
                                 continue;
                             }
-                            lock.insert(endpoint_id);
+                            lock.insert(peer_id.clone());
                             drop(lock);
 
                             let connecting2 = Arc::clone(&connecting);
                             let connected_tx = connected_tx.clone();
                             tokio::spawn(async move {
-                                match transport.connect(addr).await {
+                                match net.connect(addr).await {
                                     Ok(ic) => {
-                                        tracing::info!("Connected to discovered peer: {endpoint_id}");
+                                        tracing::info!("Connected to discovered peer: {peer_id}");
                                         // Feed back into event loop for stream-accept handling
                                         let _ = connected_tx.send(ic);
                                     }
                                     Err(e) => {
-                                        tracing::debug!("Failed to connect to {endpoint_id}: {e}");
+                                        tracing::debug!("Failed to connect to {peer_id}: {e}");
                                     }
                                 }
-                                connecting2.lock().await.remove(&endpoint_id);
+                                connecting2.lock().await.remove(&peer_id);
                             });
                         }
                     }
@@ -453,7 +456,7 @@ fn spawn_event_loop(
                 Some((target, data)) = swim_rx.recv() => {
                     let node_id = target.node_id_string();
                     let msg = ControlMessage::Swim(data);
-                    if let Err(e) = transport.send_control(&node_id, msg).await {
+                    if let Err(e) = net.send_control(&node_id, msg).await {
                         tracing::trace!("Failed to send SWIM to {node_id}: {e}");
                     }
                 }
@@ -474,12 +477,12 @@ fn spawn_event_loop(
                                 &type_registry,
                                 &node_id,
                                 &event_tx,
-                                &transport,
+                                &net,
                             );
 
                             // Eager connect: if ops mention nodes we're not
                             // connected to, initiate a connection immediately.
-                            let connected = transport.connected_nodes().await;
+                            let connected = net.connected_nodes().await;
                             for op in &ops {
                                 if let OpType::Register { origin_addr, .. } = &op.op_type {
                                     // Skip ops from our own node
@@ -491,46 +494,46 @@ fn spawn_event_loop(
                                         continue;
                                     }
                                     // The op's node_id is `endpoint_id#incarnation`; the
-                                    // origin_addr is a host:port hint. Reconstruct the iroh
-                                    // EndpointAddr to dial. Gossip carries addressing hints
+                                    // origin_addr is a host:port hint. Build the abstract
+                                    // PeerAddr to dial. Gossip carries addressing hints
                                     // only — the allowlist hook decides authorization, so a
                                     // gossiped peer that isn't allowlisted is rejected on dial.
-                                    let Some(endpoint_id) = parse_endpoint_id(&op.node_id) else {
+                                    let Some(peer_id) = node_id_of(&op.node_id) else {
                                         continue;
                                     };
                                     let Ok(sock) = origin_addr.parse::<SocketAddr>() else {
                                         continue;
                                     };
-                                    let endpoint_addr = iroh::EndpointAddr::from_parts(
-                                        endpoint_id,
-                                        [iroh::TransportAddr::Ip(sock)],
-                                    );
+                                    let peer_addr = PeerAddr {
+                                        id: peer_id.clone(),
+                                        hint: vec![sock],
+                                    };
                                     {
                                         let mut lock = connecting.lock().await;
-                                        if lock.contains(&endpoint_id) {
+                                        if lock.contains(&peer_id) {
                                             continue;
                                         }
-                                        lock.insert(endpoint_id);
+                                        lock.insert(peer_id.clone());
                                     }
 
-                                    let transport_clone = Arc::clone(&transport);
+                                    let net = Arc::clone(&net);
                                     let connecting_clone = Arc::clone(&connecting);
                                     let connected_tx = connected_tx.clone();
                                     tokio::spawn(async move {
-                                        match transport_clone.connect(endpoint_addr).await {
+                                        match net.connect(peer_addr).await {
                                             Ok(ic) => {
                                                 tracing::info!(
-                                                    "Eager connect to {endpoint_id} succeeded"
+                                                    "Eager connect to {peer_id} succeeded"
                                                 );
                                                 let _ = connected_tx.send(ic);
                                             }
                                             Err(e) => {
                                                 tracing::debug!(
-                                                    "Eager connect to {endpoint_id} failed: {e}"
+                                                    "Eager connect to {peer_id} failed: {e}"
                                                 );
                                             }
                                         }
-                                        connecting_clone.lock().await.remove(&endpoint_id);
+                                        connecting_clone.lock().await.remove(&peer_id);
                                     });
                                 }
                             }
@@ -542,14 +545,14 @@ fn spawn_event_loop(
                                 .unwrap_or(false);
                             if is_edge {
                                 sync::send_public_sync_to_peer(
-                                    &transport,
+                                    &net,
                                     &receptionist,
                                     &node_id,
                                     &peer_vv,
                                 ).await;
                             } else {
                                 sync::send_sync_to_peer(
-                                    &transport,
+                                    &net,
                                     &receptionist,
                                     &node_id,
                                     &peer_vv,
@@ -557,7 +560,7 @@ fn spawn_event_loop(
                             }
                         }
                         ControlMessage::Ping => {
-                            let _ = transport.send_control(
+                            let _ = net.send_control(
                                 &node_id,
                                 ControlMessage::Pong,
                             ).await;
@@ -571,7 +574,7 @@ fn spawn_event_loop(
                             instrument::cluster_node_left();
                             let _ = event_tx.send(ClusterEvent::NodeLeft(identity.clone()));
                             receptionist.prune_node(&departing_id);
-                            transport.remove_connection(&departing_id).await;
+                            net.remove_connection(&departing_id).await;
                             let _ = event_tx.send(ClusterEvent::NodePruned(identity.clone()));
                         }
                         ControlMessage::SpawnActor(ref request) => {
@@ -590,7 +593,7 @@ fn spawn_event_loop(
                                         "Spawned {} (type: {}) successfully",
                                         request.label, request.actor_type_name
                                     );
-                                    let _ = transport.send_control(
+                                    let _ = net.send_control(
                                         &node_id,
                                         ControlMessage::SpawnAckOk {
                                             request_id: request.request_id,
@@ -603,7 +606,7 @@ fn spawn_event_loop(
                                         "Failed to spawn {}: {e}",
                                         request.label
                                     );
-                                    let _ = transport.send_control(
+                                    let _ = net.send_control(
                                         &node_id,
                                         ControlMessage::SpawnAckErr {
                                             request_id: request.request_id,
@@ -641,7 +644,7 @@ fn spawn_event_loop(
                                 "StopSingleton from {node_id} for {label} (gen={generation}) — stopping local instance"
                             );
                             receptionist.stop(label);
-                            let _ = transport
+                            let _ = net
                                 .send_control(
                                     &node_id,
                                     ControlMessage::SingletonStoppedAck {
@@ -673,7 +676,7 @@ fn spawn_event_loop(
                             let node_id = identity.node_id_string();
                             tracing::info!("Node departed: {node_id} — pruning actors");
                             receptionist.prune_node(&node_id);
-                            transport.remove_connection(&node_id).await;
+                            net.remove_connection(&node_id).await;
                             node_registry.remove(&node_id);
                             let _ = event_tx.send(ClusterEvent::NodePruned(identity.clone()));
                         }
@@ -705,7 +708,7 @@ fn spawn_event_loop(
 
                 // ── Periodic registry sync ──────────────────────────────
                 _ = sync_interval.tick() => {
-                    sync::periodic_sync(&transport, &receptionist, &node_registry).await;
+                    sync::periodic_sync(&net, &receptionist, &node_registry).await;
                 }
 
                 // ── Shutdown ────────────────────────────────────────────
@@ -723,13 +726,13 @@ fn spawn_event_loop(
 /// stream acceptor for subsequent bi-streams, and requests initial sync.
 #[allow(clippy::too_many_arguments)]
 async fn handle_new_connection(
-    incoming: transport::IncomingConnection,
+    incoming: IncomingConnection,
     membership: &mut ClusterMembership,
     runtime: &mut FocaRuntime,
     control_in_tx: &mpsc::UnboundedSender<(String, ControlMessage)>,
     shutdown: &CancellationToken,
     receptionist: &Receptionist,
-    transport: &Arc<Transport>,
+    net: &Arc<dyn Net>,
     node_registry: &NodeRegistry,
 ) {
     let node_id = incoming.remote_identity.node_id_string();
@@ -760,7 +763,7 @@ async fn handle_new_connection(
 
     // Spawn control stream reader — reads ongoing control messages from
     // the handshake stream (which survived read_handshake).
-    tokio::spawn(transport::run_control_stream_reader(
+    tokio::spawn(net::run_control_stream_reader(
         incoming.control_recv,
         control_in_tx.clone(),
         node_id.clone(),
@@ -768,10 +771,12 @@ async fn handle_new_connection(
     ));
 
     // Spawn a task to accept additional bi streams from this connection.
-    // New streams are actor streams or control continuations.
+    // New streams are actor streams or control continuations. The boxed
+    // connection is *moved* into this task — the transport keeps its own handle
+    // in the connection pool, and `Box<dyn Connection>` isn't `Clone`.
     let control_tx = control_in_tx.clone();
     let shutdown_clone = shutdown.clone();
-    let conn = incoming.connection.clone();
+    let conn = incoming.connection;
     let nid = node_id.clone();
     let receptionist_for_streams = receptionist.clone();
     tokio::spawn(async move {
@@ -779,7 +784,9 @@ async fn handle_new_connection(
             tokio::select! {
                 result = conn.accept_bi() => {
                     match result {
-                        Ok((send, recv)) => {
+                        // `accept_bi` yields `None` when the connection closes,
+                        // which drives this accept loop's exit.
+                        Some((send, recv)) => {
                             let receptionist_clone = receptionist_for_streams.clone();
                             let ctrl_tx = control_tx.clone();
                             let nid2 = nid.clone();
@@ -793,8 +800,8 @@ async fn handle_new_connection(
                                 ).await;
                             });
                         }
-                        Err(e) => {
-                            tracing::debug!("Peer {nid} stopped accepting streams: {e}");
+                        None => {
+                            tracing::debug!("Peer {nid} stopped accepting streams");
                             break;
                         }
                     }
@@ -807,7 +814,7 @@ async fn handle_new_connection(
     // Only request bidirectional sync for full cluster members.
     // Edge clients send their own RegistrySyncRequest on connect.
     if !is_edge_client {
-        sync::request_sync_from_peer(transport, receptionist, &node_id).await;
+        sync::request_sync_from_peer(net, receptionist, &node_id).await;
     }
 }
 
@@ -822,8 +829,8 @@ async fn handle_new_connection(
 /// distinctive, while ControlMessages have different structure.
 async fn handle_incoming_stream(
     receptionist: Receptionist,
-    send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
+    send: Box<dyn net::SendHalf>,
+    mut recv: Box<dyn net::RecvHalf>,
     control_tx: mpsc::UnboundedSender<(String, ControlMessage)>,
     node_id: String,
 ) {
@@ -857,8 +864,7 @@ async fn handle_incoming_stream(
     if let Ok(msg) = framing::decode_message::<ControlMessage>(&first_frame) {
         let _ = control_tx.send((node_id.clone(), msg));
         // Continue reading control messages from this stream
-        transport::run_control_stream_reader(recv, control_tx, node_id, CancellationToken::new())
-            .await;
+        net::run_control_stream_reader(recv, control_tx, node_id, CancellationToken::new()).await;
     } else {
         tracing::warn!("Could not decode first frame from {node_id}");
     }
@@ -867,8 +873,8 @@ async fn handle_incoming_stream(
 /// Handle an actor stream where StreamInit has already been consumed.
 async fn handle_actor_stream_after_init(
     receptionist: Receptionist,
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
+    mut send: Box<dyn net::SendHalf>,
+    mut recv: Box<dyn net::RecvHalf>,
     mut codec: framing::FrameCodec,
     actor_label: &str,
 ) {
@@ -916,7 +922,7 @@ async fn handle_actor_stream_after_init(
 /// response, and write it back. Returns false if the stream should be closed.
 async fn dispatch_and_respond(
     dispatch_tx: &mpsc::UnboundedSender<DispatchRequest>,
-    send: &mut iroh::endpoint::SendStream,
+    send: &mut Box<dyn net::SendHalf>,
     frame: &[u8],
     actor_label: &str,
 ) -> bool {
@@ -1173,15 +1179,15 @@ mod tests {
             .unwrap();
 
         // Wait for the connection to establish (discovery fires, connect happens)
-        let transport_a = &system_a.transport;
+        let net_a = &system_a.net;
         poll_until(Duration::from_secs(5), || async {
-            !transport_a.connected_nodes().await.is_empty()
+            !net_a.connected_nodes().await.is_empty()
         })
         .await;
 
         // Both should see each other
-        let a_peers = system_a.transport.connected_nodes().await;
-        let b_peers = system_b.transport.connected_nodes().await;
+        let a_peers = system_a.net.connected_nodes().await;
+        let b_peers = system_b.net.connected_nodes().await;
         assert!(!a_peers.is_empty(), "A should have peers");
         assert!(!b_peers.is_empty(), "B should have peers");
 

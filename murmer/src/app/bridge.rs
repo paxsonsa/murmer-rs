@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::cluster::ClusterSystem;
 use crate::cluster::framing::ControlMessage;
 use crate::cluster::membership::ClusterEvent;
-use crate::cluster::transport::Transport;
+use crate::cluster::net::Net;
 use crate::prelude::*;
 use tokio::sync::mpsc;
 
@@ -78,14 +78,14 @@ pub fn start_coordinator(
         run_bridge_loop(&mut events, &node_registry, &bridge_ep).await;
     });
 
-    // Spawn drain loop (SpawnRequests → transport or local spawn)
-    let transport = Arc::clone(cluster.transport());
+    // Spawn drain loop (SpawnRequests → net or local spawn)
+    let net = Arc::clone(cluster.net());
     let local_node_id = cluster.identity().node_id_string();
     let spawn_registry = Arc::clone(cluster.spawn_registry());
     let receptionist = cluster.receptionist().clone();
     let ack_ep = coordinator_ep.clone();
     tokio::spawn(run_spawn_drain_loop(
-        transport,
+        net,
         local_node_id,
         spawn_registry,
         receptionist,
@@ -95,12 +95,12 @@ pub fn start_coordinator(
     ));
 
     // Drain loop for graceful singleton stops (the inner half of the drain handoff).
-    let stop_transport = Arc::clone(cluster.transport());
+    let stop_net = Arc::clone(cluster.net());
     let stop_local_node_id = cluster.identity().node_id_string();
     let stop_receptionist = cluster.receptionist().clone();
     let stop_ep = coordinator_ep.clone();
     tokio::spawn(run_singleton_stop_drain_loop(
-        stop_transport,
+        stop_net,
         stop_local_node_id,
         stop_receptionist,
         stop_ep,
@@ -285,7 +285,7 @@ impl Drop for AckGuard {
 /// caller's side (e.g. the supervisor semaphore in datastorekit). Murmer does
 /// not impose its own cap.
 async fn run_spawn_drain_loop(
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
     local_node_id: String,
     spawn_registry: Arc<crate::cluster::sync::SpawnRegistry>,
     receptionist: crate::receptionist::Receptionist,
@@ -331,10 +331,10 @@ async fn run_spawn_drain_loop(
                 request.label,
                 request.actor_type_name
             );
-            let transport = Arc::clone(&transport);
+            let net = Arc::clone(&net);
             tokio::spawn(async move {
                 let factory_start = std::time::Instant::now();
-                if let Err(e) = transport
+                if let Err(e) = net
                     .send_control(&node_id, ControlMessage::SpawnActor(request))
                     .await
                 {
@@ -351,7 +351,7 @@ async fn run_spawn_drain_loop(
 /// `StopSingleton` control message to the remote owner (whose ack returns as
 /// `ClusterEvent::SingletonStopped`).
 async fn run_singleton_stop_drain_loop(
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
     local_node_id: String,
     receptionist: crate::receptionist::Receptionist,
     coordinator: Endpoint<Coordinator>,
@@ -373,7 +373,7 @@ async fn run_singleton_stop_drain_loop(
                 req.target_node_id,
                 req.label
             );
-            if let Err(e) = transport
+            if let Err(e) = net
                 .send_control(
                     &req.target_node_id,
                     ControlMessage::StopSingleton {

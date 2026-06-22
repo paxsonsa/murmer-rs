@@ -1,4 +1,4 @@
-//! iroh transport layer — manages connections between cluster nodes.
+//! iroh transport layer — the production [`Net`] implementation.
 //!
 //! [`Transport`] owns an `iroh::Endpoint` and maintains a connection map keyed by
 //! node id (endpoint id + incarnation). It handles:
@@ -11,16 +11,23 @@
 //! ed25519 public key verified by iroh's TLS handshake). The zero-trust
 //! allowlist is enforced at the iroh layer via an [`AllowlistHook`] before any
 //! application bytes flow; the cookie handshake here is a secondary coarse gate.
+//!
+//! `Transport` implements the [`Net`] seam (`super::net`): all iroh stream and
+//! connection types are wrapped in the boxed [`SendHalf`]/[`RecvHalf`]/
+//! [`Connection`](super::net::Connection) trait objects at this boundary, so the
+//! rest of the cluster (event loop, remote dispatch) is iroh-agnostic and can be
+//! swapped for an in-memory deterministic fabric in simulation.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use iroh::endpoint::{
-    Connection, IdleTimeout, Incoming, QuicTransportConfig, RecvStream, SendStream, VarInt, presets,
+    Connection, IdleTimeout, Incoming, QuicTransportConfig, RecvStream, VarInt, presets,
 };
-use iroh::{Endpoint, EndpointAddr, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -30,43 +37,30 @@ use super::allowlist::Allowlist;
 use super::config::{NodeClass, NodeIdentity, TransportTuning};
 use super::error::ClusterError;
 use super::framing::{self, ControlMessage, FrameCodec, HandshakePayload, PROTOCOL_VERSION};
+use super::net::iroh::{IrohConnection, IrohRecv, IrohSend};
+use super::net::{self, ConnectionEvent, IncomingConnection, Net, NodeId, PeerAddr, RecvHalf, SendHalf};
 
 /// ALPN identifying the murmer cluster protocol on iroh connections.
 pub const MURMER_ALPN: &[u8] = b"murmer/cluster/1";
 
+/// Convert an iroh [`EndpointAddr`] into the seam-neutral [`PeerAddr`] the
+/// [`Net`] trait dials with. This is the iroh→seam direction (the inverse of
+/// what [`Net::connect`] does internally); it lives here, at the iroh boundary,
+/// so `net/mod.rs` stays free of iroh types.
+///
+/// `ip_addrs()` keeps only the direct IP sockets (relay/custom transport addrs
+/// are dropped) — which is exactly what `PeerAddr.hint` models, and in
+/// self-contained mode (relays disabled) those are the only addrs present.
+pub fn peer_addr(addr: &EndpointAddr) -> PeerAddr {
+    PeerAddr {
+        id: NodeId(addr.id.to_string()),
+        hint: addr.ip_addrs().copied().collect(),
+    }
+}
+
 // =============================================================================
 // TRANSPORT — iroh endpoint + connection pool
 // =============================================================================
-
-/// Lifecycle events for connections in the transport layer.
-/// Subscribers can use these to react to connectivity changes (e.g., failing
-/// pending response futures when a node disconnects).
-#[derive(Debug, Clone)]
-pub enum ConnectionEvent {
-    /// A new connection to a node has been established and stored.
-    Connected(String),
-    /// A connection to a node has been removed (departure, failure, or
-    /// replaced by a new incarnation).
-    Disconnected(String),
-}
-
-/// An incoming connection that has completed the handshake.
-/// Carries the surviving recv stream so the event loop can spawn
-/// `run_control_stream_reader` with its own shared channel.
-pub struct IncomingConnection {
-    pub remote_identity: NodeIdentity,
-    pub connection: Connection,
-    pub control_tx: mpsc::UnboundedSender<ControlMessage>,
-    /// The recv half of the handshake stream — still live, ready
-    /// for the event loop to read ongoing control messages from.
-    pub control_recv: RecvStream,
-    /// The peer's declared node class (from handshake).
-    pub node_class: NodeClass,
-    /// The peer's declared metadata (from handshake).
-    pub node_metadata: HashMap<String, String>,
-    /// Whether the peer is a pure Edge client (connected via `Transport::connect_only`).
-    pub is_edge_client: bool,
-}
 
 /// Manages a single connection to a peer node.
 pub struct NodeConnection {
@@ -78,7 +72,8 @@ pub struct NodeConnection {
 }
 
 /// The transport layer: owns the iroh endpoint, accepts incoming connections,
-/// connects to peers, and maintains a connection pool.
+/// connects to peers, and maintains a connection pool. This is the production
+/// [`Net`] implementation.
 pub struct Transport {
     endpoint: Endpoint,
     identity: NodeIdentity,
@@ -232,146 +227,6 @@ impl Transport {
         Ok((transport, connection_events_rx))
     }
 
-    /// The actual bound listen address (useful when binding to port 0).
-    pub fn local_addr(&self) -> SocketAddr {
-        self.endpoint
-            .bound_sockets()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))
-    }
-
-    /// Connect to a peer node by its [`EndpointAddr`] (endpoint id + address
-    /// hint), perform the handshake, and store the connection.
-    ///
-    /// Incarnation-aware dedup: after the iroh handshake completes and the
-    /// remote `NodeIdentity` is known, we check whether we already hold a
-    /// connection for that endpoint id. Same incarnation → duplicate, rejected.
-    /// Different incarnation → the node restarted; the old connection is replaced.
-    pub async fn connect(
-        self: &Arc<Self>,
-        addr: EndpointAddr,
-    ) -> Result<IncomingConnection, ClusterError> {
-        let target_id = addr.id;
-        let connection = self
-            .endpoint
-            .connect(addr, MURMER_ALPN)
-            .await
-            .map_err(|e| ClusterError::Transport(e.to_string()))?;
-
-        // Open the control stream (stream 0) and send our handshake.
-        let (mut send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| ClusterError::Connection(e.to_string()))?;
-
-        let our_handshake = self.handshake_payload();
-        let frame = framing::encode_message(&ControlMessage::Handshake(our_handshake))
-            .map_err(ClusterError::Serialization)?;
-        send.write_all(&frame)
-            .await
-            .map_err(|e| ClusterError::Transport(e.to_string()))?;
-
-        // Read the peer's handshake response — recv stream stays alive.
-        let (peer_handshake, recv) = read_handshake(recv).await?;
-
-        self.validate_handshake(&connection, &peer_handshake, target_id)?;
-
-        let remote_identity = peer_handshake.identity.clone();
-        let node_key = remote_identity.node_id_string();
-        let (control_out_tx, control_out_rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_control_stream_writer(
-            send,
-            control_out_rx,
-            self.shutdown.clone(),
-        ));
-
-        self.dedup_and_store(&connection, &remote_identity, &node_key, &control_out_tx)
-            .await?;
-
-        instrument::connection_opened();
-        let _ = self
-            .connection_events_tx
-            .send(ConnectionEvent::Connected(node_key));
-
-        Ok(IncomingConnection {
-            remote_identity,
-            connection,
-            control_tx: control_out_tx,
-            control_recv: recv,
-            node_class: peer_handshake.node_class,
-            node_metadata: peer_handshake.node_metadata,
-            is_edge_client: peer_handshake.is_edge_client,
-        })
-    }
-
-    /// Get the connection for a given node, if it exists.
-    pub async fn get_connection(&self, node_id: &str) -> Option<Connection> {
-        let conns = self.connections.read().await;
-        conns.get(node_id).map(|nc| nc.connection.clone())
-    }
-
-    /// Send a control message to a specific peer.
-    pub async fn send_control(
-        &self,
-        node_id: &str,
-        msg: ControlMessage,
-    ) -> Result<(), ClusterError> {
-        let conns = self.connections.read().await;
-        let nc = conns
-            .get(node_id)
-            .ok_or_else(|| ClusterError::NodeNotFound(node_id.to_string()))?;
-        nc.control_tx
-            .send(msg)
-            .map_err(|_| ClusterError::Transport("control channel closed".into()))?;
-        Ok(())
-    }
-
-    /// Send a control message to all connected peers.
-    pub async fn broadcast_control(&self, msg: &ControlMessage) {
-        let conns = self.connections.read().await;
-        for (node_id, nc) in conns.iter() {
-            if nc.control_tx.send(msg.clone()).is_err() {
-                tracing::warn!("Failed to send control message to {node_id}");
-            }
-        }
-    }
-
-    /// List all connected node IDs.
-    pub async fn connected_nodes(&self) -> Vec<String> {
-        let conns = self.connections.read().await;
-        conns.keys().cloned().collect()
-    }
-
-    /// Remove a connection (called when a peer departs or fails).
-    pub async fn remove_connection(&self, node_id: &str) {
-        let mut conns = self.connections.write().await;
-        if let Some(nc) = conns.remove(node_id) {
-            nc.connection.close(VarInt::from_u32(0), b"node departed");
-            instrument::connection_closed();
-            let _ = self
-                .connection_events_tx
-                .send(ConnectionEvent::Disconnected(node_id.to_string()));
-        }
-    }
-
-    /// Open a new bidirectional stream to a peer for actor messaging.
-    pub async fn open_actor_stream(
-        &self,
-        node_id: &str,
-    ) -> Result<(SendStream, RecvStream), ClusterError> {
-        let conns = self.connections.read().await;
-        let nc = conns
-            .get(node_id)
-            .ok_or_else(|| ClusterError::NodeNotFound(node_id.to_string()))?;
-        let (send, recv) = nc
-            .connection
-            .open_bi()
-            .await
-            .map_err(|e| ClusterError::Connection(e.to_string()))?;
-        Ok((send, recv))
-    }
-
     // =========================================================================
     // INTERNAL
     // =========================================================================
@@ -394,7 +249,7 @@ impl Transport {
         &self,
         connection: &Connection,
         peer: &HandshakePayload,
-        expected_id: iroh::EndpointId,
+        expected_id: EndpointId,
     ) -> Result<(), ClusterError> {
         let authenticated_id = connection.remote_id();
 
@@ -433,7 +288,7 @@ impl Transport {
 
     /// Incarnation-aware dedup keyed on endpoint id, then insert the connection.
     async fn dedup_and_store(
-        self: &Arc<Self>,
+        &self,
         connection: &Connection,
         remote_identity: &NodeIdentity,
         node_key: &str,
@@ -510,7 +365,7 @@ impl Transport {
     /// Drop live connections to peers revoked from the allowlist.
     async fn revocation_loop(
         self: Arc<Self>,
-        mut revoked_rx: tokio::sync::broadcast::Receiver<iroh::EndpointId>,
+        mut revoked_rx: tokio::sync::broadcast::Receiver<EndpointId>,
     ) {
         loop {
             tokio::select! {
@@ -539,7 +394,7 @@ impl Transport {
     }
 
     async fn handle_incoming(
-        self: &Arc<Self>,
+        &self,
         incoming: Incoming,
     ) -> Result<IncomingConnection, ClusterError> {
         let connection = incoming
@@ -571,8 +426,8 @@ impl Transport {
         let remote_identity = peer_handshake.identity.clone();
         let node_key = remote_identity.node_id_string();
         let (control_out_tx, control_out_rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_control_stream_writer(
-            send,
+        tokio::spawn(net::run_control_stream_writer(
+            Box::new(IrohSend(send)),
             control_out_rx,
             self.shutdown.clone(),
         ));
@@ -589,13 +444,165 @@ impl Transport {
 
         Ok(IncomingConnection {
             remote_identity,
-            connection,
+            connection: Box::new(IrohConnection(connection)),
             control_tx: control_out_tx,
-            control_recv: recv,
+            control_recv: Box::new(IrohRecv(recv)),
             node_class: peer_handshake.node_class,
             node_metadata: peer_handshake.node_metadata,
             is_edge_client: peer_handshake.is_edge_client,
         })
+    }
+}
+
+// =============================================================================
+// NET IMPL — the iroh production transport behind the seam
+// =============================================================================
+
+#[async_trait]
+impl Net for Transport {
+    fn node_id(&self) -> NodeId {
+        // The stable, authenticated identity. The pool/route key elsewhere is the
+        // `node_id_string` (endpoint id + incarnation); `NodeId` is the identity
+        // that flows through discovery/handshake.
+        NodeId(self.identity.endpoint_id.to_string())
+    }
+
+    /// The actual bound listen address (useful when binding to port 0).
+    fn local_addr(&self) -> SocketAddr {
+        self.endpoint
+            .bound_sockets()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
+    /// Connect to a peer node by its abstract [`PeerAddr`] (node id + address
+    /// hints), perform the handshake, and store the connection.
+    ///
+    /// The `PeerAddr` is converted to an iroh [`EndpointAddr`] at this boundary:
+    /// `id` is the endpoint id's string form and `hint` carries direct-dial
+    /// socket addresses.
+    ///
+    /// Incarnation-aware dedup: after the iroh handshake completes and the
+    /// remote `NodeIdentity` is known, we check whether we already hold a
+    /// connection for that endpoint id. Same incarnation → duplicate, rejected.
+    /// Different incarnation → the node restarted; the old connection is replaced.
+    async fn connect(&self, addr: PeerAddr) -> Result<IncomingConnection, ClusterError> {
+        let target_id: EndpointId = addr
+            .id
+            .0
+            .parse()
+            .map_err(|_| ClusterError::Transport(format!("invalid endpoint id: {}", addr.id)))?;
+        let endpoint_addr =
+            EndpointAddr::from_parts(target_id, addr.hint.iter().copied().map(TransportAddr::Ip));
+
+        let connection = self
+            .endpoint
+            .connect(endpoint_addr, MURMER_ALPN)
+            .await
+            .map_err(|e| ClusterError::Transport(e.to_string()))?;
+
+        // Open the control stream (stream 0) and send our handshake.
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| ClusterError::Connection(e.to_string()))?;
+
+        let our_handshake = self.handshake_payload();
+        let frame = framing::encode_message(&ControlMessage::Handshake(our_handshake))
+            .map_err(ClusterError::Serialization)?;
+        send.write_all(&frame)
+            .await
+            .map_err(|e| ClusterError::Transport(e.to_string()))?;
+
+        // Read the peer's handshake response — recv stream stays alive.
+        let (peer_handshake, recv) = read_handshake(recv).await?;
+
+        self.validate_handshake(&connection, &peer_handshake, target_id)?;
+
+        let remote_identity = peer_handshake.identity.clone();
+        let node_key = remote_identity.node_id_string();
+        let (control_out_tx, control_out_rx) = mpsc::unbounded_channel();
+        tokio::spawn(net::run_control_stream_writer(
+            Box::new(IrohSend(send)),
+            control_out_rx,
+            self.shutdown.clone(),
+        ));
+
+        self.dedup_and_store(&connection, &remote_identity, &node_key, &control_out_tx)
+            .await?;
+
+        instrument::connection_opened();
+        let _ = self
+            .connection_events_tx
+            .send(ConnectionEvent::Connected(node_key));
+
+        Ok(IncomingConnection {
+            remote_identity,
+            connection: Box::new(IrohConnection(connection)),
+            control_tx: control_out_tx,
+            control_recv: Box::new(IrohRecv(recv)),
+            node_class: peer_handshake.node_class,
+            node_metadata: peer_handshake.node_metadata,
+            is_edge_client: peer_handshake.is_edge_client,
+        })
+    }
+
+    /// Send a control message to a specific peer.
+    async fn send_control(&self, node_id: &str, msg: ControlMessage) -> Result<(), ClusterError> {
+        let conns = self.connections.read().await;
+        let nc = conns
+            .get(node_id)
+            .ok_or_else(|| ClusterError::NodeNotFound(node_id.to_string()))?;
+        nc.control_tx
+            .send(msg)
+            .map_err(|_| ClusterError::Transport("control channel closed".into()))?;
+        Ok(())
+    }
+
+    /// Send a control message to all connected peers.
+    async fn broadcast_control(&self, msg: &ControlMessage) {
+        let conns = self.connections.read().await;
+        for (node_id, nc) in conns.iter() {
+            if nc.control_tx.send(msg.clone()).is_err() {
+                tracing::warn!("Failed to send control message to {node_id}");
+            }
+        }
+    }
+
+    /// Open a new bidirectional stream to a peer for actor messaging.
+    async fn open_actor_stream(
+        &self,
+        node_id: &str,
+    ) -> Result<(Box<dyn SendHalf>, Box<dyn RecvHalf>), ClusterError> {
+        let conns = self.connections.read().await;
+        let nc = conns
+            .get(node_id)
+            .ok_or_else(|| ClusterError::NodeNotFound(node_id.to_string()))?;
+        let (send, recv) = nc
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| ClusterError::Connection(e.to_string()))?;
+        Ok((Box::new(IrohSend(send)), Box::new(IrohRecv(recv))))
+    }
+
+    /// List all connected node IDs.
+    async fn connected_nodes(&self) -> Vec<String> {
+        let conns = self.connections.read().await;
+        conns.keys().cloned().collect()
+    }
+
+    /// Remove a connection (called when a peer departs or fails).
+    async fn remove_connection(&self, node_id: &str) {
+        let mut conns = self.connections.write().await;
+        if let Some(nc) = conns.remove(node_id) {
+            nc.connection.close(VarInt::from_u32(0), b"node departed");
+            instrument::connection_closed();
+            let _ = self
+                .connection_events_tx
+                .send(ConnectionEvent::Disconnected(node_id.to_string()));
+        }
     }
 }
 
@@ -650,80 +657,6 @@ async fn read_handshake(
     }
 }
 
-/// Background task: reads ControlMessage from a channel and writes them as
-/// length-prefixed frames to the iroh send stream.
-async fn run_control_stream_writer(
-    mut send: SendStream,
-    mut rx: mpsc::UnboundedReceiver<ControlMessage>,
-    shutdown: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            msg = rx.recv() => {
-                let Some(msg) = msg else { break };
-                let frame = match framing::encode_message(&msg) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!("Failed to encode control message: {e}");
-                        continue;
-                    }
-                };
-                if let Err(e) = send.write_all(&frame).await {
-                    tracing::warn!("Control stream write failed: {e}");
-                    break;
-                }
-            }
-            _ = shutdown.cancelled() => break,
-        }
-    }
-    let _ = send.finish();
-}
-
-/// Background task: reads length-prefixed frames from an iroh receive stream
-/// and sends them as ControlMessages to the provided channel.
-pub async fn run_control_stream_reader(
-    mut recv: RecvStream,
-    tx: mpsc::UnboundedSender<(String, ControlMessage)>,
-    node_id: String,
-    shutdown: CancellationToken,
-) {
-    let mut codec = FrameCodec::new();
-    let mut buf = vec![0u8; 8192];
-
-    loop {
-        tokio::select! {
-            result = recv.read(&mut buf) => {
-                match result {
-                    Ok(Some(n)) => {
-                        codec.push_data(&buf[..n]);
-                        while let Ok(Some(frame)) = codec.next_frame() {
-                            match framing::decode_message::<ControlMessage>(&frame) {
-                                Ok(msg) => {
-                                    if tx.send((node_id.clone(), msg)).is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to decode control message from {node_id}: {e}");
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::debug!("Control stream from {node_id} closed");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Control stream read error from {node_id}: {e}");
-                        break;
-                    }
-                }
-            }
-            _ = shutdown.cancelled() => break,
-        }
-    }
-}
-
 // =============================================================================
 // ALLOWLIST INTEGRATION TESTS — prove the zero-trust security property
 // =============================================================================
@@ -733,7 +666,7 @@ mod allowlist_tests {
     use super::*;
     use crate::cluster::allowlist::{Allowlist, add_to_file, remove_from_file, write_file};
     use crate::cluster::config::AllowlistMode;
-    use iroh::{EndpointAddr, SecretKey, TransportAddr};
+    use iroh::SecretKey;
     use std::collections::HashSet;
 
     fn install_crypto() {
@@ -777,9 +710,13 @@ mod allowlist_tests {
         (t, incoming, identity)
     }
 
-    /// The iroh address to dial a bound node on loopback.
-    fn dial_addr(t: &Transport, id: &NodeIdentity) -> EndpointAddr {
-        EndpointAddr::from_parts(id.endpoint_id, [TransportAddr::Ip(t.local_addr())])
+    /// The abstract [`PeerAddr`] to dial a bound node on loopback: its endpoint
+    /// id as the [`NodeId`] plus the bound socket as the dial hint.
+    fn dial_addr(t: &Transport, id: &NodeIdentity) -> PeerAddr {
+        PeerAddr {
+            id: NodeId(id.endpoint_id.to_string()),
+            hint: vec![t.local_addr()],
+        }
     }
 
     #[tokio::test]

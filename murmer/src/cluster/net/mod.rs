@@ -33,10 +33,11 @@ use std::net::SocketAddr;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::config::{NodeClass, NodeIdentity};
 use super::error::ClusterError;
-use super::framing::ControlMessage;
+use super::framing::{self, ControlMessage, FrameCodec};
 
 /// Abstract, transport-neutral node identity.
 ///
@@ -57,14 +58,19 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// Abstract dial target. Replaces `iroh::EndpointAddr` (id + socket hint). In
-/// simulation the socket hint is meaningless and ignored; addressing collapses
+/// Abstract dial target. Replaces `iroh::EndpointAddr` (id + socket hints). In
+/// simulation the socket hints are meaningless and ignored; addressing collapses
 /// to the id.
 #[derive(Clone, Debug)]
 pub struct PeerAddr {
     pub id: NodeId,
-    /// Best-effort dial hint (host:port). `None` / ignored in sim.
-    pub hint: Option<SocketAddr>,
+    /// Best-effort dial hints (host:port). May be empty / ignored in sim.
+    ///
+    /// A `Vec` (not a single hint) because `iroh::EndpointAddr` carries multiple
+    /// `TransportAddr`s — mDNS and seed configs can advertise a multi-homed peer,
+    /// and collapsing to one would silently degrade multi-homed dialing. The sim
+    /// impl ignores this entirely.
+    pub hint: Vec<SocketAddr>,
 }
 
 /// Connection lifecycle event delivered on the `Net`'s event channel.
@@ -166,4 +172,86 @@ pub trait RecvHalf: Send {
     /// `Err` = stream error. **Invariant:** bytes within a live stream are never
     /// reordered or lost; drop/partition fail the whole stream instead.
     async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ClusterError>;
+}
+
+// =============================================================================
+// CONTROL-STREAM PUMPS — transport-neutral framing loops
+// =============================================================================
+//
+// These were `transport.rs` free fns over iroh `SendStream`/`RecvStream`; they
+// only ever touched bytes (`FrameCodec`) plus a shutdown token, so they live
+// here over the boxed seam halves and serve both the iroh and sim impls.
+
+/// Background task: reads `ControlMessage`s from a channel and writes them as
+/// length-prefixed frames to a [`SendHalf`].
+pub async fn run_control_stream_writer(
+    mut send: Box<dyn SendHalf>,
+    mut rx: mpsc::UnboundedReceiver<ControlMessage>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
+                let frame = match framing::encode_message(&msg) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("Failed to encode control message: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = send.write_all(&frame).await {
+                    tracing::warn!("Control stream write failed: {e}");
+                    break;
+                }
+            }
+            _ = shutdown.cancelled() => break,
+        }
+    }
+    let _ = send.finish();
+}
+
+/// Background task: reads length-prefixed frames from a [`RecvHalf`] and sends
+/// them as `ControlMessage`s to the provided channel, tagged with `node_id`.
+pub async fn run_control_stream_reader(
+    mut recv: Box<dyn RecvHalf>,
+    tx: mpsc::UnboundedSender<(String, ControlMessage)>,
+    node_id: String,
+    shutdown: CancellationToken,
+) {
+    let mut codec = FrameCodec::new();
+    let mut buf = vec![0u8; 8192];
+
+    loop {
+        tokio::select! {
+            result = recv.read(&mut buf) => {
+                match result {
+                    Ok(Some(n)) => {
+                        codec.push_data(&buf[..n]);
+                        while let Ok(Some(frame)) = codec.next_frame() {
+                            match framing::decode_message::<ControlMessage>(&frame) {
+                                Ok(msg) => {
+                                    if tx.send((node_id.clone(), msg)).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to decode control message from {node_id}: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Control stream from {node_id} closed");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Control stream read error from {node_id}: {e}");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => break,
+        }
+    }
 }
