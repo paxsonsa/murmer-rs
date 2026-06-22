@@ -26,14 +26,23 @@ const MDNS_ENDPOINT_ID_KEY: &str = "endpoint-id";
 
 /// Start the discovery mechanism(s) based on the config.
 ///
-/// Returns a receiver of `DiscoveryEvent` that the ClusterSystem event loop
-/// should poll. Discovered peers are candidates for connection — but discovery
-/// only conveys *addressing hints*; the allowlist decides authorization.
+/// Returns the `DiscoveryEvent` sender and receiver. The ClusterSystem event loop
+/// polls the receiver; discovered peers are candidates for connection (discovery
+/// conveys only *addressing hints* — the allowlist decides authorization).
+///
+/// The sender is handed back too so the cluster can keep it alive AND inject
+/// peers programmatically (e.g. `ClusterSystem::inject_discovered`). Holding the
+/// sender also keeps the receiver's select arm live under `Discovery::None`,
+/// where no background task owns a sender — which is how simulation drives
+/// topology (mDNS/seed are real-network/Tokio paths, bypassed under sim).
 pub fn start_discovery(
     identity: &NodeIdentity,
     discovery: &Discovery,
     shutdown: CancellationToken,
-) -> mpsc::UnboundedReceiver<DiscoveryEvent> {
+) -> (
+    mpsc::UnboundedSender<DiscoveryEvent>,
+    mpsc::UnboundedReceiver<DiscoveryEvent>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
 
     match discovery {
@@ -53,12 +62,12 @@ pub fn start_discovery(
                 tx.clone(),
                 shutdown.clone(),
             );
-            start_seed_connector(identity.clone(), seed_nodes.clone(), tx, shutdown);
+            start_seed_connector(identity.clone(), seed_nodes.clone(), tx.clone(), shutdown);
         }
         Discovery::None => {}
     }
 
-    rx
+    (tx, rx)
 }
 
 // =============================================================================

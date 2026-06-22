@@ -111,6 +111,10 @@ pub struct ClusterSystem {
     receptionist: Receptionist,
     net: Arc<dyn Net>,
     runtime: Arc<dyn Runtime>,
+    /// Sender for the discovery event stream — retained both to keep the event
+    /// loop's `discovery_rx` arm live and to inject peers via
+    /// [`inject_discovered`](Self::inject_discovered).
+    discovery_tx: mpsc::UnboundedSender<discovery::DiscoveryEvent>,
     #[allow(dead_code)]
     config: ClusterConfig,
     identity: NodeIdentity,
@@ -195,7 +199,7 @@ impl ClusterSystem {
         let net: Arc<dyn Net> = transport;
 
         // Start discovery
-        let discovery_rx =
+        let (discovery_tx, discovery_rx) =
             discovery::start_discovery(&identity, &config.discovery, shutdown.clone());
 
         // Initialize SWIM membership
@@ -214,6 +218,7 @@ impl ClusterSystem {
             receptionist: receptionist.clone(),
             net: Arc::clone(&net),
             runtime: Arc::clone(&runtime),
+            discovery_tx,
             config: config.clone(),
             identity: identity.clone(),
             event_tx: event_tx.clone(),
@@ -338,6 +343,18 @@ impl ClusterSystem {
     /// Get the actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.net.local_addr()
+    }
+
+    /// Inject a discovered peer, as if a discovery backend had found it: feeds
+    /// `PeerDiscovered` into the event loop, which dials and handshakes it (the
+    /// allowlist still gates authorization). This is the programmatic discovery
+    /// seam — the cluster's own way to learn of a peer without mDNS/seed config,
+    /// and how simulation wires topology (mDNS/seed are real-network paths,
+    /// bypassed under sim). No-op if the event loop has stopped.
+    pub fn inject_discovered(&self, addr: net::PeerAddr) {
+        let _ = self
+            .discovery_tx
+            .send(discovery::DiscoveryEvent::PeerDiscovered(addr));
     }
 
     /// Shut down the cluster system gracefully.
