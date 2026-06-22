@@ -1263,4 +1263,131 @@ mod tests {
             );
         }
     }
+
+    // ── The split-brain fence experiment (the Raft decision artifact) ─────────
+
+    /// Boot a full cluster node AND its app-layer Coordinator (bridge, election,
+    /// and the default in-RAM `GenerationSource`) on the sim runtime. Returns the
+    /// system, its `SimNet` (to inject partitions), and the Coordinator endpoint.
+    #[cfg(feature = "app")]
+    fn boot_coordinator(
+        fabric: &SimFabric,
+        rt: &Arc<dyn Runtime>,
+        shutdown: &CancellationToken,
+        name: &str,
+        id: &str,
+        port: u16,
+    ) -> (
+        ClusterSystem,
+        Arc<SimNet>,
+        Endpoint<crate::app::coordinator::Coordinator>,
+    ) {
+        use crate::app::bridge;
+        use crate::app::coordinator::CoordinatorState;
+        use crate::app::election::OldestNode;
+        use crate::app::placement::LeastLoaded;
+
+        let (sys, net) = boot(fabric, rt, shutdown, name, id, port);
+        let coord = bridge::start_coordinator(
+            &sys,
+            CoordinatorState::new(
+                sys.identity().node_id_string(),
+                Box::new(LeastLoaded),
+                Box::new(OldestNode::any()),
+            ),
+        );
+        (sys, net, coord)
+    }
+
+    /// THE Raft decision artifact: with the default per-node in-RAM
+    /// `GenerationSource`, a network partition lets two coordinators grant the
+    /// *same* fence generation to two *different* owners — a genuine split-brain
+    /// the `(term, seq)` fence cannot resolve.
+    ///
+    /// Sequence: A (leader, oldest by name tiebreak) places `catalog` at term 1.
+    /// Partition A|B and advance so foca on B detects A failed; B's bridge marks A
+    /// down, so B now believes it is leader. A client re-submits `StartSingleton`
+    /// to B (the spec doesn't propagate and there is no rebuild path —
+    /// `GenerationSource::current()` has no callers — so re-submission is how a new
+    /// leader learns a singleton). B's *own* RAM source has never seen `catalog`,
+    /// so it mints term 1 again. Now A and B both own `catalog` at the identical
+    /// generation: a packed-generation compare cannot order them, so both would be
+    /// allowed to write.
+    ///
+    /// This test exercises the whole stack the simulation work built: boot on
+    /// SimNet, partition + SWIM failure detection, the app bridge on the runtime
+    /// seam, election, and the generation source. It asserts the *broken* current
+    /// behavior on purpose — it is the concrete motivation for a consensus-minted
+    /// (e.g. openraft) `GenerationSource`, under which the minority B could not
+    /// commit a grant (no quorum) and this assertion would invert to safety. The
+    /// singleton actor never spawns (empty `SpawnRegistry`); the generation is
+    /// minted at `claim_term`, before the spawn, so the fence token is what's under
+    /// test, not the actor lifecycle.
+    #[cfg(feature = "app")]
+    #[test]
+    fn split_brain_double_grants_one_generation_to_two_owners() {
+        use crate::app::coordinator::StartSingleton;
+        use crate::app::singleton::{SingletonAnchor, SingletonGeneration, SingletonSpec};
+
+        install_crypto();
+        let mut world = SimWorld::new(1);
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+        let shutdown = CancellationToken::new();
+
+        let (sys_a, net_a, coord_a) =
+            boot_coordinator(&fabric, &rt, &shutdown, "node-a", "node-a-id", 7001);
+        let (sys_b, _net_b, coord_b) =
+            boot_coordinator(&fabric, &rt, &shutdown, "node-b", "node-b-id", 7002);
+
+        // Mesh A↔B and let the bridges learn both nodes. A is leader (equal
+        // incarnations → name tiebreak, "node-a" < "node-b").
+        sys_a.inject_discovered(PeerAddr {
+            id: sys_b.identity().endpoint_id.clone(),
+            hint: vec![],
+        });
+        world.pump();
+
+        let start = |label: &str| StartSingleton {
+            spec: SingletonSpec::new(label, "test::Catalog", SingletonAnchor::Leader),
+        };
+
+        // Leader A places the singleton: term 1, owned by A.
+        let own_a = {
+            let coord = coord_a.clone();
+            let msg = start("catalog");
+            world.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(own_a.generation, SingletonGeneration { term: 1, seq: 0 });
+        assert_eq!(
+            own_a.owner_node_id.as_deref(),
+            Some(sys_a.identity().node_id_string().as_str())
+        );
+
+        // Partition A|B, then advance so foca on B detects A failed → B's bridge
+        // marks A down → B believes it is the leader.
+        assert!(net_a.partition(&sys_b.identity().node_id_string()));
+        world.advance(Duration::from_secs(30));
+
+        // The client re-submits to the new leader B. B's own RAM source has never
+        // seen "catalog" → it mints term 1 again, for owner B.
+        let own_b = {
+            let coord = coord_b.clone();
+            let msg = start("catalog");
+            world.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+
+        // The split brain: identical fence token, two distinct owners.
+        assert_eq!(own_b.generation, SingletonGeneration { term: 1, seq: 0 });
+        assert_eq!(
+            own_a.generation, own_b.generation,
+            "the per-node RAM GenerationSource double-grants the SAME generation under \
+             partition — the fence cannot order two owners holding equal (term, seq)"
+        );
+        assert_ne!(
+            own_a.owner_node_id, own_b.owner_node_id,
+            "two distinct owners now hold the same fence token (split brain)"
+        );
+    }
 }
