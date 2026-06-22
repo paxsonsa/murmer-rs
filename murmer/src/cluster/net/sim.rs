@@ -649,6 +649,7 @@ mod tests {
     use crate::sim::SimWorld;
     use crate::ResponseRegistry;
     use serde::{Deserialize, Serialize};
+    use std::collections::BTreeSet;
     use std::time::Duration;
     use tokio::sync::broadcast;
 
@@ -942,5 +943,110 @@ mod tests {
             full_mesh_pairs(),
             "membership must hold at the full set while foca probes a healthy mesh"
         );
+    }
+
+    // ── Phase 3: partition / failover / fence ────────────────────────────────
+
+    /// Boot a converged 3-node full mesh (each node on its OWN shutdown token),
+    /// crash `victim` by cancelling its token — all its tasks stop, so it goes
+    /// silent without broadcasting a Departure (an abrupt crash, not a graceful
+    /// leave) — then advance past foca's detection budget. Returns the
+    /// `(failed, pruned)` node-id sets the *survivors* observed.
+    ///
+    /// Crucially the survivors' receivers are subscribed AFTER convergence, so
+    /// they capture only the failure phase, and the returned sets aggregate ALL
+    /// survivors — so a caller can assert not just "the victim was detected" but
+    /// "exactly the victim, and no healthy node was falsely failed".
+    fn crash_one(seed: u64, victim: usize) -> (BTreeSet<String>, BTreeSet<String>) {
+        install_crypto();
+        let mut world = SimWorld::new(seed);
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+
+        let spec = [
+            ("node-a", "node-a-id", 7001u16),
+            ("node-b", "node-b-id", 7002),
+            ("node-c", "node-c-id", 7003),
+        ];
+        // Per-node shutdown tokens so one node can be crashed independently.
+        let tokens: Vec<CancellationToken> = spec.iter().map(|_| CancellationToken::new()).collect();
+        let sys: Vec<ClusterSystem> = spec
+            .iter()
+            .zip(&tokens)
+            .map(|((name, id, port), tok)| boot(&fabric, &rt, tok, name, id, *port))
+            .collect();
+
+        for &(from, to) in FULL_MESH {
+            sys[from].inject_discovered(PeerAddr {
+                id: sys[to].identity().endpoint_id.clone(),
+                hint: vec![],
+            });
+        }
+        world.pump(); // converge — every node sees the other two up
+
+        // Subscribe AFTER convergence so the receivers capture only the failure
+        // phase (broadcast doesn't replay pre-subscribe events).
+        let mut survivor_ev: Vec<_> = sys
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != victim)
+            .map(|(_, s)| s.subscribe_events())
+            .collect();
+
+        // Crash the victim: its event loop, control readers/writers, accept loop,
+        // and foca timer manager all stop on the cancelled token. Its
+        // control-writer halves drop, landing the survivors' readers on clean EOF.
+        tokens[victim].cancel();
+
+        // Advance past foca's budget: probe_period 1.5s + suspect_to_down_after 3s
+        // (~<10s worst case); 30s is comfortable for any seed's probe-target order.
+        world.advance(Duration::from_secs(30));
+
+        let mut failed = BTreeSet::new();
+        let mut pruned = BTreeSet::new();
+        for rx in survivor_ev.iter_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ClusterEvent::NodeFailed(id)) => {
+                        failed.insert(id.endpoint_id.0);
+                    }
+                    Ok(ClusterEvent::NodePruned(id)) => {
+                        pruned.insert(id.endpoint_id.0);
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        (failed, pruned)
+    }
+
+    /// Phase 3, step 1: SWIM failure detection under a deterministic crash. A
+    /// node is killed; foca on the survivors probes it, gets no ack, suspects it,
+    /// and after `suspect_to_down_after` declares it down — `MemberDown` →
+    /// `NodeFailed` → the event loop prunes it (`NodePruned`).
+    ///
+    /// The assertion is two-sided, which is the real correctness property: the
+    /// failed/pruned set is *exactly* the crashed node — the healthy survivor pair
+    /// is never falsely failed (their acks cross in the same virtual instant, so
+    /// neither is ever suspected). "Detect the dead AND keep the live up." The
+    /// converged outcome is asserted, not the timing: foca's seeded probe-target
+    /// order varies *how fast* detection happens by seed, never *whether*.
+    #[test]
+    fn crashed_node_is_detected_failed_and_pruned() {
+        let only_a = BTreeSet::from(["node-a-id".to_string()]);
+        for seed in [1u64, 2, 0xC0FFEE] {
+            let (failed, pruned) = crash_one(seed, 0);
+            assert_eq!(
+                failed, only_a,
+                "exactly the crashed node A is detected failed — no false failure of the \
+                 healthy B–C pair (seed {seed})"
+            );
+            assert_eq!(
+                pruned, only_a,
+                "the cluster reacts: exactly A is pruned (seed {seed})"
+            );
+        }
     }
 }
