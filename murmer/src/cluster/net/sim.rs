@@ -1419,7 +1419,7 @@ mod tests {
     #[cfg(feature = "app")]
     #[test]
     fn one_shared_generation_source_fences_the_split_brain() {
-        use crate::app::coordinator::StartSingleton;
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
         use crate::app::singleton::{
             CoordinatorGenerationSource, GenerationSource, SingletonAnchor, SingletonSpec,
         };
@@ -1458,25 +1458,38 @@ mod tests {
         };
         assert_eq!(own_a.generation.term, 1);
 
-        // Partition + advance so B believes it is leader, then the client
-        // re-submits to B — exactly as in the broken test.
+        // Partition A|B and advance so B detects A failed and becomes leader.
         assert!(net_a.partition(&sys_b.identity().node_id_string()));
         world.advance(Duration::from_secs(30));
 
+        // With the shared backend, B does NOT need a client re-submit: it rebuilds
+        // `catalog`'s spec from the shared source and adopts it on itself at a
+        // strictly higher term. (A, still alive on its side of the partition,
+        // keeps its term-1 instance — but it is now fenced out by B's term 2, so
+        // the two never write concurrently. Contrast the per-node test above,
+        // where B's separate source re-grants term 1 and the fence collides.)
         let own_b = {
             let coord = coord_b.clone();
-            let msg = start("catalog");
-            world.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+            world.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
         };
-
-        // The fix: the shared source had already seen `catalog` at term 1, so B's
-        // claim bumps to term 2. Strictly higher → the fence orders them → A is
-        // fenced out. No split brain.
-        assert_eq!(own_b.generation.term, 2, "the shared source bumps the term on B's claim");
+        let own_b = own_b.expect("B adopts catalog from the shared backend under partition");
+        assert_eq!(
+            own_b.owner_node_id.as_deref(),
+            Some(sys_b.identity().node_id_string().as_str()),
+            "B owns catalog on its side"
+        );
+        assert_eq!(own_b.generation.term, 2, "the shared source bumps B's term");
         assert!(
             own_b.generation > own_a.generation,
-            "B's grant strictly outranks A's — the (term, seq) fence can now reject the stale \
-             owner A, so the two never write concurrently"
+            "B's grant strictly outranks A's — the (term, seq) fence rejects the stale owner A, \
+             so the two never write concurrently"
         );
     }
 
@@ -1557,6 +1570,90 @@ mod tests {
         assert!(
             on_b.is_none(),
             "amnesia: the new leader B never learned `catalog`, so it is orphaned (got {on_b:?})"
+        );
+    }
+
+    /// The amnesia FIX, the mirror of the orphan test above: with a single shared
+    /// backend (the durable-store path), the new leader rebuilds the singleton set
+    /// from the backend's persisted specs and adopts the singleton instead of
+    /// orphaning it — at a strictly higher term, so it's also fenced.
+    ///
+    /// Same scenario: A (leader, owner) places `catalog`, A is crashed, B becomes
+    /// leader. The only change from the orphan test is the shared source. Now B's
+    /// `load_singletons_from_backend` (run before the re-drive) reads `catalog`'s
+    /// spec, and the re-drive re-places it on B at term 2. This closes both holes
+    /// at once with the durable backend: the fence (higher term) AND the amnesia
+    /// (spec rebuild).
+    #[cfg(feature = "app")]
+    #[test]
+    fn shared_backend_lets_the_new_leader_adopt_the_singleton() {
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
+        use crate::app::singleton::{
+            CoordinatorGenerationSource, GenerationSource, SingletonAnchor, SingletonSpec,
+        };
+
+        install_crypto();
+        let mut world = SimWorld::new(1);
+        let sim_rt = world.runtime().clone();
+        let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
+        let fabric = SimFabric::new(sim_rt);
+
+        // ONE shared backend both coordinators mint from and rebuild from.
+        let shared: Arc<dyn GenerationSource> = Arc::new(CoordinatorGenerationSource::new());
+
+        let tok_a = CancellationToken::new();
+        let tok_b = CancellationToken::new();
+        let (sys_a, _net_a, coord_a) = boot_coordinator(
+            &fabric, &rt, &tok_a, "node-a", "node-a-id", 7001, Some(Arc::clone(&shared)),
+        );
+        let (sys_b, _net_b, coord_b) = boot_coordinator(
+            &fabric, &rt, &tok_b, "node-b", "node-b-id", 7002, Some(Arc::clone(&shared)),
+        );
+
+        sys_a.inject_discovered(PeerAddr {
+            id: sys_b.identity().endpoint_id.clone(),
+            hint: vec![],
+        });
+        world.pump();
+
+        // Leader A places (and owns) `catalog` at term 1.
+        let own_a = {
+            let coord = coord_a.clone();
+            let msg = StartSingleton {
+                spec: SingletonSpec::new("catalog", "test::Catalog", SingletonAnchor::Leader),
+            };
+            world.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        assert_eq!(own_a.generation.term, 1);
+
+        // Crash the leader A. B detects the failure and becomes leader.
+        tok_a.cancel();
+        world.advance(Duration::from_secs(30));
+
+        // B rebuilt `catalog` from the shared backend and re-placed it on itself —
+        // owner B, strictly-higher term. No orphan.
+        let on_b = {
+            let coord = coord_b.clone();
+            world.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        let on_b =
+            on_b.expect("new leader adopts catalog from the shared backend (not orphaned)");
+        assert_eq!(
+            on_b.owner_node_id.as_deref(),
+            Some(sys_b.identity().node_id_string().as_str()),
+            "B now owns catalog"
+        );
+        assert_eq!(on_b.generation.term, 2, "adopted at a bumped term");
+        assert!(
+            on_b.generation > own_a.generation,
+            "the adoption strictly outranks A's grant — the fence holds too"
         );
     }
 }

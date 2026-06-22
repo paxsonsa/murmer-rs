@@ -566,6 +566,10 @@ impl Coordinator {
             });
         }
 
+        // If we just became leader (the old leader is the failed node), inherit
+        // its singletons from the backend so the re-drive below can re-place them.
+        state.load_singletons_from_backend().await;
+
         // Re-place any singleton the failed node owned. The failed owner is gone
         // (SWIM-confirmed), so we do NOT drain it — we mint a strictly-higher
         // term and re-spawn; a zombie ex-owner is fenced by the `(term, seq)`
@@ -584,6 +588,10 @@ impl Coordinator {
         // Graceful departures never produce WaitForReturn timers (guarded by !graceful)
         let _timers = state.handle_node_departure(&msg.node_id, true);
         state.cluster_view.remove_node(&msg.node_id);
+
+        // If we just became leader, inherit the departed leader's singletons from
+        // the backend so the re-drive below can re-place them.
+        state.load_singletons_from_backend().await;
 
         // Re-place any singleton the departed node owned (fenced by a new term).
         state.redrive_singletons_after_loss(&msg.node_id).await;
@@ -726,6 +734,11 @@ impl Coordinator {
         // Fresh grant: bump `term`, reset `seq` — a new ownership epoch.
         let gen_source = state.generation_source.clone();
         let generation = gen_source.claim_term(&label, &owner).await?;
+        // Persist the spec to the backend so a future leader can rebuild this
+        // singleton (closes the amnesia gap when a shared/durable source is used).
+        if let Err(e) = gen_source.put_spec(&label, &msg.spec).await {
+            tracing::warn!("singleton {label}: put_spec failed: {e}");
+        }
         let ownership = SingletonOwnership {
             label: label.clone(),
             owner_node_id: Some(owner.clone()),
@@ -1044,6 +1057,40 @@ impl CoordinatorState {
                 "No spawn sender configured — singleton spawn for {} dropped",
                 spec.label
             );
+        }
+    }
+
+    /// Rebuild the managed singleton set from the durable backend — the
+    /// leader-rebuild path that closes the "amnesia" gap a new leader otherwise
+    /// has (a singleton's spec lived only in the Coordinator that placed it).
+    ///
+    /// Called before the re-drive on node loss: a node that has *just* become
+    /// leader (the old leader failed) inherits the singletons it never placed
+    /// itself by reading the backend's persisted specs, so the subsequent
+    /// `redrive_singletons_after_loss(old_leader)` finds them and re-places them.
+    ///
+    /// Leader-gated: a non-leader must keep an empty map so it never places. With
+    /// a per-node source `list` is this node's own (nothing new to load), so it's
+    /// a no-op there — the rebuild only does work with a shared/durable source.
+    async fn load_singletons_from_backend(&mut self) {
+        if !self.is_leader() {
+            return;
+        }
+        let records = match self.generation_source.list().await {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!("singleton leader-rebuild: list failed: {e}");
+                return;
+            }
+        };
+        for rec in records {
+            self.singletons
+                .entry(rec.spec.label.clone())
+                .or_insert_with(|| SingletonRuntime {
+                    spec: rec.spec,
+                    ownership: rec.ownership,
+                    pending_handoff: None,
+                });
         }
     }
 
