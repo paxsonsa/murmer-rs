@@ -132,6 +132,27 @@ impl System {
         })
     }
 
+    /// Like [`clustered`](Self::clustered) but on an explicit [`Runtime`]
+    /// (`crate::runtime::Runtime`) — the deterministic `SimRuntime` under
+    /// simulation, so the whole cluster runs on the virtual clock. The entire
+    /// cluster (event loop, foca timers, spawned stream handlers) is driven by
+    /// `runtime`. `clustered` is the production (Tokio) path.
+    pub async fn clustered_with_runtime(
+        config: ClusterConfig,
+        type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
+        runtime: std::sync::Arc<dyn crate::runtime::Runtime>,
+    ) -> Result<Self, ClusterError> {
+        let cluster =
+            ClusterSystem::start_with_runtime(config, type_registry, spawn_registry, runtime)
+                .await?;
+        Ok(Self {
+            inner: SystemInner::Clustered {
+                cluster: Box::new(cluster),
+            },
+        })
+    }
+
     /// Create a clustered system with auto-discovered type registry.
     ///
     /// Uses [`TypeRegistry::from_auto()`] to automatically register all actor

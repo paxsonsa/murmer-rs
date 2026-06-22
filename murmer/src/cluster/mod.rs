@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::instrument;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::{
     Actor, DispatchRequest, Endpoint, Listing, OpType, ReceptionKey, Receptionist,
     ReceptionistConfig, RemoteDispatch, RemoteInvocation,
@@ -109,6 +110,7 @@ impl NodeRegistry {
 pub struct ClusterSystem {
     receptionist: Receptionist,
     net: Arc<dyn Net>,
+    runtime: Arc<dyn Runtime>,
     #[allow(dead_code)]
     config: ClusterConfig,
     identity: NodeIdentity,
@@ -141,16 +143,33 @@ impl ClusterSystem {
         type_registry: TypeRegistry,
         spawn_registry: SpawnRegistry,
     ) -> Result<Self, ClusterError> {
+        Self::start_with_runtime(config, type_registry, spawn_registry, Arc::new(TokioRuntime))
+            .await
+    }
+
+    /// Like [`start`](Self::start) but on an explicit [`Runtime`] — the
+    /// deterministic `SimRuntime` under simulation, so the whole cluster
+    /// (event loop, timers, spawned stream handlers) runs on the virtual clock.
+    /// `start` is the production path (Tokio).
+    pub async fn start_with_runtime(
+        config: ClusterConfig,
+        type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<Self, ClusterError> {
         let identity = config.identity.clone();
         let shutdown = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(256);
 
-        // Receptionist with this node's identity
-        let receptionist = Receptionist::with_config(ReceptionistConfig {
-            node_id: identity.node_id_string(),
-            origin_addr: format!("{}:{}", identity.host, identity.port),
-            ..Default::default()
-        });
+        // Receptionist with this node's identity, on the same runtime seam.
+        let receptionist = Receptionist::with_config_and_runtime(
+            ReceptionistConfig {
+                node_id: identity.node_id_string(),
+                origin_addr: format!("{}:{}", identity.host, identity.port),
+                ..Default::default()
+            },
+            Arc::clone(&runtime),
+        );
 
         // Type manifest from the registry
         let type_manifest = type_registry.known_types();
@@ -190,6 +209,7 @@ impl ClusterSystem {
         let system = Self {
             receptionist: receptionist.clone(),
             net: Arc::clone(&net),
+            runtime: Arc::clone(&runtime),
             config: config.clone(),
             identity: identity.clone(),
             event_tx: event_tx.clone(),
@@ -202,6 +222,7 @@ impl ClusterSystem {
         spawn_event_loop(
             receptionist,
             net,
+            runtime,
             membership,
             identity,
             event_tx,
@@ -325,7 +346,7 @@ impl ClusterSystem {
         self.net.broadcast_control(&departure).await;
 
         // Small grace period for message delivery
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.runtime.sleep(Duration::from_millis(50)).await;
 
         // Cancel the event loop
         self.shutdown.cancel();
@@ -340,6 +361,7 @@ impl ClusterSystem {
 fn spawn_event_loop(
     receptionist: Receptionist,
     net: Arc<dyn Net>,
+    rt: Arc<dyn Runtime>,
     mut membership: ClusterMembership,
     identity: NodeIdentity,
     event_tx: broadcast::Sender<ClusterEvent>,
@@ -369,15 +391,21 @@ fn spawn_event_loop(
 
     let mut runtime = FocaRuntime::new(identity.clone(), event_tx.clone(), swim_tx, timer_cmd_tx);
 
-    // Periodic sync interval
-    let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
-
     // Track node ids we're currently connecting to, to avoid duplicates.
     let connecting = Arc::new(tokio::sync::Mutex::new(
         std::collections::HashSet::<NodeId>::new(),
     ));
 
-    tokio::spawn(async move {
+    // The event loop runs on the runtime seam (Tokio in prod, the deterministic
+    // SimRuntime under simulation). `loop_rt` is the clone the loop uses for its
+    // own spawns/timers; `tokio::select!` itself is just a poll combinator and
+    // needs no reactor.
+    let loop_rt = Arc::clone(&rt);
+    rt.spawn(Box::pin(async move {
+        // Periodic registry sync, on the runtime clock. `tokio::time::interval`
+        // fired its first tick immediately, so arm the first sleep at ZERO to
+        // preserve "sync at t≈0", then re-arm at 5s.
+        let mut sync_timer = loop_rt.sleep(Duration::from_secs(0));
         // Helper closure factored into an inline fn below to handle a new
         // connection identically regardless of inbound vs outbound origin.
 
@@ -394,6 +422,7 @@ fn spawn_event_loop(
                         &receptionist,
                         &net,
                         &node_registry,
+                        &loop_rt,
                     ).await;
                 }
 
@@ -408,6 +437,7 @@ fn spawn_event_loop(
                         &receptionist,
                         &net,
                         &node_registry,
+                        &loop_rt,
                     ).await;
                 }
 
@@ -427,7 +457,7 @@ fn spawn_event_loop(
 
                             let connecting2 = Arc::clone(&connecting);
                             let connected_tx = connected_tx.clone();
-                            tokio::spawn(async move {
+                            loop_rt.spawn(Box::pin(async move {
                                 match net.connect(addr).await {
                                     Ok(ic) => {
                                         tracing::info!("Connected to discovered peer: {peer_id}");
@@ -439,7 +469,7 @@ fn spawn_event_loop(
                                     }
                                 }
                                 connecting2.lock().await.remove(&peer_id);
-                            });
+                            }));
                         }
                     }
                 }
@@ -519,7 +549,7 @@ fn spawn_event_loop(
                                     let net = Arc::clone(&net);
                                     let connecting_clone = Arc::clone(&connecting);
                                     let connected_tx = connected_tx.clone();
-                                    tokio::spawn(async move {
+                                    loop_rt.spawn(Box::pin(async move {
                                         match net.connect(peer_addr).await {
                                             Ok(ic) => {
                                                 tracing::info!(
@@ -534,7 +564,7 @@ fn spawn_event_loop(
                                             }
                                         }
                                         connecting_clone.lock().await.remove(&peer_id);
-                                    });
+                                    }));
                                 }
                             }
                         }
@@ -706,9 +736,10 @@ fn spawn_event_loop(
                     }
                 }
 
-                // ── Periodic registry sync ──────────────────────────────
-                _ = sync_interval.tick() => {
+                // ── Periodic registry sync (on the runtime clock) ───────
+                _ = &mut sync_timer => {
                     sync::periodic_sync(&net, &receptionist, &node_registry).await;
+                    sync_timer = loop_rt.sleep(Duration::from_secs(5));
                 }
 
                 // ── Shutdown ────────────────────────────────────────────
@@ -718,7 +749,7 @@ fn spawn_event_loop(
                 }
             }
         }
-    });
+    }));
 }
 
 /// Handles a newly established connection (inbound or outbound):
@@ -734,6 +765,7 @@ async fn handle_new_connection(
     receptionist: &Receptionist,
     net: &Arc<dyn Net>,
     node_registry: &NodeRegistry,
+    rt: &Arc<dyn Runtime>,
 ) {
     let node_id = incoming.remote_identity.node_id_string();
     let is_edge_client = incoming.is_edge_client;
@@ -763,12 +795,12 @@ async fn handle_new_connection(
 
     // Spawn control stream reader — reads ongoing control messages from
     // the handshake stream (which survived read_handshake).
-    tokio::spawn(net::run_control_stream_reader(
+    rt.spawn(Box::pin(net::run_control_stream_reader(
         incoming.control_recv,
         control_in_tx.clone(),
         node_id.clone(),
         shutdown.clone(),
-    ));
+    )));
 
     // Spawn a task to accept additional bi streams from this connection.
     // New streams are actor streams or control continuations. The boxed
@@ -779,7 +811,8 @@ async fn handle_new_connection(
     let conn = incoming.connection;
     let nid = node_id.clone();
     let receptionist_for_streams = receptionist.clone();
-    tokio::spawn(async move {
+    let accept_rt = Arc::clone(rt);
+    rt.spawn(Box::pin(async move {
         loop {
             tokio::select! {
                 result = conn.accept_bi() => {
@@ -790,7 +823,7 @@ async fn handle_new_connection(
                             let receptionist_clone = receptionist_for_streams.clone();
                             let ctrl_tx = control_tx.clone();
                             let nid2 = nid.clone();
-                            tokio::spawn(async move {
+                            accept_rt.spawn(Box::pin(async move {
                                 handle_incoming_stream(
                                     receptionist_clone,
                                     send,
@@ -798,7 +831,7 @@ async fn handle_new_connection(
                                     ctrl_tx,
                                     nid2,
                                 ).await;
-                            });
+                            }));
                         }
                         None => {
                             tracing::debug!("Peer {nid} stopped accepting streams");
@@ -809,7 +842,7 @@ async fn handle_new_connection(
                 _ = shutdown_clone.cancelled() => break,
             }
         }
-    });
+    }));
 
     // Only request bidirectional sync for full cluster members.
     // Edge clients send their own RegistrySyncRequest on connect.
