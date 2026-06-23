@@ -37,12 +37,44 @@
 //! dispatch ([`handle_incoming_stream`](crate::cluster::handle_incoming_stream))
 //! over the real [`FrameCodec`](crate::cluster::framing) wire path, so a passing
 //! test proves the production message path, not a sim-only mock.
+//!
+//! # Network latency fault injection
+//!
+//! [`SimFabric::set_latency`] installs a [`LatencyConfig`] that delays each
+//! chunk's delivery by `base + rand(0..=jitter)` of virtual time. The model is
+//! faithful to QUIC's reliable ordered streams:
+//!
+//! - **FIFO within a stream** is preserved by a per-`SimSend` monotonic delivery
+//!   clock: `deliver_at = max(last_delivery, now) + sample_delay()`. A fast burst
+//!   of writes can never overtake one another — each chunk's delivery instant is
+//!   at least as late as the previous chunk's.
+//!
+//! - **Cross-stream reorder** emerges naturally from differing per-stream delays,
+//!   exactly as QUIC allows independent streams to interleave. No explicit
+//!   reordering is added.
+//!
+//! - **In-flight drops on partition** are handled inside the delayed-delivery
+//!   task: it checks `severed.is_cancelled()` before sending the chunk into the
+//!   channel, so a byte that was already in-flight when `partition` fires is
+//!   silently discarded instead of arriving after the link is gone.
+//!
+//! - **Default is off** (`None`): delivery is immediate and byte-for-byte
+//!   identical to the old behavior, so all existing tests are unaffected.
+//!
+//! The shared `Arc<Mutex<ChaCha8Rng>>` seeded from
+//! `runtime.derive_seed("net-faults")` is the single deterministic draw stream
+//! for all links: every delay sample comes from one RNG in a fixed draw order
+//! (the `write_all` call order the sim's task scheduler produces), so the whole
+//! fault schedule is reproducible from the root seed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -58,6 +90,41 @@ use super::{
     Connection, ConnectionEvent, IncomingConnection, Net, NodeId, PeerAddr, RecvHalf, SendHalf,
     run_control_stream_writer,
 };
+
+// =============================================================================
+// LATENCY CONFIG — seeded, shared delay sampler for network fault injection
+// =============================================================================
+
+/// Per-fabric latency configuration: a seeded RNG shared across all links so
+/// the draw order is the single deterministic fault schedule. `None` everywhere
+/// means no latency — delivery is immediate, byte-for-byte the old behavior.
+///
+/// Cheap to clone (the RNG is behind `Arc<Mutex<...>>`). Install via
+/// [`SimFabric::set_latency`]; the fabric clones it into every [`SimNet`] and
+/// [`SimConnection`] at bind/connect time.
+#[derive(Clone)]
+struct LatencyConfig {
+    runtime: SimRuntime,
+    base: Duration,
+    jitter: Duration,
+    /// Single draw stream for ALL links — seeded from
+    /// `runtime.derive_seed("net-faults")` so the fault schedule descends from
+    /// the root seed without consuming from the actor RNG stream.
+    rng: Arc<Mutex<ChaCha8Rng>>,
+}
+
+impl LatencyConfig {
+    /// Draw one delay sample: `base + uniform(0..=jitter)`.
+    /// If jitter is zero the result is exactly `base` (no RNG draw needed).
+    fn sample_delay(&self) -> Duration {
+        if self.jitter.is_zero() {
+            return self.base;
+        }
+        let jitter_ns = self.jitter.as_nanos() as u64;
+        let n = self.rng.lock().unwrap().next_u64() % (jitter_ns + 1);
+        self.base + Duration::from_nanos(n)
+    }
+}
 
 /// A bidirectional byte stream's two halves, as the `Net` seam hands them out.
 type Stream = (Box<dyn SendHalf>, Box<dyn RecvHalf>);
@@ -77,11 +144,25 @@ type Peers = Arc<Mutex<BTreeMap<String, SimDialTarget>>>;
 
 /// Send half: each `write_all` delivers one ordered chunk to the peer. Dropping
 /// it (or finishing) lets the peer's reads observe EOF once the channel drains.
+///
+/// When `latency` is `Some`, delivery is deferred to virtual time
+/// `deliver_at = max(last_delivery, now) + sample_delay()`. The monotonic
+/// `last_delivery` clock is the FIFO invariant: it prevents a shorter delay on
+/// chunk N+1 from overtaking chunk N that was written just before it. Cross-
+/// stream reorder emerges naturally from independent per-stream delays; no
+/// explicit reordering is added.
 struct SimSend {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     /// The connection's liveness token. Cancelled by partition/close → writes
     /// fail fast (a severed link cannot deliver).
     severed: CancellationToken,
+    /// Latency config, or `None` for immediate (no-latency) delivery.
+    latency: Option<LatencyConfig>,
+    /// Monotonic per-stream delivery clock (FIFO guard). Tracks when the
+    /// previously-scheduled chunk will arrive; the next chunk may not land before
+    /// it. Starts at zero (no history → the first chunk is not artificially
+    /// delayed beyond its own sample).
+    last_delivery: Duration,
 }
 
 #[async_trait]
@@ -92,11 +173,48 @@ impl SendHalf for SimSend {
         if self.severed.is_cancelled() {
             return Err(ClusterError::Transport("sim link severed".into()));
         }
-        // Whole-frame delivery; `FrameCodec` on the read side reconstructs
-        // message boundaries. Ordered and lossless within a live stream.
-        self.tx
-            .send(buf.to_vec())
-            .map_err(|_| ClusterError::Transport("sim stream: peer closed".into()))
+
+        if let Some(cfg) = &self.latency {
+            // Latency path: schedule chunk delivery as a background task that
+            // sleeps for `sleep_for` virtual time then puts the chunk into the
+            // receive channel — but ONLY if the link is still live at wakeup.
+            //
+            // FIFO invariant: `deliver_at = max(last_delivery, now) + delay`
+            // ensures this chunk cannot arrive before the previous one, even if
+            // its random delay is smaller. This faithfully models QUIC's ordered
+            // reliable streams.
+            //
+            // Severed-drops-in-flight invariant: checking `severed` again inside
+            // the spawned task means a chunk whose delivery was scheduled before a
+            // `partition` call is discarded on wakeup instead of arriving after the
+            // link is logically gone — a byte in-flight when the wire is cut does
+            // not survive the cut.
+            let now = cfg.runtime.now();
+            let delay = cfg.sample_delay();
+            let deliver_at = self.last_delivery.max(now) + delay;
+            self.last_delivery = deliver_at;
+            let sleep_for = deliver_at.saturating_sub(now);
+
+            let tx = self.tx.clone();
+            let severed = self.severed.clone();
+            let rt = cfg.runtime.clone();
+            let chunk = buf.to_vec();
+            cfg.runtime.spawn(Box::pin(async move {
+                rt.sleep(sleep_for).await;
+                // Drop the chunk if the link was severed while it was in-flight.
+                if !severed.is_cancelled() {
+                    let _ = tx.send(chunk);
+                }
+            }));
+            Ok(())
+        } else {
+            // No-latency path: immediate delivery, byte-for-byte the original
+            // behavior. All existing tests run through here (latency is `None`
+            // by default), so they are unaffected.
+            self.tx
+                .send(buf.to_vec())
+                .map_err(|_| ClusterError::Transport("sim stream: peer closed".into()))
+        }
     }
 
     fn finish(&mut self) -> Result<(), ClusterError> {
@@ -157,13 +275,20 @@ impl RecvHalf for SimRecv {
 /// sharing one `severed` liveness token. Returns `(near, far)` — opposite ends
 /// of the same stream: `near.write` is read by `far.read`, and vice versa.
 /// Cancelling `severed` cuts both directions at once (partition/close).
-fn stream_pair(severed: CancellationToken) -> (Stream, Stream) {
+///
+/// `latency` is cloned into both send halves. When `None`, delivery is
+/// immediate (original behavior). When `Some`, each direction's send half gets
+/// its own `last_delivery` clock starting at zero, so the two directions are
+/// independent — FIFO is per-direction, matching QUIC's stream semantics.
+fn stream_pair(severed: CancellationToken, latency: Option<LatencyConfig>) -> (Stream, Stream) {
     let (a_tx, b_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (b_tx, a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let near: Stream = (
         Box::new(SimSend {
             tx: a_tx,
             severed: severed.clone(),
+            latency: latency.clone(),
+            last_delivery: Duration::ZERO,
         }),
         Box::new(SimRecv::new(a_rx, severed.clone())),
     );
@@ -171,6 +296,8 @@ fn stream_pair(severed: CancellationToken) -> (Stream, Stream) {
         Box::new(SimSend {
             tx: b_tx,
             severed: severed.clone(),
+            latency,
+            last_delivery: Duration::ZERO,
         }),
         Box::new(SimRecv::new(b_rx, severed)),
     );
@@ -196,6 +323,9 @@ struct SimConnection {
     /// connection-map entry. Cancelled by `close` or `partition`: it severs all
     /// streams (control + actor) at the byte level AND unblocks `accept_bi`.
     closed: CancellationToken,
+    /// Latency config for actor streams opened on this connection, or `None`
+    /// for immediate delivery. Cloned from the fabric at connect time.
+    latency: Option<LatencyConfig>,
 }
 
 #[async_trait]
@@ -206,8 +336,9 @@ impl Connection for SimConnection {
 
     async fn open_bi(&self) -> Result<Stream, ClusterError> {
         // Actor streams share the connection's liveness token, so a partition
-        // severs them along with the control stream.
-        let (near, far) = stream_pair(self.closed.clone());
+        // severs them along with the control stream. Latency (if any) is
+        // carried into each new stream's send halves.
+        let (near, far) = stream_pair(self.closed.clone(), self.latency.clone());
         self.peer_accept_tx
             .send(far)
             .map_err(|_| ClusterError::Connection("sim peer not accepting streams".into()))?;
@@ -291,22 +422,53 @@ pub struct SimFabric {
     runtime: SimRuntime,
     nodes: Nodes,
     peers: Peers,
+    /// Latency config applied to all new streams. `None` (the default) means
+    /// immediate delivery — no latency, no change from the original behavior.
+    latency: Option<LatencyConfig>,
 }
 
 impl SimFabric {
     /// Create a fabric driven by `runtime` (the same `SimRuntime` the nodes run
     /// on, so stream delivery is part of the one deterministic schedule).
+    /// Starts with no latency: all delivery is immediate.
     pub fn new(runtime: SimRuntime) -> Self {
         Self {
             runtime,
             nodes: Arc::new(Mutex::new(BTreeMap::new())),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
+            latency: None,
         }
     }
 
     /// The runtime this fabric (and its nodes) run on.
     pub fn runtime(&self) -> &SimRuntime {
         &self.runtime
+    }
+
+    /// Install a latency model on this fabric. Every stream created after this
+    /// call will delay each chunk by `base + rand(0..=jitter)` of virtual time.
+    ///
+    /// This is faithful to QUIC's reliable ordered streams:
+    /// - Per-stream FIFO is preserved by a monotonic delivery clock in each
+    ///   [`SimSend`] — a burst of writes cannot reorder within the same stream.
+    /// - Cross-stream reorder emerges from differing per-stream delays: that is
+    ///   the faithful "reorder" QUIC allows across independent streams.
+    /// - A chunk in-flight when `partition` fires is discarded (the delivery
+    ///   task checks the liveness token at wakeup).
+    ///
+    /// Call this BEFORE booting nodes via [`bind`](Self::bind) or
+    /// [`node`](Self::node) — bound [`SimNet`]s copy the config at construction.
+    /// The shared RNG is seeded from `derive_seed("net-faults")` so the fault
+    /// schedule is reproducible from the root seed and never consumes from the
+    /// actor RNG stream.
+    pub fn set_latency(&mut self, base: Duration, jitter: Duration) {
+        let seed = self.runtime.derive_seed("net-faults");
+        self.latency = Some(LatencyConfig {
+            runtime: self.runtime.clone(),
+            base,
+            jitter,
+            rng: Arc::new(Mutex::new(ChaCha8Rng::seed_from_u64(seed))),
+        });
     }
 
     /// **Phase 1.** Register a node by its `node_id_string` route `key` for the
@@ -333,6 +495,7 @@ impl SimFabric {
             conn_events_tx,
             runtime: self.runtime.clone(),
             shutdown: CancellationToken::new(),
+            latency: self.latency.clone(),
         };
         (net, rx)
     }
@@ -387,6 +550,7 @@ impl SimFabric {
             conn_events_tx,
             runtime: self.runtime.clone(),
             shutdown,
+            latency: self.latency.clone(),
         });
 
         // Spawn the acceptor loop: each inbound dial becomes an IncomingConnection.
@@ -475,6 +639,9 @@ pub struct SimNet {
     conn_events_tx: mpsc::UnboundedSender<ConnectionEvent>,
     runtime: SimRuntime,
     shutdown: CancellationToken,
+    /// Latency config cloned from the fabric at node construction, or `None`
+    /// for immediate delivery. Propagated into connections and streams.
+    latency: Option<LatencyConfig>,
 }
 
 #[async_trait]
@@ -519,18 +686,21 @@ impl Net for SimNet {
             peer_accept_tx: a_to_b_tx.clone(),
             my_accept_rx: AsyncMutex::new(b_to_a_rx),
             closed: link.clone(),
+            latency: self.latency.clone(),
         };
         let their_conn = SimConnection {
             remote_id: self.identity.endpoint_id.clone(),
             peer_accept_tx: b_to_a_tx.clone(),
             my_accept_rx: AsyncMutex::new(a_to_b_rx),
             closed: link.clone(),
+            latency: self.latency.clone(),
         };
 
         // The control stream: one bidirectional byte stream split across the two
         // nodes, sharing the connection's liveness token. `near` stays with us,
-        // `far` goes to the target.
-        let (near, far) = stream_pair(link.clone());
+        // `far` goes to the target. Latency applies to control frames too —
+        // SWIM probes and acks are just bytes on the control stream.
+        let (near, far) = stream_pair(link.clone(), self.latency.clone());
         let (our_ctrl_send, our_ctrl_recv) = near;
         let (their_ctrl_send, their_ctrl_recv) = far;
 
@@ -614,7 +784,7 @@ impl Net for SimNet {
     async fn open_actor_stream(&self, node_id: &str) -> Result<Stream, ClusterError> {
         // Phase 2: route over an established connection if one exists. The new
         // stream shares that connection's liveness token, so a partition severs
-        // it too.
+        // it too. Latency (if configured) applies to the new stream's send halves.
         let conn = self
             .connections
             .lock()
@@ -622,7 +792,7 @@ impl Net for SimNet {
             .get(node_id)
             .map(|c| (c.peer_accept_tx.clone(), c.severed.clone()));
         if let Some((peer_accept_tx, severed)) = conn {
-            let (near, far) = stream_pair(severed);
+            let (near, far) = stream_pair(severed, self.latency.clone());
             peer_accept_tx.send(far).map_err(|_| {
                 ClusterError::Transport(format!("node {node_id} not accepting streams"))
             })?;
@@ -639,7 +809,7 @@ impl Net for SimNet {
             .get(node_id)
             .cloned()
             .ok_or_else(|| ClusterError::NodeNotFound(node_id.to_string()))?;
-        let (near, far) = stream_pair(CancellationToken::new());
+        let (near, far) = stream_pair(CancellationToken::new(), self.latency.clone());
         target.send(far).map_err(|_| {
             ClusterError::Transport(format!("node {node_id} not accepting streams"))
         })?;
@@ -826,5 +996,129 @@ mod tests {
         // Same outcome on a different seed: the Phase 1 path has no entropy, so
         // this only confirms the proof isn't accidentally seed-dependent.
         assert_eq!(two_node_roundtrip(1), 5);
+    }
+
+    // ── latency fault injection (stream_pair / SimSend) ───────────────────────
+
+    /// A [`SimSend`] with latency must preserve chunk arrival order within the
+    /// same stream (the FIFO invariant). We write two chunks in order and confirm
+    /// the receive channel produces them in the same order, even though each chunk
+    /// gets an independent random delay. The monotonic `last_delivery` clock is
+    /// what enforces this: the second chunk's `deliver_at` is at least as large as
+    /// the first chunk's, so it cannot arrive earlier.
+    ///
+    /// This test is self-contained: it drives `stream_pair` directly through a
+    /// `SimRuntime` / `SimWorld` rather than going through the full cluster stack,
+    /// so it isolates the send-half invariant without the handshake or foca
+    /// overhead.
+    #[test]
+    fn latency_in_stream_fifo_order_preserved() {
+        use crate::sim::SimWorld;
+
+        let mut world = SimWorld::new(0xABCD);
+        let rt = world.runtime().clone();
+
+        // A latency config with noticeable jitter so the two delay samples are
+        // unlikely to be equal (which would still pass FIFO but hide a bug).
+        let cfg = LatencyConfig {
+            runtime: rt.clone(),
+            base: Duration::from_millis(10),
+            jitter: Duration::from_millis(40),
+            rng: Arc::new(Mutex::new(ChaCha8Rng::seed_from_u64(
+                rt.derive_seed("fifo-test"),
+            ))),
+        };
+
+        let severed = CancellationToken::new();
+        let (near, far) = stream_pair(severed, Some(cfg));
+        let (mut send, _) = near;
+        let (_, mut recv) = far;
+
+        // Write two chunks. Due to latency, delivery is deferred; each write
+        // spawns a background task that delivers at `deliver_at`.
+        world.block_on(async move {
+            send.write_all(&[1, 2, 3]).await.unwrap();
+            send.write_all(&[4, 5, 6]).await.unwrap();
+        });
+
+        // Advance time past the maximum possible delivery (base + jitter = 50ms).
+        // Both delivery tasks fire, in their scheduled order.
+        world.advance(Duration::from_millis(100));
+
+        // Read both chunks and confirm FIFO: [1,2,3] arrives before [4,5,6].
+        // Use Arc<Mutex> to share `got` with the 'static async block.
+        let got: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let got2 = got.clone();
+        world.block_on(async move {
+            let mut buf = [0u8; 8];
+            // First chunk.
+            let n = recv.read(&mut buf).await.unwrap().expect("first chunk");
+            got2.lock().unwrap().extend_from_slice(&buf[..n]);
+            // Second chunk.
+            let n = recv.read(&mut buf).await.unwrap().expect("second chunk");
+            got2.lock().unwrap().extend_from_slice(&buf[..n]);
+        });
+        let got = got.lock().unwrap();
+        assert_eq!(&got[..3], &[1, 2, 3], "first chunk arrived first (FIFO)");
+        assert_eq!(&got[3..6], &[4, 5, 6], "second chunk arrived second (FIFO)");
+    }
+
+    /// A chunk that is in-flight (delivery task spawned but not yet woken) when
+    /// the link is severed via `partition` must NOT be delivered. This validates
+    /// the "severed-drops-in-flight" invariant: the delivery task checks
+    /// `severed.is_cancelled()` before putting the chunk into the channel.
+    #[test]
+    fn latency_in_flight_chunk_dropped_on_sever() {
+        use crate::sim::SimWorld;
+
+        let mut world = SimWorld::new(0xBEEF);
+        let rt = world.runtime().clone();
+
+        // Long latency so the delivery task is definitely still sleeping when we
+        // cancel.
+        let cfg = LatencyConfig {
+            runtime: rt.clone(),
+            base: Duration::from_millis(200),
+            jitter: Duration::ZERO,
+            rng: Arc::new(Mutex::new(ChaCha8Rng::seed_from_u64(
+                rt.derive_seed("inflight-test"),
+            ))),
+        };
+
+        let severed = CancellationToken::new();
+        let (near, far) = stream_pair(severed.clone(), Some(cfg));
+        let (mut send, _) = near;
+        let (_, mut recv) = far;
+
+        // Write the chunk → delivery scheduled 200ms from now.
+        world.block_on(async move {
+            send.write_all(&[9, 8, 7]).await.unwrap();
+        });
+
+        // Sever the link BEFORE advancing time past the delivery point.
+        severed.cancel();
+
+        // Advance past the delivery point. The delivery task wakes, sees
+        // `severed.is_cancelled()` == true, and discards the chunk.
+        world.advance(Duration::from_millis(300));
+
+        // The recv's peer send half was dropped when `near` was destructured and
+        // `send` was moved into block_on. After block_on returns, send is gone,
+        // so the recv channel is closed → the next read should return EOF (None).
+        // A Some(n) here would mean the in-flight chunk was wrongly delivered.
+        let result: Arc<Mutex<Option<Option<usize>>>> = Arc::new(Mutex::new(None));
+        let result2 = result.clone();
+        world.block_on(async move {
+            let mut buf = [0u8; 8];
+            let r = recv.read(&mut buf).await.unwrap();
+            *result2.lock().unwrap() = Some(r);
+        });
+        match *result.lock().unwrap() {
+            Some(None) => {} // EOF: channel closed with no chunk — correct
+            Some(Some(n)) => {
+                panic!("in-flight chunk should have been dropped on sever, but got {n} bytes")
+            }
+            None => panic!("block_on did not complete"),
+        }
     }
 }

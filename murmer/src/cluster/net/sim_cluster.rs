@@ -158,6 +158,9 @@ pub struct SimClusterBuilder {
     /// Drive the cluster under adversarial (seeded-random) task scheduling
     /// instead of FIFO. See [`random_scheduling`](Self::random_scheduling).
     random_scheduling: bool,
+    /// Network latency to inject, or `None` for immediate delivery.
+    /// Set via [`network_latency`](Self::network_latency).
+    network_latency: Option<(Duration, Duration)>,
     #[cfg(feature = "app")]
     coordinators: bool,
     #[cfg(feature = "app")]
@@ -218,6 +221,31 @@ impl SimClusterBuilder {
         self
     }
 
+    /// Inject network latency on every stream in the cluster. Each chunk written
+    /// is delivered after `base + rand(0..=jitter)` of virtual time instead of
+    /// immediately.
+    ///
+    /// The model is faithful to QUIC's reliable ordered streams:
+    /// - **FIFO within a stream** is preserved by a monotonic delivery clock in
+    ///   each send half — a burst of writes cannot reorder within the same stream.
+    /// - **Cross-stream reorder** emerges from differing per-stream delays —
+    ///   exactly what QUIC allows across independent streams. No extra reordering
+    ///   mechanism is needed.
+    /// - **In-flight drops on partition** are handled transparently: the delivery
+    ///   task discards a chunk if the link is severed before it lands.
+    ///
+    /// Drop modeling is NOT done here; use `partition` for that. The default
+    /// (`None`) is immediate delivery — all existing tests run through that path
+    /// and are unaffected by this call.
+    ///
+    /// Because latency makes convergence take virtual time (delayed control frames
+    /// mean SWIM probes arrive later), tests that call this must pair it with a
+    /// sufficient `advance` rather than relying on `pump`-only convergence.
+    pub fn network_latency(mut self, base: Duration, jitter: Duration) -> Self {
+        self.network_latency = Some((base, jitter));
+        self
+    }
+
     /// Boot every node on one shared [`SimRuntime`], returning a driveable cluster.
     /// No discovery edges are injected yet — call [`mesh`](SimCluster::mesh) (or
     /// [`dial`](SimCluster::dial)) then [`pump`](SimCluster::pump) to converge.
@@ -229,7 +257,12 @@ impl SimClusterBuilder {
         }
         let sim_rt = world.runtime().clone();
         let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
-        let fabric = SimFabric::new(sim_rt);
+        let mut fabric = SimFabric::new(sim_rt);
+        // Install latency BEFORE booting nodes so every `bind`-constructed
+        // SimNet picks up the config (fabric clones it at construction time).
+        if let Some((base, jitter)) = self.network_latency {
+            fabric.set_latency(base, jitter);
+        }
 
         let mut cluster = SimCluster {
             world,
@@ -275,6 +308,7 @@ impl SimCluster {
             seed,
             names: Vec::new(),
             random_scheduling: false,
+            network_latency: None,
             #[cfg(feature = "app")]
             coordinators: false,
             #[cfg(feature = "app")]
@@ -1235,5 +1269,152 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── latency fault injection (SimCluster level) ────────────────────────────
+
+    /// Membership must converge even when every stream delivery is delayed by
+    /// `base + jitter` of virtual time. Because SWIM probes and acks cross the
+    /// control stream, and control frames also have latency, convergence needs the
+    /// virtual clock to advance. We mesh, then `advance` enough time for all
+    /// delayed frames to arrive and for foca to process them.
+    ///
+    /// A green run here proves: (a) the latency path does not deadlock `pump`, (b)
+    /// `stream_pair` with latency `Some(...)` produces functional streams the real
+    /// cluster code can use, and (c) delayed-but-eventually-delivered control frames
+    /// are enough for full membership convergence (no loss in the default path).
+    #[test]
+    fn convergence_holds_under_network_latency() {
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .node("node-b")
+            .node("node-c")
+            .network_latency(Duration::from_millis(50), Duration::from_millis(20))
+            .build();
+        c.mesh();
+        // Pump to spawn connection tasks; latency means frames haven't arrived yet.
+        c.pump();
+        // Advance past the maximum delivery window and well into foca's first probe
+        // cycle. With up to 70ms latency on control frames, 30 virtual seconds is
+        // more than enough for every handshake and MemberUp to deliver and process.
+        c.advance(Duration::from_secs(30));
+
+        // Every node must still see the other two joined (membership is stable
+        // under a slow-but-lossless network).
+        let expect = |c: &mut SimCluster, me: &str, peers: [&str; 2]| {
+            let joined = c.events(me).joined_ids();
+            let want: BTreeSet<String> = peers.iter().map(|p| format!("{p}-id")).collect();
+            assert_eq!(joined, want, "{me} converged under network latency");
+        };
+        expect(&mut c, "node-a", ["node-b", "node-c"]);
+        expect(&mut c, "node-b", ["node-a", "node-c"]);
+        expect(&mut c, "node-c", ["node-a", "node-b"]);
+    }
+
+    /// Two runs of the same latency scenario at the same seed must produce the
+    /// same converged membership set. This validates that `LatencyConfig`'s shared
+    /// ChaCha8Rng — seeded from `derive_seed("net-faults")` — is reproducible:
+    /// the delay samples are drawn in the same order because the sim's
+    /// single-threaded executor produces task executions in the same sequence.
+    ///
+    /// We also assert that a DIFFERENT seed still converges to the full set
+    /// (jitter changes the timing, not the membership outcome) — latency may slow
+    /// things down but must not break correctness.
+    #[test]
+    fn network_latency_is_deterministic() {
+        fn converged_set(seed: u64) -> BTreeSet<(String, String)> {
+            let mut c = SimCluster::builder(seed)
+                .node("node-a")
+                .node("node-b")
+                .node("node-c")
+                .network_latency(Duration::from_millis(30), Duration::from_millis(20))
+                .build();
+            c.mesh();
+            c.pump();
+            c.advance(Duration::from_secs(30));
+            let mut pairs = BTreeSet::new();
+            for me in ["node-a", "node-b", "node-c"] {
+                for id in c.events(me).joined_ids() {
+                    pairs.insert((me.to_string(), id));
+                }
+            }
+            pairs
+        }
+
+        // Same seed → identical converged set across two independent runs.
+        assert_eq!(
+            converged_set(42),
+            converged_set(42),
+            "same seed must reproduce the same converged membership set under latency"
+        );
+
+        // Different seeds must BOTH produce the full 6-pair set (three nodes × two
+        // peers each). Jitter varies the delivery order, not the outcome.
+        let s1 = converged_set(1);
+        let s2 = converged_set(2);
+        assert_eq!(s1.len(), 6, "seed 1: all 3 nodes see 2 peers under latency");
+        assert_eq!(s2.len(), 6, "seed 2: all 3 nodes see 2 peers under latency");
+    }
+
+    /// End-to-end latency threading test: the actor-stream round-trip must still
+    /// complete under `.network_latency(...)`, and `block_on` must drive the
+    /// virtual clock forward to deliver the delayed frames.
+    ///
+    /// The key assertion is the clock check: we record the virtual time before
+    /// calling `block_on` (which drives time internally until the future resolves).
+    /// If latency were hardcoded to `None` at any `stream_pair` call site, every
+    /// actor-stream frame would arrive instantly and the round-trip future would
+    /// resolve without advancing virtual time at all — that would cause the clock
+    /// assertion to FAIL. With latency wired through, the actor-stream open frame
+    /// and the request/reply bytes must wait for their delivery timer, advancing
+    /// the clock by at least `base` per direction crossed.
+    ///
+    /// This is the only test that would fail if `latency: None` were silently
+    /// hardcoded at any of the three `stream_pair` call sites.
+    #[test]
+    fn remote_actor_messaging_works_under_network_latency() {
+        let base = Duration::from_millis(200);
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .node("node-b")
+            .network_latency(base, Duration::ZERO) // zero jitter: deterministic minimum
+            .build();
+        c.mesh();
+        c.pump();
+
+        // Start a discoverable actor on node-a.
+        let _local = c
+            .system("node-a")
+            .start_actor("counter/0", Counter, CounterState::default());
+
+        // Advance through the registry-sync interval so node-b learns about the actor.
+        // The sync frames themselves are delayed by `base`, so advance well past 6s.
+        c.advance(Duration::from_secs(7));
+
+        // Record the virtual clock before driving the actor round-trip.
+        let before = c.now();
+
+        // `block_on` drives the virtual clock until the future resolves. The request
+        // and reply each cross a latency-bearing stream, so the clock must advance by
+        // at least `base` total. If any stream_pair call site were None, frames
+        // would arrive instantly and `now()` would not advance.
+        let ep = c
+            .system("node-b")
+            .lookup::<Counter>("counter/0")
+            .expect("node-b discovers node-a's actor after the registry sync + latency");
+        let reply = c.block_on(async move { ep.send(Increment { amount: 7 }).await.unwrap() });
+        assert_eq!(
+            reply, 7,
+            "remote increment round-trips over latency-bearing sim streams"
+        );
+
+        // The clock MUST have advanced — latency forces the delivery tasks to sleep
+        // on the virtual timer before pushing bytes into the channel.
+        let elapsed = c.now() - before;
+        assert!(
+            elapsed >= base,
+            "virtual clock must advance by at least base ({base:?}) during the round-trip \
+             — got {elapsed:?}; if zero, latency is not wired through stream_pair"
+        );
     }
 }
