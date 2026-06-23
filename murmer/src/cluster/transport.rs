@@ -38,7 +38,9 @@ use super::config::{NodeClass, NodeIdentity, TransportTuning};
 use super::error::ClusterError;
 use super::framing::{self, ControlMessage, FrameCodec, HandshakePayload, PROTOCOL_VERSION};
 use super::net::iroh::{IrohConnection, IrohRecv, IrohSend};
-use super::net::{self, ConnectionEvent, IncomingConnection, Net, NodeId, PeerAddr, RecvHalf, SendHalf};
+use super::net::{
+    self, ConnectionEvent, IncomingConnection, Net, NodeId, PeerAddr, RecvHalf, SendHalf,
+};
 
 /// ALPN identifying the murmer cluster protocol on iroh connections.
 pub const MURMER_ALPN: &[u8] = b"murmer/cluster/1";
@@ -491,11 +493,10 @@ impl Net for Transport {
     /// connection for that endpoint id. Same incarnation → duplicate, rejected.
     /// Different incarnation → the node restarted; the old connection is replaced.
     async fn connect(&self, addr: PeerAddr) -> Result<IncomingConnection, ClusterError> {
-        let target_id: EndpointId = addr
-            .id
-            .0
-            .parse()
-            .map_err(|_| ClusterError::Transport(format!("invalid endpoint id: {}", addr.id)))?;
+        let target_id: EndpointId =
+            addr.id.0.parse().map_err(|_| {
+                ClusterError::Transport(format!("invalid endpoint id: {}", addr.id))
+            })?;
         let endpoint_addr =
             EndpointAddr::from_parts(target_id, addr.hint.iter().copied().map(TransportAddr::Ip));
 
@@ -717,7 +718,10 @@ mod allowlist_tests {
     /// which authorize raw ed25519 keys. The `NodeId` holds the key's string form,
     /// so it round-trips.
     fn eid(id: &NodeIdentity) -> EndpointId {
-        id.endpoint_id.0.parse().expect("test node id is a valid key")
+        id.endpoint_id
+            .0
+            .parse()
+            .expect("test node id is a valid key")
     }
 
     /// The abstract [`PeerAddr`] to dial a bound node on loopback: its node id

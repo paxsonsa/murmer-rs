@@ -83,7 +83,12 @@ impl Worker {
     }
 
     #[handler]
-    fn completed(&self, _ctx: &ActorContext<Self>, state: &mut WorkerState, _msg: Completed) -> u64 {
+    fn completed(
+        &self,
+        _ctx: &ActorContext<Self>,
+        state: &mut WorkerState,
+        _msg: Completed,
+    ) -> u64 {
         state.completed
     }
 
@@ -101,7 +106,9 @@ fn drains_one_job_per_tick_in_virtual_time() {
         .start("worker/0", Worker, WorkerState::default());
 
     world.send(&worker, Submit { jobs: 5 }).unwrap();
-    world.send(&worker, StartDraining { every_ms: 100 }).unwrap();
+    world
+        .send(&worker, StartDraining { every_ms: 100 })
+        .unwrap();
     assert_eq!(world.send(&worker, Completed).unwrap(), 0);
 
     // 250ms of virtual time → 2 drains (at 100ms, 200ms). No real sleeping.

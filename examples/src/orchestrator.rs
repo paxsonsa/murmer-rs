@@ -276,7 +276,7 @@ mod tests {
                 "store-a",
                 NodeClass::Worker,
                 vec![("volume", "photos")],
-                &[gateway_addr.clone()],
+                std::slice::from_ref(&gateway_addr),
             ),
             TypeRegistry::from_auto(),
             make_spawn_registry(),

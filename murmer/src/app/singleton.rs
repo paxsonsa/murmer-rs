@@ -400,8 +400,8 @@ impl GenerationSource for CoordinatorGenerationSource {
 mod tests {
     use super::*;
     use crate::app::node_info::NodeInfo;
-    use std::collections::HashMap;
     use crate::cluster::config::NodeIdentity;
+    use std::collections::HashMap;
 
     fn make_node(name: &str, incarnation: u64, class: NodeClass) -> NodeInfo {
         NodeInfo::new(

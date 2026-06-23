@@ -396,9 +396,7 @@ impl<A: Actor + 'static> PoolRouter<A> {
                 RoutingStrategy::RoundRobin => {
                     self.counter.fetch_add(1, Ordering::Relaxed) % pool.len()
                 }
-                RoutingStrategy::Random => {
-                    (self.runtime.rng_u64() % pool.len() as u64) as usize
-                }
+                RoutingStrategy::Random => (self.runtime.rng_u64() % pool.len() as u64) as usize,
                 RoutingStrategy::Broadcast => 0,
             };
 

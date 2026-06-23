@@ -503,18 +503,14 @@ impl System {
     pub fn endpoint_addr(&self) -> Option<iroh::EndpointAddr> {
         match &self.inner {
             SystemInner::Local { .. } => None,
-            SystemInner::Clustered { cluster } => cluster
-                .identity()
-                .endpoint_id
-                .0
-                .parse()
-                .ok()
-                .map(|id| {
+            SystemInner::Clustered { cluster } => {
+                cluster.identity().endpoint_id.0.parse().ok().map(|id| {
                     iroh::EndpointAddr::from_parts(
                         id,
                         [iroh::TransportAddr::Ip(cluster.local_addr())],
                     )
-                }),
+                })
+            }
         }
     }
 }

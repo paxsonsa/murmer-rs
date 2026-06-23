@@ -244,14 +244,22 @@ async fn test_singleton_fails_over_on_owner_departure_with_higher_term() {
     let gw_addr = gateway.endpoint_addr().unwrap();
 
     let worker_a = System::clustered(
-        node_config("worker-a", NodeClass::Worker, &[gw_addr.clone()]),
+        node_config(
+            "worker-a",
+            NodeClass::Worker,
+            std::slice::from_ref(&gw_addr),
+        ),
         TypeRegistry::from_auto(),
         catalog_registry(),
     )
     .await
     .unwrap();
     let worker_b = System::clustered(
-        node_config("worker-b", NodeClass::Worker, &[gw_addr.clone()]),
+        node_config(
+            "worker-b",
+            NodeClass::Worker,
+            std::slice::from_ref(&gw_addr),
+        ),
         TypeRegistry::from_auto(),
         catalog_registry(),
     )
