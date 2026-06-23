@@ -35,6 +35,10 @@ path = "src/supervisor.rs"
 name = "sim_cluster_demo"
 path = "src/sim_cluster_demo.rs"
 
+[[bin]]
+name = "sim_app_demo"
+path = "src/sim_app_demo.rs"
+
 [dependencies]
 iroh = "1.0.0"
 # `sim` enables the deterministic simulation runtime used by sim_cluster_demo;

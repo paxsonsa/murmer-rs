@@ -98,6 +98,55 @@ complete (every task is parked, no timer is pending). That almost always means
 the future is awaiting a reply or message that no actor will ever send, which is
 a real bug worth seeing.
 
+## Running a whole actor stack
+
+The first test showed one actor. The thing you will actually do most is stand up
+a whole stack of actors that talk to each other and run it deterministically.
+This is the heart of what the sim gives you. Your application is some set of
+actors passing messages and scheduling work. The sim lets you boot all of them on
+one virtual clock, drive them with a seeded workload, fast-forward time instead of
+sleeping through it, and replay the exact run from the seed.
+
+`cargo run -p murmer-examples --bin sim_app_demo` is a worked example. It is a
+small job pipeline: a dispatcher round-robins a batch of jobs across three
+workers, each worker drains its queue at its own rate on a virtual-time timer, and
+every finished job is reported to a ledger.
+
+```
+dispatcher --Process--> worker (x3) --Completed--> ledger
+```
+
+The driver stands the stack up, submits a seeded batch, advances ten seconds of
+virtual time until the queues drain, and reads the ledger. Ten seconds of pipeline
+work runs in a few milliseconds of real time, and the ledger comes out identical
+every run at the same seed. Nothing about the actors is special. They use the
+ordinary `start`, `send`, `ctx.spawn`, and `ctx.schedule_repeat` you would write
+anyway. The only thing the sim changes is that time is virtual and the schedule is
+seeded.
+
+One thing to know about scheduled work: the `ScheduleHandle` returned by
+`ctx.schedule_once`/`schedule_repeat` cancels the timer when it drops. Keep it in
+the actor's state if you want the timer to keep firing. The workers in the example
+hold their drain ticker in state for exactly this reason.
+
+### SimWorld or SimCluster
+
+Both run your actor stack. The difference is how many nodes.
+
+`SimWorld` boots one `System`. It is the right tool when your stack lives on a
+single node, which is most application logic. The example above uses it.
+
+`SimCluster` boots several `System`s on the same virtual clock and wires them
+over an in-memory network, so you can put actors on different nodes and inject
+crash, partition, and latency. Your actor code does not change. The same actors
+that run on `SimWorld` run on `SimCluster`. You reach for `SimCluster` when the
+behavior you are testing involves the cluster itself: discovery, failover, the
+singleton fence, or how your actors behave when a node they depend on goes away.
+
+So the progression is: write your actors, test the stack on `SimWorld`, then move
+to `SimCluster` when you need to fault the cluster underneath it. The next
+sections are about that second step.
+
 ## Multi-node testing with SimCluster
 
 A single `SimWorld` boots one `System`. To test membership, failure detection,
@@ -387,13 +436,18 @@ invariant you pin, and the interleaving is the thing trying to break it.
 
 ## Runnable starting points
 
-Two files in the repo are the place to start. One you run, one you copy.
+A few files in the repo are the place to start. Two you run, one you copy.
+
+`cargo run -p murmer-examples --bin sim_app_demo` runs the whole-actor-stack
+example from above: a dispatcher, three workers, and a ledger on one virtual
+clock, drained deterministically and replayed from the seed. Start here to see a
+realistic stack run.
 
 `cargo run -p murmer-examples --bin sim_cluster_demo` boots a three-node cluster
 on the sim runtime, crashes a node, shows the survivors detect it, and replays
 the same scenario from the same seed to prove it is reproducible. The thirty
 seconds of detection time it advances elapse in a few milliseconds of real time.
-It is the quickest way to see the rig work.
+This is the multi-node, fault-injection side.
 
 `murmer/tests/sim_cluster.rs` is the template to copy. It is an external consumer
 of murmer that uses only the public API, the way your own crate would. It covers
