@@ -31,9 +31,15 @@ path = "src/edge_client.rs"
 name = "supervisor"
 path = "src/supervisor.rs"
 
+[[bin]]
+name = "sim_cluster_demo"
+path = "src/sim_cluster_demo.rs"
+
 [dependencies]
 iroh = "1.0.0"
-murmer = { workspace = true, features = ["app"] }
+# `sim` enables the deterministic simulation runtime used by sim_cluster_demo;
+# it is purely additive (the other example bins keep using the real cluster).
+murmer = { workspace = true, features = ["app", "sim"] }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

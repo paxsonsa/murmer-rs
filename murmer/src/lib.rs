@@ -284,6 +284,8 @@ pub use actor::{
     RemoteDispatch, RemoteMessage, ScheduleHandle,
 };
 pub use client::{ClientOptions, MurmerClient};
+#[cfg(feature = "sim")]
+pub use cluster::net::sim_cluster::{DrainedEvents, SimCluster, SimClusterBuilder};
 pub use endpoint::Endpoint;
 pub use lifecycle::{
     ActorFactory, ActorTerminated, BackoffConfig, RestartConfig, RestartPolicy, TerminationReason,

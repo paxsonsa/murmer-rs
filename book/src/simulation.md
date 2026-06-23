@@ -385,6 +385,22 @@ converges to the same set every run, so the membership tests assert on that set.
 That habit is also what makes adversarial scheduling work: the outcome is the
 invariant you pin, and the interleaving is the thing trying to break it.
 
+## Runnable starting points
+
+Two files in the repo are the place to start. One you run, one you copy.
+
+`cargo run -p murmer-examples --bin sim_cluster_demo` boots a three-node cluster
+on the sim runtime, crashes a node, shows the survivors detect it, and replays
+the same scenario from the same seed to prove it is reproducible. The thirty
+seconds of detection time it advances elapse in a few milliseconds of real time.
+It is the quickest way to see the rig work.
+
+`murmer/tests/sim_cluster.rs` is the template to copy. It is an external consumer
+of murmer that uses only the public API, the way your own crate would. It covers
+convergence, crash detection, partition tolerance, a remote actor reached across
+nodes, a slow-network run, and the same-seed replay check. Its single-node
+sibling, `murmer/tests/sim_world.rs`, is the same idea for one node's actors.
+
 ## How it fits together
 
 The `sim` runtime is built on the `Runtime` seam (`murmer::runtime::Runtime`).
