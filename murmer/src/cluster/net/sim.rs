@@ -131,6 +131,11 @@ impl RecvHalf for SimRecv {
     async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ClusterError> {
         if self.leftover.is_empty() {
             tokio::select! {
+                // Deterministic branch priority (see supervisor.rs): if a buffered
+                // chunk and a same-step sever are both ready, deliver the chunk
+                // before observing EOF — so a delivery racing a partition replays
+                // identically instead of letting select!'s RNG pick per run.
+                biased;
                 chunk = self.rx.recv() => match chunk {
                     Some(chunk) => self.leftover = chunk,
                     None => return Ok(None), // sender dropped → clean EOF
@@ -212,6 +217,9 @@ impl Connection for SimConnection {
     async fn accept_bi(&self) -> Option<Stream> {
         let mut rx = self.my_accept_rx.lock().await;
         tokio::select! {
+            // Deterministic branch priority (see supervisor.rs): accept a ready
+            // stream before a same-step close, so the order replays identically.
+            biased;
             s = rx.recv() => s,
             // `close` (partition/departure) unblocks the accept loop. The peer
             // dropping its `peer_accept_tx` also yields `None` via `recv`.

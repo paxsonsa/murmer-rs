@@ -147,8 +147,13 @@ impl ClusterSystem {
         type_registry: TypeRegistry,
         spawn_registry: SpawnRegistry,
     ) -> Result<Self, ClusterError> {
-        Self::start_with_runtime(config, type_registry, spawn_registry, Arc::new(TokioRuntime))
-            .await
+        Self::start_with_runtime(
+            config,
+            type_registry,
+            spawn_registry,
+            Arc::new(TokioRuntime),
+        )
+        .await
     }
 
     /// Like [`start`](Self::start) but on an explicit [`Runtime`] — the
@@ -479,6 +484,11 @@ fn spawn_event_loop(
 
         loop {
             tokio::select! {
+                // Deterministic branch priority under the sim runtime (see
+                // supervisor.rs): a fixed poll order so a step with several ready
+                // channels replays identically instead of letting select!'s RNG
+                // pick which connection/event is handled first.
+                biased;
                 // ── Incoming handshaked connections (accepted by accept_loop) ─
                 Some(incoming) = incoming_rx.recv() => {
                     handle_new_connection(
@@ -883,6 +893,9 @@ async fn handle_new_connection(
     rt.spawn(Box::pin(async move {
         loop {
             tokio::select! {
+                // Deterministic branch priority (see supervisor.rs): process a
+                // ready stream before a same-step shutdown, so it replays.
+                biased;
                 result = conn.accept_bi() => {
                     match result {
                         // `accept_bi` yields `None` when the connection closes,
@@ -1276,7 +1289,8 @@ mod tests {
         let addr_a = system_a.local_addr();
 
         // Node B uses A as a seed
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1318,7 +1332,8 @@ mod tests {
         assert_eq!(result, 5);
 
         // Start node B with A as seed
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1359,7 +1374,8 @@ mod tests {
 
         system_a.start_actor("counter/a", TestCounter, TestCounterState { count: 100 });
 
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1412,7 +1428,8 @@ mod tests {
             TestCounterState { count: 42 },
         );
 
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1469,7 +1486,8 @@ mod tests {
             TestCounterState { count: 77 },
         );
 
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1521,7 +1539,8 @@ mod tests {
             TestCounterState { count: 10 },
         );
 
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1545,7 +1564,8 @@ mod tests {
         .await;
 
         // Now start a NEW node A and connect it to B (rejoin)
-        let config_a2 = test_config_with_seed("node-a-2", system_b.identity().endpoint_id.clone(), addr_b);
+        let config_a2 =
+            test_config_with_seed("node-a-2", system_b.identity().endpoint_id.clone(), addr_b);
         let system_a2 = ClusterSystem::start(config_a2, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1679,7 +1699,8 @@ mod tests {
         system_a.start_actor("counter/r2", TestCounter, TestCounterState { count: 0 });
 
         // Node B: connect to A as seed
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1752,7 +1773,8 @@ mod tests {
         );
 
         // Node B: start "ref-receiver/main" (RefReceiver)
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b =
             ClusterSystem::start(config_b, extended_type_registry(), SpawnRegistry::new())
                 .await
@@ -1821,7 +1843,8 @@ mod tests {
         system_a.start_actor("counter/on-a", TestCounter, TestCounterState { count: 10 });
 
         // Node B: seed = A, start "counter/on-b"
-        let config_b = test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1855,7 +1878,8 @@ mod tests {
         assert_eq!(count, 20, "A reads B's counter directly");
 
         // Node C: seed = B only (no direct connection to A)
-        let config_c = test_config_with_seed("node-c", system_b.identity().endpoint_id.clone(), addr_b);
+        let config_c =
+            test_config_with_seed("node-c", system_b.identity().endpoint_id.clone(), addr_b);
         let system_c = ClusterSystem::start(config_c, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();

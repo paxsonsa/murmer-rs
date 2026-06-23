@@ -142,12 +142,31 @@ impl PlacementStrategy for LeastLoaded {
 ///
 /// All eligible nodes get equal fitness, so the winner depends on
 /// floating-point comparison of random values — effectively uniform random.
-pub struct RandomPlacement;
+pub struct RandomPlacement {
+    /// Seeded RNG behind a mutex. `fitness` takes `&self`, so the draw needs
+    /// interior mutability; the sim is single-threaded so this never contends.
+    /// Seeding off the world seed is what makes placement replay deterministically
+    /// (the old `rand::rng()` form drew from global OS entropy and diverged
+    /// run-to-run on the same seed, silently breaking the simulation guarantee).
+    rng: std::sync::Mutex<rand::rngs::StdRng>,
+}
+
+impl RandomPlacement {
+    /// Seed the placement RNG. Under simulation pass `world.derive_seed("placement")`
+    /// (or any per-run derived seed) so placement decisions descend from the world
+    /// seed; in production seed from a source of your choosing.
+    pub fn new(seed: u64) -> Self {
+        use rand::SeedableRng;
+        Self {
+            rng: std::sync::Mutex::new(rand::rngs::StdRng::seed_from_u64(seed)),
+        }
+    }
+}
 
 impl PlacementStrategy for RandomPlacement {
     fn fitness(&self, _node: &NodeInfo, _spec: &ActorSpec, _view: &ClusterView) -> f64 {
         use rand::Rng;
-        rand::rng().random::<f64>()
+        self.rng.lock().unwrap().random::<f64>()
     }
 
     fn name(&self) -> &str {
