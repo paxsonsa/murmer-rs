@@ -887,6 +887,59 @@ mod tests {
         }
     }
 
+    /// A wide seed sweep — the difference between "tested three seeds" and "finds
+    /// the schedule-dependent bug". Each seed must converge to the full mesh AND,
+    /// after a crash, detect exactly the victim, under BOTH FIFO and adversarial
+    /// scheduling. Defaults to a small count for local runs; CI sets
+    /// `MURMER_SIM_SWEEP_SEEDS` high (a same-seed divergence or a raw-spawn panic
+    /// on the sim-reachable cluster path shows up here, which is the empirical
+    /// guard the static determinism gate can't give for `cluster/*`).
+    #[test]
+    fn seed_sweep_membership_invariants() {
+        let n: u64 = std::env::var("MURMER_SIM_SWEEP_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+        let only_a = BTreeSet::from(["node-a-id".to_string()]);
+        for seed in 0..n {
+            for adversarial in [false, true] {
+                let mut b = SimCluster::builder(seed)
+                    .node("node-a")
+                    .node("node-b")
+                    .node("node-c");
+                if adversarial {
+                    b = b.random_scheduling();
+                }
+                let mut c = b.build();
+                c.mesh();
+                c.pump();
+
+                for (me, peers) in [
+                    ("node-a", ["node-b-id", "node-c-id"]),
+                    ("node-b", ["node-a-id", "node-c-id"]),
+                    ("node-c", ["node-a-id", "node-b-id"]),
+                ] {
+                    let want: BTreeSet<String> = peers.iter().map(|s| s.to_string()).collect();
+                    assert_eq!(
+                        c.events(me).joined_ids(),
+                        want,
+                        "seed {seed} adversarial={adversarial}: {me} convergence"
+                    );
+                }
+
+                c.crash("node-a");
+                c.advance(Duration::from_secs(30));
+                for survivor in ["node-b", "node-c"] {
+                    assert_eq!(
+                        c.events(survivor).failed,
+                        only_a,
+                        "seed {seed} adversarial={adversarial}: {survivor} detects exactly A"
+                    );
+                }
+            }
+        }
+    }
+
     // ── app-layer coordination backend (the Raft-decision catalog) ────────────
     //
     // The two 2×2 experiments that settled "durable store over Raft": per-node
