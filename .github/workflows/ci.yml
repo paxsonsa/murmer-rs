@@ -55,7 +55,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      # ripgrep for the gate script (not on the runner by default); nextest for
+      # the seed sweep.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,ripgrep
       - run: bash scripts/check-determinism.sh
       - run: cargo nextest run -p murmer --features sim,app seed_sweep
         env:
