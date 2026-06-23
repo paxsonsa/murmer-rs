@@ -9,6 +9,8 @@
 - [Clustering](./clustering.md)
 - [Edge Clients](./edge-clients.md)
 - [Simulation Testing](./simulation.md)
+  - [The Determinism Contract](./simulation-determinism.md)
+  - [Extending Simulation](./simulation-extending.md)
 - [Administration & Security](./administration.md)
 - [Monitoring](./monitoring.md)
 - [Proc Macro Reference](./macros.md)
