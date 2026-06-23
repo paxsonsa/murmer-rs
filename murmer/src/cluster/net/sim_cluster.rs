@@ -298,7 +298,12 @@ impl SimCluster {
         let net: Arc<dyn Net> = sim_net.clone();
         let system = ClusterSystem::start_with_net(
             sim_config(&name, identity),
-            TypeRegistry::new(),
+            // Populate the type registry from the linkme `#[handlers]` slice, as
+            // the real clustered path does (System::clustered_auto). With an empty
+            // registry, a node receiving a remote actor's Register op finds no
+            // factory and silently skips wiring the remote endpoint — so cross-node
+            // actor lookup returns None.
+            TypeRegistry::from_auto(),
             SpawnRegistry::new(),
             Arc::clone(&self.rt),
             net,
@@ -549,6 +554,41 @@ impl SimCluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::ActorContext;
+    use crate::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    // A discoverable, remotely-dispatchable actor for the cross-node smoke test.
+    struct Counter;
+
+    #[derive(Default)]
+    struct CounterState {
+        count: i64,
+    }
+
+    impl Actor for Counter {
+        type State = CounterState;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Message)]
+    #[message(result = i64, remote = "simcluster::Increment")]
+    struct Increment {
+        amount: i64,
+    }
+
+    #[handlers]
+    impl Counter {
+        #[handler]
+        fn increment(
+            &self,
+            _ctx: &ActorContext<Self>,
+            state: &mut CounterState,
+            msg: Increment,
+        ) -> i64 {
+            state.count += msg.amount;
+            state.count
+        }
+    }
 
     /// Boot a converged full mesh of three nodes and return the cluster, ready for
     /// fault injection. Convergence is pump-only (MemberUp is synchronous on
@@ -741,6 +781,41 @@ mod tests {
         };
         assert!(readmitted(&c.events("node-b")), "B readmits A@2");
         assert!(readmitted(&c.events("node-c")), "C readmits A@2");
+    }
+
+    /// The cross-node ACTOR path — the capability a consumer (appdata) needs to
+    /// test its own actors multi-node. Start a discoverable actor on node-a, let
+    /// its registration sync to node-b, then message it from node-b. This drives
+    /// `apply_remote_ops` spawning `run_actor_stream_writer` (cluster/sync.rs) —
+    /// a site that raw-`tokio::spawn`ned and PANICKED under sim ("no reactor")
+    /// until it was routed through the Runtime seam. A green run here is the proof
+    /// the cross-node actor path is sim-runnable.
+    #[test]
+    fn remote_actor_messaging_works_under_sim() {
+        let mut c = SimCluster::builder(1).node("node-a").node("node-b").build();
+        c.mesh();
+        c.pump();
+
+        // Discoverable actor on node-a (registers with the receptionist).
+        let _local = c
+            .system("node-a")
+            .start_actor("counter/0", Counter, CounterState::default());
+
+        // Advance a registry-sync interval so node-a's Register op propagates to
+        // node-b, whose apply_remote_ops registers the remote actor and spawns the
+        // stream writer toward node-a (the routed spawn).
+        c.advance(Duration::from_secs(6));
+
+        // From node-b, resolve the remote endpoint and message it over the SimNet.
+        let ep = c
+            .system("node-b")
+            .lookup::<Counter>("counter/0")
+            .expect("node-b discovers node-a's actor after the registry sync");
+        let reply = c.block_on(async move { ep.send(Increment { amount: 5 }).await.unwrap() });
+        assert_eq!(
+            reply, 5,
+            "a remote increment round-trips over the sim actor stream"
+        );
     }
 
     // ── adversarial scheduling oracles (real cluster code, shuffled order) ────

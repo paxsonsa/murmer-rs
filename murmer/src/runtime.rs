@@ -71,6 +71,17 @@ pub trait Runtime: Send + Sync + 'static {
     /// one atomic step. This is deliberately **not** `tokio::spawn_blocking`:
     /// a sim scheduler cannot observe an uncontrolled thread pool.
     fn run_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()>;
+
+    /// Whether [`spawn`](Self::spawn) can accept a task right now. The sim runtime
+    /// always can (it queues into the world), so this defaults to `true`. The
+    /// Tokio default overrides it: it can only spawn inside a live runtime
+    /// context, so this is `false` on a thread with no reactor — e.g. a `Drop`
+    /// running during process teardown after the runtime is gone. Use it to guard
+    /// a spawn that must not panic into a dead runtime, WITHOUT excluding the sim
+    /// path (where `Handle::try_current()` is always `Err` but spawning is fine).
+    fn can_spawn(&self) -> bool {
+        true
+    }
 }
 
 /// A handle to a spawned task. Dropping it does not cancel the task; call
@@ -119,6 +130,11 @@ impl Runtime for TokioRuntime {
         let handle = tokio::spawn(fut);
         let abort = handle.abort_handle();
         SpawnHandle::from_abort(move || abort.abort())
+    }
+
+    #[inline]
+    fn can_spawn(&self) -> bool {
+        tokio::runtime::Handle::try_current().is_ok()
     }
 
     #[inline]

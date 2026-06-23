@@ -41,7 +41,7 @@ use crate::listing::{
 };
 use crate::oplog::{Op, OpLog, OpType, VersionVector};
 use crate::ready::ReadyHandle;
-use crate::runtime::{Runtime, TokioRuntime};
+use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::supervisor::{run_supervisor, should_restart};
 use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegistry};
 
@@ -265,7 +265,7 @@ struct ReceptionistInner {
     observed_versions: Mutex<VersionVector>,
     watches: Mutex<HashMap<String, Vec<WatchEntry>>>,
     pending_notifications: Mutex<Vec<PendingListingNotification>>,
-    blip_pending: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    blip_pending: Mutex<HashMap<String, SpawnHandle>>,
     /// The runtime seam: all supervisor/background spawns and timers go through
     /// this, so a deterministic `SimRuntime` can drive the whole node.
     runtime: Arc<dyn Runtime>,
@@ -1548,11 +1548,15 @@ impl Receptionist {
             let key_ids = key_ids.to_vec();
 
             let label_for_insert = label_owned.clone();
-            // Blip debounce is gated on blip_window (cluster config), off the
-            // default single-node sim path. Routing it through the runtime seam
-            // is a tracked follow-up.
-            let handle = tokio::spawn(async move { // determinism-gate: allow — blip debounce
-                tokio::time::sleep(window).await; // determinism-gate: allow — blip debounce
+            // Routed through the Runtime seam so the blip debounce is sim-runnable:
+            // a raw tokio::spawn + tokio::time::sleep would panic under SimWorld
+            // (no reactor / no timer driver), and `runtime.sleep` runs on virtual
+            // time under sim. This path is reachable only when a consumer sets a
+            // non-default `blip_window`.
+            let runtime = self.inner.runtime.clone();
+            let sleep_rt = runtime.clone();
+            let handle = runtime.spawn(Box::pin(async move {
+                sleep_rt.sleep(window).await;
 
                 // If the actor is still registered after the window, commit the op
                 let still_exists = receptionist
@@ -1584,7 +1588,7 @@ impl Receptionist {
                     .lock()
                     .unwrap()
                     .remove(&label_owned);
-            });
+            }));
 
             self.inner
                 .blip_pending

@@ -265,13 +265,13 @@ impl Drop for AckGuard {
         if self.sent {
             return;
         }
-        // Guard against dropping after the Tokio runtime has shut down (spawning
-        // then panics). Under the sim runtime there is no Tokio handle, so this
-        // also early-returns — acceptable because the bridge's happy path always
-        // calls `ack` (consuming the guard, `sent = true`), so this failure-ack
-        // path is not exercised under simulation. Routing it through the seam for
-        // sim-driven factory panics is a tracked follow-up.
-        if tokio::runtime::Handle::try_current().is_err() {
+        // Guard against spawning into a dead runtime (prod teardown), via the
+        // seam's `can_spawn` rather than `tokio::runtime::Handle`. Under sim
+        // `can_spawn` is true, so the failure-ack IS delivered — previously the
+        // raw Handle check early-returned here and silently swallowed it, leaking
+        // the Coordinator's `pending_spawns` entry, so a sim test driving a
+        // panicking factory hung instead of seeing the failure ack.
+        if !self.runtime.can_spawn() {
             return;
         }
         let coord = self.coordinator.clone();
@@ -325,7 +325,11 @@ async fn run_spawn_drain_loop(
             );
             let registry = Arc::clone(&spawn_registry);
             let receptionist = receptionist.clone();
-            let guard = AckGuard::new(Arc::clone(&runtime), coordinator.clone(), request.request_id);
+            let guard = AckGuard::new(
+                Arc::clone(&runtime),
+                coordinator.clone(),
+                request.request_id,
+            );
             runtime.spawn(Box::pin(async move {
                 let factory_start = std::time::Instant::now();
                 let result = registry

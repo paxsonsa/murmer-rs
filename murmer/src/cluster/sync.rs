@@ -326,14 +326,21 @@ pub fn apply_remote_ops(
                 // establishes the connection.
                 let target_node_id = op.node_id.clone();
 
-                tokio::spawn(remote::run_actor_stream_writer(
-                    Arc::clone(net),
-                    receptionist.runtime().clone(),
-                    target_node_id,
-                    label.clone(),
-                    wire_rx,
-                    response_registry,
-                ));
+                // Route through the Runtime seam (not a raw tokio::spawn) so this
+                // is sim-runnable: under SimWorld a raw spawn calls Handle::current
+                // and panics ("no reactor"). This is the FIRST site a cross-node
+                // consumer hits — it fires the moment a remote actor registration
+                // syncs here. The runtime is already in scope (2nd arg below).
+                receptionist
+                    .runtime()
+                    .spawn(Box::pin(remote::run_actor_stream_writer(
+                        Arc::clone(net),
+                        receptionist.runtime().clone(),
+                        target_node_id,
+                        label.clone(),
+                        wire_rx,
+                        response_registry,
+                    )));
 
                 let _ = event_tx.send(ClusterEvent::ActorRegistered {
                     label: label.clone(),
