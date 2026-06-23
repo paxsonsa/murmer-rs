@@ -1030,4 +1030,82 @@ mod tests {
             "the adoption strictly outranks A's grant — the fence holds too"
         );
     }
+
+    /// The richest correctness path under adversarial scheduling: election +
+    /// generation minting + fault + backend rebuild, run with deliberately-
+    /// shuffled task order. The shared-backend FIXES must hold regardless of
+    /// interleaving — (a) the fence under partition and (b) the amnesia fix
+    /// (new-leader adoption) under a leader crash. (term/seq is a counter and
+    /// election is OldestNode, neither rng-dependent, so this confirms the safety
+    /// properties survive the interleaving space.)
+    #[cfg(feature = "app")]
+    #[test]
+    fn shared_backend_fixes_hold_under_adversarial_scheduling() {
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
+        use crate::app::singleton::{CoordinatorGenerationSource, SingletonAnchor, SingletonSpec};
+
+        let place_catalog = |c: &mut SimCluster| {
+            let coord = c.coordinator("node-a");
+            let msg = StartSingleton {
+                spec: SingletonSpec::new("catalog", "test::Catalog", SingletonAnchor::Leader),
+            };
+            c.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        let get_on_b = |c: &mut SimCluster| {
+            let coord = c.coordinator("node-b");
+            c.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+
+        for seed in [1u64, 2, 0xC0FFEE] {
+            // (a) Partition: B adopts catalog at a strictly higher term — the fence
+            //     orders the two owners, no split brain.
+            {
+                let mut c = SimCluster::builder(seed)
+                    .node("node-a")
+                    .node("node-b")
+                    .shared_generation_source(Arc::new(CoordinatorGenerationSource::new()))
+                    .random_scheduling()
+                    .build();
+                c.mesh();
+                c.pump();
+                let own_a = place_catalog(&mut c);
+                assert!(c.partition("node-a", "node-b"));
+                c.advance(Duration::from_secs(30));
+                let on_b = get_on_b(&mut c).expect("B adopts under partition (adversarial)");
+                assert!(
+                    on_b.generation > own_a.generation,
+                    "fence holds under adversarial scheduling (seed {seed})"
+                );
+            }
+            // (b) Crash the leader: the new leader rebuilds from the backend and
+            //     adopts — no amnesia, strictly higher term.
+            {
+                let mut c = SimCluster::builder(seed)
+                    .node("node-a")
+                    .node("node-b")
+                    .shared_generation_source(Arc::new(CoordinatorGenerationSource::new()))
+                    .random_scheduling()
+                    .build();
+                c.mesh();
+                c.pump();
+                let own_a = place_catalog(&mut c);
+                c.crash("node-a");
+                c.advance(Duration::from_secs(30));
+                let b_id = c.identity("node-b").node_id_string();
+                let on_b = get_on_b(&mut c).expect("new leader adopts, not orphaned (adversarial)");
+                assert_eq!(on_b.owner_node_id.as_deref(), Some(b_id.as_str()));
+                assert!(
+                    on_b.generation > own_a.generation,
+                    "adoption outranks A under adversarial scheduling (seed {seed})"
+                );
+            }
+        }
+    }
 }

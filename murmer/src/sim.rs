@@ -276,10 +276,15 @@ impl ReadyPolicy for FifoPolicy {
 /// A seeded adversarial policy: pick a uniformly-random ready task each step,
 /// deliberately exploring interleavings a FIFO run never reaches. Seed it from
 /// [`SimWorld::derive_seed`]`("scheduler")` (see
-/// [`use_random_scheduling`](SimWorld::use_random_scheduling)) so the scheduling
-/// RNG is isolated from the actor-visible stream — turning it on never shifts an
-/// `rng_u64()` draw a test or actor sees, so the same workload can be replayed
-/// under FIFO and random scheduling and the observable outcome compared.
+/// [`use_random_scheduling`](SimWorld::use_random_scheduling)): the scheduler
+/// draws from its own derived stream, so it never *consumes* from the actor RNG
+/// stream — that stream's value sequence is unchanged whether scheduling is FIFO
+/// or random. It does NOT mean outcomes are rng-identical: actors share one
+/// `SimShared.rng`, so a different task order changes which actor draws *first*,
+/// i.e. the cross-actor consumption order. That is exactly the point — the way to
+/// validate is an oracle (run the workload under both policies and assert the
+/// observable *outcome* is invariant, as the cluster oracle tests do), not to
+/// expect identical draws.
 pub struct RandomPolicy {
     rng: ChaCha8Rng,
 }
@@ -436,10 +441,11 @@ impl SimWorld {
     }
 
     /// Switch to seeded-random scheduling: an adversarial [`RandomPolicy`] seeded
-    /// off this world's root seed (via `derive_seed("scheduler")`, a stream
-    /// isolated from the actor RNG so enabling it perturbs nothing an actor or
-    /// test observes). Reproducible from the world seed: the same seed replays the
-    /// same interleaving. Call before driving the world.
+    /// off this world's root seed (via `derive_seed("scheduler")`, a stream the
+    /// scheduler draws from instead of the actor RNG — so it consumes nothing from
+    /// the actor stream, though task order can still change *which* actor draws
+    /// first; see [`RandomPolicy`]). Reproducible from the world seed: the same
+    /// seed replays the same interleaving. Call before driving the world.
     pub fn use_random_scheduling(&mut self) {
         let seed = self.derive_seed("scheduler");
         self.set_policy(Box::new(RandomPolicy::new(seed)));
