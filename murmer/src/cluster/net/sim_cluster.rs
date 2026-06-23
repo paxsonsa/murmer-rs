@@ -155,6 +155,9 @@ pub struct SimClusterBuilder {
     /// Node names in insertion order; ids/ports are derived (`<name>-id`,
     /// `BASE_PORT + index`).
     names: Vec<String>,
+    /// Drive the cluster under adversarial (seeded-random) task scheduling
+    /// instead of FIFO. See [`random_scheduling`](Self::random_scheduling).
+    random_scheduling: bool,
     #[cfg(feature = "app")]
     coordinators: bool,
     #[cfg(feature = "app")]
@@ -203,12 +206,27 @@ impl SimClusterBuilder {
         self
     }
 
+    /// Drive the whole cluster under adversarial (seeded-random) task scheduling:
+    /// the executor picks a random ready task each step instead of FIFO, so boot,
+    /// handshake, foca SWIM, and fault handling all run under deliberately-shuffled
+    /// interleavings. Reproducible from the cluster seed. A correctness property
+    /// (e.g. the converged membership set) that holds under FIFO *and* here is far
+    /// better evidence than FIFO alone — it survived the interleaving space, not
+    /// one lucky order.
+    pub fn random_scheduling(mut self) -> Self {
+        self.random_scheduling = true;
+        self
+    }
+
     /// Boot every node on one shared [`SimRuntime`], returning a driveable cluster.
     /// No discovery edges are injected yet — call [`mesh`](SimCluster::mesh) (or
     /// [`dial`](SimCluster::dial)) then [`pump`](SimCluster::pump) to converge.
     pub fn build(self) -> SimCluster {
         install_crypto();
-        let world = SimWorld::new(self.seed);
+        let mut world = SimWorld::new(self.seed);
+        if self.random_scheduling {
+            world.use_random_scheduling();
+        }
         let sim_rt = world.runtime().clone();
         let rt: Arc<dyn Runtime> = Arc::new(sim_rt.clone());
         let fabric = SimFabric::new(sim_rt);
@@ -256,6 +274,7 @@ impl SimCluster {
         SimClusterBuilder {
             seed,
             names: Vec::new(),
+            random_scheduling: false,
             #[cfg(feature = "app")]
             coordinators: false,
             #[cfg(feature = "app")]
@@ -722,6 +741,75 @@ mod tests {
         };
         assert!(readmitted(&c.events("node-b")), "B readmits A@2");
         assert!(readmitted(&c.events("node-c")), "C readmits A@2");
+    }
+
+    // ── adversarial scheduling oracles (real cluster code, shuffled order) ────
+
+    #[test]
+    fn convergence_is_invariant_under_adversarial_scheduling() {
+        // The converged membership set must not depend on task interleaving. Run
+        // the same 3-node mesh under FIFO and under adversarial (seeded-random)
+        // scheduling; every node must see the same two peers either way. This
+        // drives the REAL cluster substrate — event loop, handshake/accept, foca
+        // SWIM, control streams — under deliberately-shuffled task order, so a
+        // green result is evidence the convergence survives the interleaving
+        // space, not one lucky FIFO order.
+        fn converged(seed: u64, adversarial: bool) -> BTreeSet<(String, String)> {
+            let mut b = SimCluster::builder(seed)
+                .node("node-a")
+                .node("node-b")
+                .node("node-c");
+            if adversarial {
+                b = b.random_scheduling();
+            }
+            let mut c = b.build();
+            c.mesh();
+            c.pump();
+            let mut pairs = BTreeSet::new();
+            for me in ["node-a", "node-b", "node-c"] {
+                for id in c.events(me).joined_ids() {
+                    pairs.insert((me.to_string(), id));
+                }
+            }
+            pairs
+        }
+        for seed in [1u64, 2, 0xC0FFEE] {
+            let fifo = converged(seed, false);
+            assert_eq!(fifo.len(), 6, "full mesh: each of 3 nodes sees 2 peers");
+            assert_eq!(
+                converged(seed, true),
+                fifo,
+                "convergence is invariant under adversarial scheduling (seed {seed})"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_detection_is_invariant_under_adversarial_scheduling() {
+        // The failure detector is the path most likely to hide an ordering bug
+        // (probe / ack / suspect timing). Crash A under adversarial scheduling:
+        // the survivors must still detect EXACTLY A failed, same as under FIFO.
+        let only_a = BTreeSet::from(["node-a-id".to_string()]);
+        for seed in [1u64, 2, 0xC0FFEE] {
+            let mut c = SimCluster::builder(seed)
+                .node("node-a")
+                .node("node-b")
+                .node("node-c")
+                .random_scheduling()
+                .build();
+            c.mesh();
+            c.pump();
+            let _ = (c.events("node-b"), c.events("node-c")); // drop convergence
+            c.crash("node-a");
+            c.advance(Duration::from_secs(30));
+            for survivor in ["node-b", "node-c"] {
+                assert_eq!(
+                    c.events(survivor).failed,
+                    only_a,
+                    "{survivor} detects exactly A failed under adversarial scheduling (seed {seed})"
+                );
+            }
+        }
     }
 
     // ── app-layer coordination backend (the Raft-decision catalog) ────────────
