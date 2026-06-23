@@ -1417,4 +1417,109 @@ mod tests {
              — got {elapsed:?}; if zero, latency is not wired through stream_pair"
         );
     }
+
+    /// Seed-sweep the singleton fence's SAFETY properties — the sibling of
+    /// `seed_sweep_membership_invariants`, for the coordination layer.
+    ///
+    /// The fence DST rides on cluster determinism (foca membership + failure
+    /// detection + election), which the static determinism gate does NOT cover
+    /// (`cluster/*` is out of scope; see `scripts/check-determinism.sh`). The
+    /// single-seed fence tests above and the convergence/crash sweep do not
+    /// exercise the fence outcome across the seed space, so a cluster-determinism
+    /// regression that surfaces only through the fence path could pass at seed 1.
+    /// This sweep closes that gap: across many seeds, the shared backend must (a)
+    /// fence a partition split-brain (the new leader adopts at a strictly higher
+    /// term) and (b) adopt on a leader crash (no amnesia). Defaults small locally;
+    /// CI sets `MURMER_SIM_SWEEP_SEEDS` high (the `seed_sweep` name is in the CI
+    /// determinism job's filter).
+    ///
+    /// Note: this sweeps OUTCOME correctness across seeds. The cross-process
+    /// same-seed reproducibility of these scenarios is spot-checked once below;
+    /// a full replay guard for the cluster path remains a tracked follow-up.
+    #[cfg(feature = "app")]
+    #[test]
+    fn seed_sweep_fence_invariants() {
+        use crate::app::coordinator::{GetSingleton, StartSingleton};
+        use crate::app::singleton::{CoordinatorGenerationSource, SingletonAnchor, SingletonSpec};
+
+        let n: u64 = std::env::var("MURMER_SIM_SWEEP_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+
+        let place_catalog = |c: &mut SimCluster| {
+            let coord = c.coordinator("node-a");
+            let msg = StartSingleton {
+                spec: SingletonSpec::new("catalog", "test::Catalog", SingletonAnchor::Leader),
+            };
+            c.block_on(async move { coord.send_async(msg).await.unwrap().unwrap() })
+        };
+        let get_on_b = |c: &mut SimCluster| {
+            let coord = c.coordinator("node-b");
+            c.block_on(async move {
+                coord
+                    .send(GetSingleton {
+                        label: "catalog".into(),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        // The new leader's adopted term vs A's grant term, under partition.
+        let fence_under_partition = |seed: u64| -> (u64, u64) {
+            let mut c = SimCluster::builder(seed)
+                .node("node-a")
+                .node("node-b")
+                .shared_generation_source(Arc::new(CoordinatorGenerationSource::new()))
+                .build();
+            c.mesh();
+            c.pump();
+            let own_a = place_catalog(&mut c);
+            assert!(c.partition("node-a", "node-b"));
+            c.advance(Duration::from_secs(30));
+            let on_b = get_on_b(&mut c).expect("B adopts catalog under partition");
+            (own_a.generation.term, on_b.generation.term)
+        };
+
+        // Reproducibility spot-check: the same seed yields the same fence terms.
+        assert_eq!(
+            fence_under_partition(1),
+            fence_under_partition(1),
+            "the fence outcome must replay identically at the same seed"
+        );
+
+        for seed in 0..n {
+            // (a) Partition: B adopts at a strictly higher term than A's grant —
+            //     the fence orders the two owners, so the stale A is rejected.
+            let (term_a, term_b) = fence_under_partition(seed);
+            assert!(
+                term_b > term_a,
+                "fence holds under partition: B's term {term_b} > A's {term_a} (seed {seed})"
+            );
+
+            // (b) Crash the leader: the new leader rebuilds from the shared backend
+            //     and adopts on itself at a higher term (no amnesia, no orphan).
+            let mut c = SimCluster::builder(seed)
+                .node("node-a")
+                .node("node-b")
+                .shared_generation_source(Arc::new(CoordinatorGenerationSource::new()))
+                .build();
+            c.mesh();
+            c.pump();
+            let own_a = place_catalog(&mut c);
+            c.crash("node-a");
+            c.advance(Duration::from_secs(30));
+            let b_id = c.identity("node-b").node_id_string();
+            let on_b = get_on_b(&mut c).expect("new leader adopts from the shared backend");
+            assert_eq!(
+                on_b.owner_node_id.as_deref(),
+                Some(b_id.as_str()),
+                "B owns catalog after adopting (seed {seed})"
+            );
+            assert!(
+                on_b.generation.term > own_a.generation.term,
+                "adoption outranks A on crash (seed {seed})"
+            );
+        }
+    }
 }
