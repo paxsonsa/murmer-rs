@@ -29,7 +29,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::actor::{Actor, Handler, RemoteMessage};
+use crate::actor::{Actor, AsyncHandler, Handler, RemoteMessage};
 use crate::endpoint::Endpoint;
 use crate::listing::{ListingEvent, ReceptionKey, WatchedListing};
 use crate::receptionist::Receptionist;
@@ -104,6 +104,35 @@ impl<A: Actor + 'static> Router<A> {
                 // For broadcast via send(), just send to the first endpoint
                 self.endpoints[0].send(msg).await
             }
+        }
+    }
+
+    /// Like [`send`](Self::send) but routes to an [`AsyncHandler<M>`] — the
+    /// `.await`-capable handler the `#[handlers]` macro emits for an `async fn`.
+    ///
+    /// `send` is bound `A: Handler<M>` (the sync handler), and the macro emits
+    /// exactly one of `Handler`/`AsyncHandler` per message, so an actor whose
+    /// handler is `async` can only be routed through this method.
+    pub async fn send_async<M>(&self, msg: M) -> Result<M::Result, SendError>
+    where
+        A: AsyncHandler<M>,
+        M: RemoteMessage,
+        M::Result: Serialize + DeserializeOwned,
+    {
+        if self.endpoints.is_empty() {
+            return Err(SendError::MailboxClosed);
+        }
+
+        match self.strategy {
+            RoutingStrategy::RoundRobin => {
+                let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
+                self.endpoints[idx].send_async(msg).await
+            }
+            RoutingStrategy::Random => {
+                let idx = (self.runtime.rng_u64() % self.endpoints.len() as u64) as usize;
+                self.endpoints[idx].send_async(msg).await
+            }
+            RoutingStrategy::Broadcast => self.endpoints[0].send_async(msg).await,
         }
     }
 
@@ -406,6 +435,35 @@ impl<A: Actor + 'static> PoolRouter<A> {
         endpoint.send(msg).await
     }
 
+    /// Like [`send`](Self::send) but routes to an [`AsyncHandler<M>`] — the
+    /// `.await`-capable handler the `#[handlers]` macro emits for an `async fn`.
+    /// Same pool/strategy selection; only the per-endpoint dispatch differs.
+    pub async fn send_async<M>(&self, msg: M) -> Result<M::Result, SendError>
+    where
+        A: AsyncHandler<M>,
+        M: RemoteMessage,
+        M::Result: Serialize + DeserializeOwned,
+    {
+        let endpoint = {
+            let pool = self.pool.read().unwrap();
+            if pool.is_empty() {
+                return Err(SendError::MailboxClosed);
+            }
+
+            let idx = match self.strategy {
+                RoutingStrategy::RoundRobin => {
+                    self.counter.fetch_add(1, Ordering::Relaxed) % pool.len()
+                }
+                RoutingStrategy::Random => (self.runtime.rng_u64() % pool.len() as u64) as usize,
+                RoutingStrategy::Broadcast => 0,
+            };
+
+            pool[idx].1.clone()
+        }; // lock released here
+
+        endpoint.send_async(msg).await
+    }
+
     /// Send a message to ALL endpoints concurrently and collect results.
     pub async fn broadcast<M>(&self, msg: M) -> Vec<Result<M::Result, SendError>>
     where
@@ -449,5 +507,76 @@ impl<A: Actor + 'static> PoolRouter<A> {
             .iter()
             .map(|(l, _)| l.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::ActorContext;
+    use crate::prelude::*;
+    use crate::receptionist::Receptionist;
+    use serde::{Deserialize, Serialize};
+
+    // An actor whose handler is `async` — so the `#[handlers]` macro emits
+    // `AsyncHandler<AsyncAdd>` and NOT `Handler<AsyncAdd>`. That is exactly the
+    // shape `send` cannot route to and `send_async` must.
+    struct AsyncWorker;
+
+    #[derive(Default)]
+    struct WorkerState {
+        seen: i64,
+    }
+
+    impl Actor for AsyncWorker {
+        type State = WorkerState;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Message)]
+    #[message(result = i64, remote = "router::AsyncAdd")]
+    struct AsyncAdd {
+        amount: i64,
+    }
+
+    #[handlers]
+    impl AsyncWorker {
+        #[handler]
+        async fn async_add(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            state: &mut WorkerState,
+            msg: AsyncAdd,
+        ) -> i64 {
+            state.seen += msg.amount;
+            state.seen
+        }
+    }
+
+    #[tokio::test]
+    async fn router_send_async_round_robins_to_async_handlers() {
+        let recep = Receptionist::new();
+        let ep1 = recep.start("w/1", AsyncWorker, WorkerState::default());
+        let ep2 = recep.start("w/2", AsyncWorker, WorkerState::default());
+        let router = Router::new(vec![ep1, ep2], RoutingStrategy::RoundRobin);
+
+        // Round-robin over 2 endpoints: msgs 0,2 → w/1; msgs 1,3 → w/2. Each
+        // endpoint sees 2 increments; the 4th reply is w/2's running total (2).
+        let mut last = 0;
+        for _ in 0..4 {
+            last = router
+                .send_async(AsyncAdd { amount: 1 })
+                .await
+                .expect("send_async routes to the AsyncHandler");
+        }
+        assert_eq!(last, 2, "round-robin spread the 4 sends evenly across 2 async actors");
+    }
+
+    #[tokio::test]
+    async fn router_send_async_empty_pool_errors() {
+        let router: Router<AsyncWorker> = Router::new(vec![], RoutingStrategy::RoundRobin);
+        assert!(matches!(
+            router.send_async(AsyncAdd { amount: 1 }).await,
+            Err(SendError::MailboxClosed)
+        ));
     }
 }

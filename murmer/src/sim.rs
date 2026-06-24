@@ -636,6 +636,15 @@ mod tests {
         every_ms: u64,
     }
 
+    // An ASYNC-handled increment — the macro emits `AsyncHandler<IncrAsync>`, so
+    // it can only be routed via `send_async`, not `send`. Used by the PoolRouter
+    // async-routing test below.
+    #[derive(Debug, Clone, Serialize, Deserialize, Message)]
+    #[message(result = i64, remote = "sim::IncrAsync")]
+    struct IncrAsync {
+        amount: i64,
+    }
+
     #[handlers]
     impl Counter {
         #[handler]
@@ -677,6 +686,17 @@ mod tests {
             msg: StartTicking,
         ) {
             state.timer = Some(ctx.schedule_repeat(Duration::from_millis(msg.every_ms), Tick));
+        }
+
+        #[handler]
+        async fn incr_async(
+            &mut self,
+            _ctx: &ActorContext<Self>,
+            state: &mut CounterState,
+            msg: IncrAsync,
+        ) -> i64 {
+            state.count += msg.amount;
+            state.count
         }
     }
 
@@ -859,6 +879,46 @@ mod tests {
             vec!["p/alpha", "p/bravo", "p/charlie"],
             "pool order is deterministic (sorted by label, not hash-random)"
         );
+        let _ = kept;
+    }
+
+    #[test]
+    fn pool_router_send_async_routes_under_sim() {
+        // PoolRouter::send_async must route to actors whose handler is `async`
+        // (AsyncHandler) — the case `send` (bound Handler) cannot reach. Drive it
+        // deterministically under sim: fill the pool via pump, then route.
+        let mut world = SimWorld::new(9);
+        let key = ReceptionKey::<Counter>::new("apool");
+        let mut kept = Vec::new();
+        for label in ["a/0", "a/1"] {
+            let ep = world
+                .system()
+                .start(label, Counter, CounterState::default());
+            world.system().check_in(label, key.clone());
+            kept.push(ep);
+        }
+
+        let router = PoolRouter::new(
+            world.system().receptionist(),
+            key,
+            RoutingStrategy::RoundRobin,
+        );
+        world.pump();
+        assert_eq!(router.len(), 2, "both async actors are in the pool");
+
+        // Two round-robin sends: a/0 then a/1, each incremented once. The 2nd
+        // reply is a/1's running total (1).
+        let last = world.block_on(async move {
+            let mut last = 0;
+            for _ in 0..2 {
+                last = router
+                    .send_async(IncrAsync { amount: 1 })
+                    .await
+                    .expect("PoolRouter::send_async routes to the AsyncHandler");
+            }
+            last
+        });
+        assert_eq!(last, 1, "round-robin hit each of the 2 async actors exactly once");
         let _ = kept;
     }
 
