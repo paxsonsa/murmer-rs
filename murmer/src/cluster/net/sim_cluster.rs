@@ -763,6 +763,73 @@ mod tests {
         );
     }
 
+    /// The behavior the injected registry exists for: a Coordinator on a
+    /// simulated node actually *spawns* an actor through it. Drives the whole
+    /// path under the virtual clock — `SubmitSpec` → placement → spawn-drain loop
+    /// → `registry.spawn` → `receptionist.start` → a running, message-handling
+    /// actor. The factory here genuinely calls `receptionist.start(...)` (not a
+    /// no-op stub), so a green run is proof the drain loop fires under sim and the
+    /// consumer's factory runs — the actual P0 unblock, not just the plumbing.
+    #[cfg(feature = "app")]
+    #[test]
+    fn coordinator_spawns_through_the_injected_registry_under_sim() {
+        use crate::app::coordinator::SubmitSpec;
+        use crate::app::spec::ActorSpec;
+
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .with_spawn_registry(|| {
+                let mut reg = SpawnRegistry::new();
+                reg.register(
+                    "simcluster::Counter",
+                    Box::new(|receptionist, label, _state: Vec<u8>| {
+                        Box::pin(async move {
+                            // The real factory work: start the actor. (A consumer
+                            // would decode `_state` into CounterState first; default
+                            // state is enough to prove the spawn path fires.)
+                            receptionist.start(&label, Counter, CounterState::default());
+                            Ok::<(), crate::cluster::sync::SpawnError>(())
+                        })
+                    }),
+                );
+                reg
+            })
+            .with_coordinators()
+            .build();
+        c.pump();
+
+        // Submit a spec for the registered type. The single node auto-registers
+        // itself and leads, so LeastLoaded places locally.
+        let coord = c.coordinator("node-a");
+        let decision = c.block_on(async move {
+            coord
+                .send(SubmitSpec {
+                    spec: ActorSpec::new("counter/spawned", "simcluster::Counter"),
+                })
+                .await
+                .unwrap()
+        });
+        assert!(
+            decision.is_ok(),
+            "placement should choose the local node, got {decision:?}"
+        );
+
+        // Run the spawn-drain loop + the registry factory + the ack round-trip.
+        c.pump();
+        c.advance(Duration::from_secs(1));
+
+        // The actor is now running on the node — reachable and handling messages.
+        let ep = c
+            .system("node-a")
+            .lookup::<Counter>("counter/spawned")
+            .expect("the Coordinator spawned Counter through the injected registry");
+        let reply = c.block_on(async move { ep.send(Increment { amount: 3 }).await.unwrap() });
+        assert_eq!(
+            reply, 3,
+            "the actor the Coordinator spawned handles messages"
+        );
+    }
+
     #[test]
     fn full_mesh_converges_deterministically() {
         // Every node sees the other two come up — the converged SET, asserted
