@@ -393,6 +393,15 @@ impl ClusterSystem {
         &self.net
     }
 
+    /// The [`Runtime`] seam this system runs on — Tokio in production, the
+    /// deterministic `SimRuntime` under simulation. Parity with
+    /// [`SimWorld::runtime`](crate::sim::SimWorld::runtime) so a consumer can
+    /// install a per-node spawn seam (or run blocking work via the seam) without
+    /// reaching through `receptionist().runtime()`.
+    pub fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.runtime
+    }
+
     /// Get the actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.net.local_addr()
