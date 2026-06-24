@@ -12,9 +12,11 @@
 # marker (used for monitor-only instrumentation and consciously-deferred paths).
 #
 # NOT scanned (tracked follow-ups, deliberately out of scope for single-node P0):
-#   router.rs, app/*, client.rs, node.rs, monitor/*, cluster/*  — these still
-#   spawn on Tokio directly and are not sim-ready yet. As each is routed through
-#   the runtime seam, move it into CORE below.
+#   client.rs, node.rs, monitor/*, and the rest of cluster/* — these still spawn
+#   on Tokio directly and are not sim-ready yet. As each is routed through the
+#   runtime seam, move it into CORE below. (router.rs and the cluster app path —
+#   app/bridge.rs, app/spawn_sender.rs, app/placement.rs — have already made the
+#   move and now live in CORE.)
 # Seam implementations (allowed to touch Tokio/RNG by definition): runtime.rs, sim.rs.
 #
 # SCOPE: this is the MECHANICAL half of the determinism contract — it catches
@@ -49,14 +51,27 @@ CORE=(
   oplog.rs
   router.rs
   app/coordinator.rs
+  # Cluster app path — routed through the Runtime seam (bridge spawns via
+  # `runtime.spawn`) and seeded (RandomPlacement uses a derived StdRng). The
+  # only escape hatches left are monitor-instrumentation `Instant::now()` reads,
+  # each carrying an explicit `determinism-gate: allow` marker.
+  app/bridge.rs
+  app/spawn_sender.rs
+  app/placement.rs
 )
 
 # Tokens that reintroduce nondeterminism if used outside the Runtime seam:
 #   spawn  -> uncontrolled task scheduling
 #   time   -> wall-clock timers
 #   now    -> wall-clock reads that can feed decisions
-#   rand   -> unseeded global RNG
-BANNED='tokio::spawn|tokio::time::|Instant::now|SystemTime::now|rand::(rng|random|thread_rng)'
+#   rand   -> unseeded global RNG, OR a generator seeded from OS entropy
+#
+# The rand alternatives are word-bounded so the *module path* `rand::rngs::…`
+# does not match the global-fn form `rand::rng()` (that overlap used to flag the
+# legitimately-seeded `rand::rngs::StdRng`). The entropy entry points
+# (`OsRng`, `from_entropy`, `from_os_rng`) are listed explicitly so a generator
+# seeded from the OS still trips while a seeded `StdRng::seed_from_u64` passes.
+BANNED='tokio::spawn|tokio::time::|Instant::now|SystemTime::now|rand::(rng|random|thread_rng)\b|OsRng|from_entropy|from_os_rng'
 
 violations=0
 for f in "${CORE[@]}"; do
@@ -89,9 +104,7 @@ fi
 
 echo "✓ determinism gate: clean across ${#CORE[@]} core modules."
 
-# Informational: the not-yet-routed surface, so it stays visible and shrinks.
-deferred=$(rg -n -e "$BANNED" "$SRC/app/bridge.rs" "$SRC/app/spawn_sender.rs" "$SRC/app/placement.rs" 2>/dev/null \
-  | rg -v 'determinism-gate: allow' | rg -v '^\s*//' | wc -l | tr -d ' ')
-echo "  ($deferred Tokio/RNG sites remain in deferred modules — app/bridge.rs +"
-echo "   app/spawn_sender.rs are cluster-path (need a live ClusterSystem, not the"
-echo "   local sim path); app/placement.rs RandomPlacement needs a seeded strategy.)"
+# The cluster app path (bridge/spawn_sender/placement) is now part of CORE above
+# — seam-routed and seeded. What this gate still does NOT cover is the rest of
+# cluster/* (the foca membership + failure detector + control streams), which is
+# guarded empirically instead, by the `seed_sweep_*` sim tests. Keep those green.

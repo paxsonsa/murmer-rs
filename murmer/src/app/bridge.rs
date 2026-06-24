@@ -331,7 +331,7 @@ async fn run_spawn_drain_loop(
                 request.request_id,
             );
             runtime.spawn(Box::pin(async move {
-                let factory_start = std::time::Instant::now();
+                let factory_start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (spawn_drain_factory timing, never feeds control flow)
                 let result = registry
                     .spawn(
                         receptionist,
@@ -354,7 +354,7 @@ async fn run_spawn_drain_loop(
             );
             let net = Arc::clone(&net);
             runtime.spawn(Box::pin(async move {
-                let factory_start = std::time::Instant::now();
+                let factory_start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (spawn_drain_factory timing, never feeds control flow)
                 if let Err(e) = net
                     .send_control(&node_id, ControlMessage::SpawnActor(request))
                     .await
