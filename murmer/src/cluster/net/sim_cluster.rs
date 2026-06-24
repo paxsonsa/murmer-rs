@@ -161,6 +161,12 @@ pub struct SimClusterBuilder {
     /// Network latency to inject, or `None` for immediate delivery.
     /// Set via [`network_latency`](Self::network_latency).
     network_latency: Option<(Duration, Duration)>,
+    /// Per-node [`SpawnRegistry`] factory. `None` (the default) boots each node
+    /// with an empty registry; set via [`with_spawn_registry`](Self::with_spawn_registry).
+    /// A *factory* (not a single registry) because [`SpawnRegistry`] holds
+    /// boxed, non-`Clone` factories and every node needs its own, so the harness
+    /// calls this once per node at boot (and again on `rejoin`).
+    spawn_registry_factory: Option<Arc<dyn Fn() -> SpawnRegistry + Send + Sync>>,
     #[cfg(feature = "app")]
     coordinators: bool,
     #[cfg(feature = "app")]
@@ -246,6 +252,38 @@ impl SimClusterBuilder {
         self
     }
 
+    /// Supply a factory that builds the [`SpawnRegistry`] each node boots with —
+    /// the seam a consumer uses to register its own actor factories (e.g. the
+    /// `ContainerSupervisor → Writer/Reader/Pin` cast) so the simulated
+    /// Coordinator can spawn a real deployment, not just bare murmer actors.
+    ///
+    /// The closure is invoked once per node at [`build`](Self::build) time, and
+    /// again whenever a node [`rejoin`](SimCluster::rejoin)s, so every node
+    /// (including a returning one) gets its own fully-populated registry. It must
+    /// be a factory rather than a single value because [`SpawnRegistry`] is not
+    /// `Clone` (its [`SpawnFactory`](crate::cluster::sync::SpawnFactory) entries
+    /// are boxed closures) and [`ClusterSystem::start_with_net`] takes the
+    /// registry by value.
+    ///
+    /// ```rust,ignore
+    /// let cluster = SimCluster::builder(1)
+    ///     .nodes(3)
+    ///     .with_spawn_registry(|| {
+    ///         let mut reg = SpawnRegistry::new();
+    ///         reg.register("appdata::Writer", writer_factory());
+    ///         reg.register("appdata::Reader", reader_factory());
+    ///         reg
+    ///     })
+    ///     .build();
+    /// ```
+    pub fn with_spawn_registry(
+        mut self,
+        factory: impl Fn() -> SpawnRegistry + Send + Sync + 'static,
+    ) -> Self {
+        self.spawn_registry_factory = Some(Arc::new(factory));
+        self
+    }
+
     /// Boot every node on one shared [`SimRuntime`], returning a driveable cluster.
     /// No discovery edges are injected yet — call [`mesh`](SimCluster::mesh) (or
     /// [`dial`](SimCluster::dial)) then [`pump`](SimCluster::pump) to converge.
@@ -269,6 +307,7 @@ impl SimClusterBuilder {
             fabric,
             rt,
             nodes: Vec::with_capacity(self.names.len()),
+            spawn_registry_factory: self.spawn_registry_factory,
             #[cfg(feature = "app")]
             coordinators: self.coordinators,
             #[cfg(feature = "app")]
@@ -294,6 +333,10 @@ pub struct SimCluster {
     rt: Arc<dyn Runtime>,
     /// Insertion order — the deterministic iteration order for mesh/events.
     nodes: Vec<Node>,
+    /// Builds the per-node [`SpawnRegistry`]; invoked once per `boot_node`
+    /// (including on `rejoin`) so a returning node gets the same factories as the
+    /// original. `None` → empty registry. See [`SimClusterBuilder::with_spawn_registry`].
+    spawn_registry_factory: Option<Arc<dyn Fn() -> SpawnRegistry + Send + Sync>>,
     #[cfg(feature = "app")]
     coordinators: bool,
     #[cfg(feature = "app")]
@@ -309,6 +352,7 @@ impl SimCluster {
             names: Vec::new(),
             random_scheduling: false,
             network_latency: None,
+            spawn_registry_factory: None,
             #[cfg(feature = "app")]
             coordinators: false,
             #[cfg(feature = "app")]
@@ -330,6 +374,13 @@ impl SimCluster {
             shutdown.clone(),
         );
         let net: Arc<dyn Net> = sim_net.clone();
+        // Per-node spawn registry: the consumer's factory if one was supplied,
+        // else an empty registry (bare-murmer-actor sims). Built fresh per node
+        // because the registry is not `Clone` and each node owns its own.
+        let spawn_registry = match &self.spawn_registry_factory {
+            Some(factory) => factory(),
+            None => SpawnRegistry::new(),
+        };
         let system = ClusterSystem::start_with_net(
             sim_config(&name, identity),
             // Populate the type registry from the linkme `#[handlers]` slice, as
@@ -338,7 +389,7 @@ impl SimCluster {
             // factory and silently skips wiring the remote endpoint — so cross-node
             // actor lookup returns None.
             TypeRegistry::from_auto(),
-            SpawnRegistry::new(),
+            spawn_registry,
             Arc::clone(&self.rt),
             net,
             incoming_rx,
@@ -650,6 +701,65 @@ mod tests {
         assert_ne!(
             c.identity("node-a").socket_addr(),
             c.identity("node-b").socket_addr()
+        );
+    }
+
+    #[test]
+    fn with_spawn_registry_threads_factories_into_every_node() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Count factory-builder invocations — must be exactly once per booted node
+        // (no node falls back to the hardcoded empty registry).
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_in = Arc::clone(&builds);
+
+        let mut c = SimCluster::builder(1)
+            .node("node-a")
+            .node("node-b")
+            .with_spawn_registry(move || {
+                builds_in.fetch_add(1, Ordering::Relaxed);
+                let mut reg = SpawnRegistry::new();
+                // A trivial factory — the test only checks the type is registered
+                // and reachable on each node, not that it spawns anything.
+                reg.register(
+                    "test::Spawnable",
+                    Box::new(|_receptionist, _label, _state: Vec<u8>| {
+                        Box::pin(async move {
+                            Ok::<(), crate::cluster::sync::SpawnError>(())
+                        })
+                    }),
+                );
+                reg
+            })
+            .build();
+
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            2,
+            "the factory runs once per node (2 nodes), never the empty fallback"
+        );
+        for n in ["node-a", "node-b"] {
+            assert!(
+                c.system(n).spawn_registry().get("test::Spawnable").is_some(),
+                "{n} boots with the consumer's spawn factory wired in"
+            );
+        }
+
+        // A returning node must be re-threaded, not silently bare — this is the
+        // reason the factory lives on the SimCluster struct (rejoin → boot_node).
+        c.crash("node-a");
+        c.rejoin("node-a");
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            3,
+            "rejoin rebuilds the registry for the returning node"
+        );
+        assert!(
+            c.system("node-a")
+                .spawn_registry()
+                .get("test::Spawnable")
+                .is_some(),
+            "the rejoined node keeps the supplied spawn factory"
         );
     }
 
