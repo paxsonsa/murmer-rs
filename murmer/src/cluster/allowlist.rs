@@ -257,14 +257,14 @@ pub fn remove_from_file(path: impl AsRef<Path>, id: &EndpointId) -> Result<bool,
 
 fn spawn_watcher(allowlist: Allowlist, path: PathBuf, shutdown: CancellationToken) {
     tokio::spawn(async move {
-        let mut last_mtime = file_mtime(&path);
+        let mut last_fingerprint = file_fingerprint(&path);
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let mtime = file_mtime(&path);
-                    if mtime != last_mtime {
-                        last_mtime = mtime;
+                    let fingerprint = file_fingerprint(&path);
+                    if fingerprint != last_fingerprint {
+                        last_fingerprint = fingerprint;
                         match load_file(&path) {
                             Ok(next) => {
                                 tracing::info!(path = %path.display(), count = next.len(), "allowlist reloaded");
@@ -280,8 +280,20 @@ fn spawn_watcher(allowlist: Allowlist, path: PathBuf, shutdown: CancellationToke
     });
 }
 
-fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// Change-detection fingerprint for the allowlist file: a hash of its bytes.
+///
+/// Hashing the contents — rather than comparing mtime — means an edit that
+/// leaves mtime unchanged is still detected: coarse (1s) mtime filesystems, two
+/// edits within the same second, or timestamp-preserving tools (`rsync
+/// --times`, some editors). An mtime- or size-only check could miss a key
+/// removal and leave a revoked peer's connection open. Returns `None` if the
+/// file can't be read (treated as "no fingerprint", same as before).
+fn file_fingerprint(path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 #[cfg(test)]
@@ -323,5 +335,26 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         assert!(load_file(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fingerprint_tracks_content_not_just_size() {
+        let path = temp_path("fingerprint");
+        let _ = std::fs::remove_file(&path);
+        let a = SecretKey::generate().public();
+        let b = SecretKey::generate().public();
+
+        write_file(&path, &HashSet::from([a])).unwrap();
+        let fp_a = file_fingerprint(&path);
+
+        // Swap to a different key: same entry count (so same length), so an
+        // mtime- or size-only check could miss it. The content fingerprint must
+        // change, otherwise a key removal/swap would never trigger a reload.
+        write_file(&path, &HashSet::from([b])).unwrap();
+        let fp_b = file_fingerprint(&path);
+
+        assert!(fp_a.is_some());
+        assert_ne!(fp_a, fp_b, "a content change must change the fingerprint");
+        let _ = std::fs::remove_file(&path);
     }
 }
