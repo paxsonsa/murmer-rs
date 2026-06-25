@@ -2,26 +2,47 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use iroh::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::config::{Discovery, NodeIdentity};
+use super::net::{NodeId, PeerAddr};
+use super::transport::peer_addr;
 
 /// Events emitted by the discovery subsystem.
+///
+/// A discovered peer is a seam-neutral [`PeerAddr`]: the peer's node id plus
+/// direct-address hints. The id is required — the cluster dials by identity,
+/// not by bare socket address — while hints are best-effort (and ignored by the
+/// in-memory sim fabric).
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
-    PeerDiscovered(SocketAddr),
+    PeerDiscovered(PeerAddr),
 }
+
+/// TXT-record key under which a node advertises its endpoint id over mDNS.
+const MDNS_ENDPOINT_ID_KEY: &str = "endpoint-id";
 
 /// Start the discovery mechanism(s) based on the config.
 ///
-/// Returns a receiver of `DiscoveryEvent` that the ClusterSystem event loop
-/// should poll. Discovered peers are candidates for connection.
+/// Returns the `DiscoveryEvent` sender and receiver. The ClusterSystem event loop
+/// polls the receiver; discovered peers are candidates for connection (discovery
+/// conveys only *addressing hints* — the allowlist decides authorization).
+///
+/// The sender is handed back too so the cluster can keep it alive AND inject
+/// peers programmatically (e.g. `ClusterSystem::inject_discovered`). Holding the
+/// sender also keeps the receiver's select arm live under `Discovery::None`,
+/// where no background task owns a sender — which is how simulation drives
+/// topology (mDNS/seed are real-network/Tokio paths, bypassed under sim).
 pub fn start_discovery(
     identity: &NodeIdentity,
     discovery: &Discovery,
     shutdown: CancellationToken,
-) -> mpsc::UnboundedReceiver<DiscoveryEvent> {
+) -> (
+    mpsc::UnboundedSender<DiscoveryEvent>,
+    mpsc::UnboundedReceiver<DiscoveryEvent>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
 
     match discovery {
@@ -41,12 +62,12 @@ pub fn start_discovery(
                 tx.clone(),
                 shutdown.clone(),
             );
-            start_seed_connector(identity.clone(), seed_nodes.clone(), tx, shutdown);
+            start_seed_connector(identity.clone(), seed_nodes.clone(), tx.clone(), shutdown);
         }
         Discovery::None => {}
     }
 
-    rx
+    (tx, rx)
 }
 
 // =============================================================================
@@ -70,7 +91,8 @@ fn start_mdns(
             }
         };
 
-        // Register our service
+        // Register our service, advertising our endpoint id so peers can dial us.
+        let endpoint_id = identity.endpoint_id.to_string();
         let our_service = mdns_sd::ServiceInfo::new(
             &service_type,
             &identity.name,
@@ -80,6 +102,7 @@ fn start_mdns(
             [
                 ("node-name", identity.name.as_str()),
                 ("incarnation", &identity.incarnation.to_string()),
+                (MDNS_ENDPOINT_ID_KEY, endpoint_id.as_str()),
             ]
             .as_slice(),
         );
@@ -107,7 +130,7 @@ fn start_mdns(
             }
         };
 
-        let mut seen: HashSet<SocketAddr> = HashSet::new();
+        let mut seen: HashSet<EndpointId> = HashSet::new();
 
         loop {
             tokio::select! {
@@ -117,17 +140,30 @@ fn start_mdns(
                 }) => {
                     match event {
                         Ok(Ok(mdns_sd::ServiceEvent::ServiceResolved(info))) => {
+                            // Parse the peer's endpoint id from the TXT records.
+                            let Some(peer_id) = info
+                                .get_property_val_str(MDNS_ENDPOINT_ID_KEY)
+                                .and_then(|s| s.parse::<EndpointId>().ok())
+                            else {
+                                continue; // not a murmer/iroh peer, or missing id
+                            };
+                            // Don't discover ourselves.
+                            if NodeId(peer_id.to_string()) == identity.endpoint_id {
+                                continue;
+                            }
                             let port = info.get_port();
-                            for scoped_ip in info.get_addresses() {
-                                let socket_addr = SocketAddr::new(scoped_ip.to_ip_addr(), port);
-                                // Don't discover ourselves
-                                if socket_addr == identity.socket_addr() {
-                                    continue;
-                                }
-                                if seen.insert(socket_addr) {
-                                    tracing::info!("mDNS discovered peer: {socket_addr}");
-                                    let _ = tx.send(DiscoveryEvent::PeerDiscovered(socket_addr));
-                                }
+                            let hint: Vec<SocketAddr> = info
+                                .get_addresses()
+                                .iter()
+                                .map(|ip| SocketAddr::new(ip.to_ip_addr(), port))
+                                .collect();
+                            if hint.is_empty() {
+                                continue;
+                            }
+                            if seen.insert(peer_id) {
+                                let peer = PeerAddr { id: NodeId(peer_id.to_string()), hint };
+                                tracing::info!("mDNS discovered peer: {peer_id}");
+                                let _ = tx.send(DiscoveryEvent::PeerDiscovered(peer));
                             }
                         }
                         Ok(Ok(_)) => {} // other mDNS events, ignore
@@ -149,23 +185,26 @@ fn start_mdns(
 }
 
 // =============================================================================
-// SEED NODE CONNECTOR — connect to well-known addresses
+// SEED NODE CONNECTOR — connect to well-known endpoints
 // =============================================================================
 
 fn start_seed_connector(
     identity: NodeIdentity,
-    seeds: Vec<SocketAddr>,
+    seeds: Vec<EndpointAddr>,
     tx: mpsc::UnboundedSender<DiscoveryEvent>,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
         // Emit each seed as a discovered peer. The ClusterSystem event loop
         // will attempt to connect and retry on failure.
-        for seed in &seeds {
-            if *seed == identity.socket_addr() {
-                continue; // skip ourselves
+        let emit = |seed: &EndpointAddr| {
+            if NodeId(seed.id.to_string()) == identity.endpoint_id {
+                return; // skip ourselves
             }
-            let _ = tx.send(DiscoveryEvent::PeerDiscovered(*seed));
+            let _ = tx.send(DiscoveryEvent::PeerDiscovered(peer_addr(seed)));
+        };
+        for seed in &seeds {
+            emit(seed);
         }
 
         // Retry seeds that haven't connected after a delay
@@ -175,10 +214,7 @@ fn start_seed_connector(
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {
                     for seed in &seeds {
-                        if *seed == identity.socket_addr() {
-                            continue;
-                        }
-                        let _ = tx.send(DiscoveryEvent::PeerDiscovered(*seed));
+                        emit(seed);
                     }
                     attempt += 1;
                     if attempt > 10 {

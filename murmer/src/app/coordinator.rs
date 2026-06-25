@@ -27,7 +27,10 @@
 //! }).await?;
 //! ```
 
-use std::collections::HashMap;
+// BTreeMap for the label-keyed maps whose iteration order is observable
+// (redrive/respawn emit order + request_id assignment); HashMap stays for the
+// request_id-keyed, by-key-only pending_spawns. See the determinism audit.
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,7 +63,7 @@ pub struct CoordinatorState {
     /// Snapshot of the cluster topology.
     pub cluster_view: ClusterView,
     /// All submitted actor specs, keyed by label.
-    pub specs: HashMap<String, ActorSpec>,
+    pub specs: BTreeMap<String, ActorSpec>,
     /// Placement strategy for deciding which node gets which actor.
     pub placement_strategy: Box<dyn PlacementStrategy>,
     /// Leader election algorithm.
@@ -70,9 +73,9 @@ pub struct CoordinatorState {
     /// Pending spawn requests awaiting acks, keyed by request_id.
     pub pending_spawns: HashMap<u64, PendingSpawn>,
     /// Specs waiting for a failed node to return, keyed by label.
-    pub waiting_for_return: HashMap<String, WaitingSpec>,
+    pub waiting_for_return: BTreeMap<String, WaitingSpec>,
     /// Cluster singletons being managed, keyed by singleton label.
-    pub singletons: HashMap<String, SingletonRuntime>,
+    pub singletons: BTreeMap<String, SingletonRuntime>,
     /// Pluggable authority that mints `(term, seq)` generations for singletons.
     /// Defaults to an in-RAM source (single-node/tests); inject a durable one
     /// (e.g. catalog-backed) for multi-node write deployments.
@@ -324,6 +327,7 @@ pub enum SpecState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableNodeInfo {
     pub name: String,
+    pub endpoint_id: crate::cluster::net::NodeId,
     pub host: String,
     pub port: u16,
     pub incarnation: u64,
@@ -498,6 +502,7 @@ impl Coordinator {
         let info = NodeInfo::new(
             crate::cluster::config::NodeIdentity {
                 name: msg.info.name,
+                endpoint_id: msg.info.endpoint_id,
                 host: msg.info.host,
                 port: msg.info.port,
                 incarnation: msg.info.incarnation,
@@ -550,14 +555,20 @@ impl Coordinator {
         state.cluster_view.mark_failed(&msg.node_id);
         let timers = state.handle_node_departure(&msg.node_id, false);
 
-        // Spawn timeout tasks for WaitForReturn specs
+        // Spawn timeout tasks for WaitForReturn specs (on the runtime seam, so
+        // the timeout fires on virtual time under a sim runtime).
         for (label, duration) in timers {
             let endpoint = ctx.endpoint();
-            tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
+            let runtime = ctx.receptionist().runtime().clone();
+            ctx.spawn(async move {
+                runtime.sleep(duration).await;
                 let _ = endpoint.send(WaitForReturnTimeout { label }).await;
             });
         }
+
+        // If we just became leader (the old leader is the failed node), inherit
+        // its singletons from the backend so the re-drive below can re-place them.
+        state.load_singletons_from_backend().await;
 
         // Re-place any singleton the failed node owned. The failed owner is gone
         // (SWIM-confirmed), so we do NOT drain it — we mint a strictly-higher
@@ -577,6 +588,10 @@ impl Coordinator {
         // Graceful departures never produce WaitForReturn timers (guarded by !graceful)
         let _timers = state.handle_node_departure(&msg.node_id, true);
         state.cluster_view.remove_node(&msg.node_id);
+
+        // If we just became leader, inherit the departed leader's singletons from
+        // the backend so the re-drive below can re-place them.
+        state.load_singletons_from_backend().await;
 
         // Re-place any singleton the departed node owned (fenced by a new term).
         state.redrive_singletons_after_loss(&msg.node_id).await;
@@ -719,6 +734,11 @@ impl Coordinator {
         // Fresh grant: bump `term`, reset `seq` — a new ownership epoch.
         let gen_source = state.generation_source.clone();
         let generation = gen_source.claim_term(&label, &owner).await?;
+        // Persist the spec to the backend so a future leader can rebuild this
+        // singleton (closes the amnesia gap when a shared/durable source is used).
+        if let Err(e) = gen_source.put_spec(&label, &msg.spec).await {
+            tracing::warn!("singleton {label}: put_spec failed: {e}");
+        }
         let ownership = SingletonOwnership {
             label: label.clone(),
             owner_node_id: Some(owner.clone()),
@@ -943,13 +963,13 @@ impl CoordinatorState {
     ) -> Self {
         Self {
             cluster_view: ClusterView::new(),
-            specs: HashMap::new(),
+            specs: BTreeMap::new(),
             placement_strategy,
             election,
             local_node_id: local_node_id.into(),
             pending_spawns: HashMap::new(),
-            waiting_for_return: HashMap::new(),
-            singletons: HashMap::new(),
+            waiting_for_return: BTreeMap::new(),
+            singletons: BTreeMap::new(),
             generation_source: Arc::new(CoordinatorGenerationSource::new()),
             next_request_id: 0,
             spawn_sender: None,
@@ -1037,6 +1057,40 @@ impl CoordinatorState {
                 "No spawn sender configured — singleton spawn for {} dropped",
                 spec.label
             );
+        }
+    }
+
+    /// Rebuild the managed singleton set from the durable backend — the
+    /// leader-rebuild path that closes the "amnesia" gap a new leader otherwise
+    /// has (a singleton's spec lived only in the Coordinator that placed it).
+    ///
+    /// Called before the re-drive on node loss: a node that has *just* become
+    /// leader (the old leader failed) inherits the singletons it never placed
+    /// itself by reading the backend's persisted specs, so the subsequent
+    /// `redrive_singletons_after_loss(old_leader)` finds them and re-places them.
+    ///
+    /// Leader-gated: a non-leader must keep an empty map so it never places. With
+    /// a per-node source `list` is this node's own (nothing new to load), so it's
+    /// a no-op there — the rebuild only does work with a shared/durable source.
+    async fn load_singletons_from_backend(&mut self) {
+        if !self.is_leader() {
+            return;
+        }
+        let records = match self.generation_source.list().await {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!("singleton leader-rebuild: list failed: {e}");
+                return;
+            }
+        };
+        for rec in records {
+            self.singletons
+                .entry(rec.spec.label.clone())
+                .or_insert_with(|| SingletonRuntime {
+                    spec: rec.spec,
+                    ownership: rec.ownership,
+                    pending_handoff: None,
+                });
         }
     }
 
@@ -1138,8 +1192,9 @@ impl CoordinatorState {
         if let Some(duration) = drain_timeout {
             let endpoint = ctx.endpoint();
             let label = label.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
+            let runtime = ctx.receptionist().runtime().clone();
+            ctx.spawn(async move {
+                runtime.sleep(duration).await;
                 let _ = endpoint
                     .send(SingletonDrainTimeout {
                         label,
@@ -1327,12 +1382,7 @@ mod tests {
     fn make_system_and_coordinator() -> (crate::System, Endpoint<Coordinator>) {
         let system = crate::System::local();
 
-        let alpha_identity = NodeIdentity {
-            name: "alpha".into(),
-            host: "127.0.0.1".into(),
-            port: 7100,
-            incarnation: 1,
-        };
+        let alpha_identity = NodeIdentity::for_test("alpha", 1);
         let local_node_id = alpha_identity.node_id_string();
 
         let mut state = CoordinatorState::new(
@@ -1349,6 +1399,7 @@ mod tests {
         state.cluster_view.upsert_node(NodeInfo::new(
             NodeIdentity {
                 name: "beta".into(),
+                endpoint_id: NodeIdentity::test_endpoint_id("beta"),
                 host: "127.0.0.1".into(),
                 port: 7200,
                 incarnation: 2,
@@ -1582,6 +1633,7 @@ mod tests {
                 node_id: original_node.clone(),
                 info: SerializableNodeInfo {
                     name: "alpha".into(),
+                    endpoint_id: crate::cluster::config::NodeIdentity::test_endpoint_id("alpha"),
                     host: "127.0.0.1".into(),
                     port: 7100,
                     incarnation: 1,
@@ -1615,11 +1667,9 @@ mod tests {
 
         // Leader (oldest = alpha, incarnation 1) owns it; first grant is term 1.
         assert!(
-            ownership
-                .owner_node_id
-                .as_deref()
-                .unwrap()
-                .contains("alpha"),
+            ownership.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string()
+            ),
             "leader anchor should resolve to alpha, got {:?}",
             ownership.owner_node_id
         );
@@ -1760,7 +1810,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let original_owner = before.owner_node_id.clone().unwrap();
-        assert!(original_owner.contains("alpha"));
+        assert!(original_owner.contains(
+            &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string()
+        ));
         assert_eq!(before.generation, SingletonGeneration { term: 1, seq: 0 });
 
         // The owner fails: re-drive to the survivor with a strictly-higher term
@@ -1780,7 +1832,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            after.owner_node_id.as_deref().unwrap().contains("beta"),
+            after.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "must move off the failed node to beta, got {:?}",
             after.owner_node_id
         );
@@ -1813,13 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn test_singleton_node_anchor_owner_loss_clears_owner() {
         let (_system, coordinator) = make_system_and_coordinator();
-        let alpha_id = NodeIdentity {
-            name: "alpha".into(),
-            host: "127.0.0.1".into(),
-            port: 7100,
-            incarnation: 1,
-        }
-        .node_id_string();
+        let alpha_id = NodeIdentity::for_test("alpha", 1).node_id_string();
 
         coordinator
             .send_async(StartSingleton {
@@ -1874,6 +1922,7 @@ mod tests {
         let system = crate::System::local();
         let coord = NodeIdentity {
             name: "coord".into(),
+            endpoint_id: NodeIdentity::test_endpoint_id("coord"),
             host: "127.0.0.1".into(),
             port: 7000,
             incarnation: 0, // oldest overall → stable leader
@@ -1891,6 +1940,7 @@ mod tests {
             state.cluster_view.upsert_node(NodeInfo::new(
                 NodeIdentity {
                     name: name.into(),
+                    endpoint_id: NodeIdentity::test_endpoint_id(name),
                     host: "127.0.0.1".into(),
                     port,
                     incarnation: inc,
@@ -1908,6 +1958,7 @@ mod tests {
     async fn join_older_worker(coordinator: &Endpoint<Coordinator>) -> String {
         let id = NodeIdentity {
             name: "w0".into(),
+            endpoint_id: NodeIdentity::test_endpoint_id("w0"),
             host: "127.0.0.1".into(),
             port: 7200,
             incarnation: 1,
@@ -1918,6 +1969,7 @@ mod tests {
                 node_id: id.clone(),
                 info: SerializableNodeInfo {
                     name: "w0".into(),
+                    endpoint_id: NodeIdentity::test_endpoint_id("w0"),
                     host: "127.0.0.1".into(),
                     port: 7200,
                     incarnation: 1,
@@ -1980,7 +2032,9 @@ mod tests {
         let draining = get_catalog(&coordinator).await.unwrap();
         assert_eq!(draining.phase, SingletonPhase::Draining);
         assert!(
-            draining.owner_node_id.as_deref().unwrap().contains("w2"),
+            draining.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("w2").to_string()
+            ),
             "ownership stays on the old owner while draining"
         );
         assert_eq!(draining.generation, SingletonGeneration { term: 1, seq: 0 });
@@ -2037,7 +2091,11 @@ mod tests {
             .unwrap();
         let still = get_catalog(&coordinator).await.unwrap();
         assert_eq!(still.phase, SingletonPhase::Draining);
-        assert!(still.owner_node_id.as_deref().unwrap().contains("w2"));
+        assert!(
+            still.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("w2").to_string()
+            )
+        );
 
         // The matching ack advances it.
         coordinator
@@ -2098,7 +2156,11 @@ mod tests {
         let after = get_catalog(&coordinator).await.unwrap();
         assert_eq!(after.phase, SingletonPhase::Active);
         assert_eq!(after.generation, SingletonGeneration { term: 1, seq: 0 });
-        assert!(after.owner_node_id.as_deref().unwrap().contains("w2"));
+        assert!(
+            after.owner_node_id.as_deref().unwrap().contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("w2").to_string()
+            )
+        );
     }
 
     #[tokio::test]

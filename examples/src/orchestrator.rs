@@ -125,7 +125,7 @@ mod tests {
     use murmer::cluster::sync::{SpawnRegistry, TypeRegistry};
 
     fn init_tracing() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        murmer::cluster::install_default_crypto();
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .with_test_writer()
@@ -159,14 +159,17 @@ mod tests {
         name: &str,
         class: NodeClass,
         metadata: Vec<(&str, &str)>,
-        seeds: &[SocketAddr],
+        seeds: &[iroh::EndpointAddr],
     ) -> murmer::cluster::config::ClusterConfig {
         let mut builder = ClusterConfigBuilder::new()
             .name(name)
             .listen("127.0.0.1:0".parse::<SocketAddr>().unwrap())
             .cookie("orchestrator-example")
             .discovery(Discovery::None)
-            .node_class(class);
+            .node_class(class)
+            // Each node MUST have a distinct identity; without an explicit key
+            // the builder loads a shared default key file and all nodes collide.
+            .secret_key(iroh::SecretKey::generate());
 
         for (k, v) in metadata {
             builder = builder.metadata(k, v);
@@ -265,7 +268,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let gateway_addr = gateway.local_addr().unwrap();
+        let gateway_addr = gateway.endpoint_addr().unwrap();
 
         // 2. Start store-a (Worker, volume=photos)
         let store_a = System::clustered(
@@ -273,7 +276,7 @@ mod tests {
                 "store-a",
                 NodeClass::Worker,
                 vec![("volume", "photos")],
-                &[gateway_addr],
+                std::slice::from_ref(&gateway_addr),
             ),
             TypeRegistry::from_auto(),
             make_spawn_registry(),
@@ -329,6 +332,7 @@ mod tests {
                     host: store_a_cluster.identity().host.clone(),
                     port: store_a_cluster.identity().port,
                     incarnation: store_a_cluster.identity().incarnation,
+                    endpoint_id: store_a_cluster.identity().endpoint_id.clone(),
                     class: NodeClass::Worker,
                     metadata: [("volume".into(), "photos".into())].into(),
                 },
@@ -344,6 +348,7 @@ mod tests {
                     host: store_b_cluster.identity().host.clone(),
                     port: store_b_cluster.identity().port,
                     incarnation: store_b_cluster.identity().incarnation,
+                    endpoint_id: store_b_cluster.identity().endpoint_id.clone(),
                     class: NodeClass::Worker,
                     metadata: [("volume".into(), "docs".into())].into(),
                 },
@@ -360,6 +365,7 @@ mod tests {
                     host: cluster.identity().host.clone(),
                     port: cluster.identity().port,
                     incarnation: cluster.identity().incarnation,
+                    endpoint_id: cluster.identity().endpoint_id.clone(),
                     class: NodeClass::Edge,
                     metadata: HashMap::new(),
                 },
@@ -481,14 +487,16 @@ mod tests {
 
         // 9. Verify placement decisions respected constraints
         // Photos should be on store-a (volume=photos)
-        assert!(
-            photos_decision.node_id.contains("store-a"),
+        assert_eq!(
+            photos_decision.node_id,
+            store_a_cluster.identity().node_id_string(),
             "Photos should be placed on store-a, got: {}",
             photos_decision.node_id
         );
         // Docs should be on store-b (volume=docs)
-        assert!(
-            docs_decision.node_id.contains("store-b"),
+        assert_eq!(
+            docs_decision.node_id,
+            store_b_cluster.identity().node_id_string(),
             "Docs should be placed on store-b, got: {}",
             docs_decision.node_id
         );
@@ -513,7 +521,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let a_addr = node_a.local_addr().unwrap();
+        let a_addr = node_a.endpoint_addr().unwrap();
 
         let node_b = System::clustered(
             node_config("beta", NodeClass::Worker, vec![("gpu", "true")], &[a_addr]),
@@ -543,6 +551,7 @@ mod tests {
                     host: cluster.identity().host.clone(),
                     port: cluster.identity().port,
                     incarnation: cluster.identity().incarnation,
+                    endpoint_id: cluster.identity().endpoint_id.clone(),
                     class: NodeClass::Worker,
                     metadata: HashMap::new(),
                 },
@@ -557,6 +566,7 @@ mod tests {
                     host: b_cluster.identity().host.clone(),
                     port: b_cluster.identity().port,
                     incarnation: b_cluster.identity().incarnation,
+                    endpoint_id: b_cluster.identity().endpoint_id.clone(),
                     class: NodeClass::Worker,
                     metadata: [("gpu".into(), "true".into())].into(),
                 },

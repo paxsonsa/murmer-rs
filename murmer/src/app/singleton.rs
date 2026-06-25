@@ -25,18 +25,33 @@
 //! `HEAD.writer_gen` advance-or-reject) fences the stale owner with **no change
 //! to that comparison** — only *who mints* the generation changes.
 //!
-//! # Pluggable [`GenerationSource`]
+//! # The coordination backend: [`GenerationSource`]
 //!
-//! Minting is behind the [`GenerationSource`] trait so the authoritative store
-//! is swappable: a single-owner external store (e.g. appdata's catalog) today,
-//! a consensus-minted source later — without touching the downstream fence.
-//! The default [`CoordinatorGenerationSource`] keeps generations in RAM and is
-//! suitable only for single-node deployments and tests (it is **not** durable
-//! across a Coordinator restart).
+//! Both durable facts a singleton needs — the monotone fence generation AND its
+//! spec — live behind the [`GenerationSource`] trait, the swappable **coordination
+//! backend**. This is the single authority that makes "exactly one" hold across
+//! nodes, so it works at 1, 2, or N nodes with no quorum *among the nodes*.
+//!
+//! - **In-RAM default** ([`CoordinatorGenerationSource`]): single node, dev, and
+//!   simulation tests (where one shared instance models a durable store both
+//!   nodes reach). As a *per-node* source it is not safe across multiple writers.
+//! - **Durable shared store** (multi-node): one linearization point all nodes
+//!   call — a file-backed store for dev, or a real store (e.g. appdata's catalog,
+//!   which already has the atomic compare-and-swap this needs) for production.
+//! - **Raft** (opt-in, later): for 3+ node, survive-a-split, no-external-store
+//!   deployments. Parked, not the default — 2-node Raft tolerates zero failures.
+//!   See `.llm/shared/context/2026-06-22-coordination-backend-decision.md`.
+//!
+//! The backend persists the spec ([`put_spec`](GenerationSource::put_spec)) and
+//! can [`list`](GenerationSource::list) all singletons, so a newly-elected leader
+//! rebuilds the managed set from a shared backend (the Coordinator's
+//! `load_singletons_from_backend`) instead of orphaning singletons it did not
+//! place itself. Two separate guarantees, both from one backend: the fence (a
+//! higher term can never collide) and the rebuild (a new leader inherits the set).
 //!
 //! Enable with `murmer = { features = ["app"] }`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -213,12 +228,29 @@ pub fn resolve_owner(
 // GENERATION SOURCE
 // =============================================================================
 
-/// Pluggable authority that mints and persists [`SingletonGeneration`]s.
+/// A full singleton record in a [`GenerationSource`]: its spec plus the latest
+/// ownership grant (if any). Returned by [`GenerationSource::list`] so a
+/// newly-elected leader can rebuild the managed set from a shared/durable
+/// backend (closing the "amnesia" gap where a new leader doesn't know which
+/// singletons exist).
+#[derive(Debug, Clone)]
+pub struct SingletonRecord {
+    pub spec: SingletonSpec,
+    pub ownership: Option<SingletonOwnership>,
+}
+
+/// Pluggable authority that mints and persists [`SingletonGeneration`]s — the
+/// **coordination backend**. It owns two durable facts per singleton: the
+/// monotone fence generation (so two owners can never hold an equal token) and
+/// the spec (so a new leader can rebuild the managed set).
 ///
-/// Keeping minting behind a trait lets the authoritative store be swapped — a
-/// single-owner external store (e.g. appdata's catalog, today) or a
-/// consensus-minted source (later) — **without** changing the downstream fence
-/// that compares the packed generation.
+/// Keeping this behind a trait lets the authoritative store be swapped — the
+/// in-RAM default (single node / tests), a durable shared store both nodes reach
+/// (e.g. a file-backed store, or appdata's catalog) for multi-node, or a
+/// consensus-minted source (Raft, later) — **without** changing the downstream
+/// fence that compares the packed generation. Correctness across multiple nodes
+/// comes from the backend being one authority, so it works at 1, 2, or N nodes
+/// with no quorum among the nodes themselves.
 ///
 /// Implementations must guarantee that, for a given `label`, every successful
 /// `claim_term` returns a strictly greater `term` than any previously returned
@@ -238,20 +270,50 @@ pub trait GenerationSource: Send + Sync {
     /// idempotent re-place): bump `seq`. Returns the new generation.
     async fn claim_seq(&self, label: &str) -> Result<SingletonGeneration, String>;
 
-    /// Read the current authoritative ownership for `label` (used for
-    /// cold-start rebuild after a Coordinator restart). `None` if never claimed.
+    /// Read the current authoritative ownership for `label`. `None` if never
+    /// claimed.
     async fn current(&self, label: &str) -> Result<Option<SingletonOwnership>, String>;
+
+    /// Persist a singleton's spec, so a newly-elected leader can rebuild the full
+    /// managed set (not just its ownership). Idempotent.
+    ///
+    /// Default: a no-op. A source that does not persist specs simply offers no
+    /// leader-rebuild — a new leader stays amnesiac about singletons it did not
+    /// place itself. The in-RAM and durable sources override this.
+    async fn put_spec(&self, _label: &str, _spec: &SingletonSpec) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// List every known singleton (spec + latest ownership) — the leader-rebuild
+    /// read. Default: empty (no rebuild). Sources that persist specs override it.
+    async fn list(&self) -> Result<Vec<SingletonRecord>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// One stored singleton in the in-RAM source: its spec (set by `put_spec`) and
+/// its latest ownership grant (set by `claim_term`/`claim_seq`). Either may be
+/// absent depending on call order, though the Coordinator always claims a term
+/// and then persists the spec when placing.
+#[derive(Debug, Default, Clone)]
+struct StoredSingleton {
+    spec: Option<SingletonSpec>,
+    ownership: Option<SingletonOwnership>,
 }
 
 /// Default in-RAM [`GenerationSource`].
 ///
-/// Suitable for single-node deployments and tests **only** — it is not durable
-/// across a Coordinator restart (term/seq reset to zero), which would break
-/// monotonicity in a multi-node write deployment. Production multi-node use
-/// must inject a durable source (e.g. appdata's catalog-backed one).
+/// As a **per-node** source (each Coordinator holds its own) it is correct only
+/// for single-node deployments and tests: it is not durable across a Coordinator
+/// restart, and two nodes' separate copies do not share monotonicity, so a
+/// multi-node write deployment must inject a single shared/durable source (e.g. a
+/// file-backed store, or appdata's catalog). Shared by reference (`Arc`) across
+/// Coordinators in tests, this same type models that single durable store.
+///
+/// Uses a `BTreeMap` so `list` iterates in a deterministic (sorted-label) order.
 #[derive(Debug, Default)]
 pub struct CoordinatorGenerationSource {
-    state: Mutex<HashMap<String, SingletonOwnership>>,
+    state: Mutex<BTreeMap<String, StoredSingleton>>,
 }
 
 impl CoordinatorGenerationSource {
@@ -270,23 +332,25 @@ impl GenerationSource for CoordinatorGenerationSource {
     ) -> Result<SingletonGeneration, String> {
         let mut state = self.state.lock().expect("generation source mutex poisoned");
         // term 0 is reserved for "never claimed"; first grant is term 1.
-        let term = state.get(label).map(|o| o.generation.term + 1).unwrap_or(1);
+        let term = state
+            .get(label)
+            .and_then(|s| s.ownership.as_ref())
+            .map(|o| o.generation.term + 1)
+            .unwrap_or(1);
         let generation = SingletonGeneration { term, seq: 0 };
-        state.insert(
-            label.to_string(),
-            SingletonOwnership {
-                label: label.to_string(),
-                owner_node_id: Some(owner_node_id.to_string()),
-                generation,
-                phase: SingletonPhase::Active,
-            },
-        );
+        // Upsert the ownership, preserving any already-persisted spec.
+        state.entry(label.to_string()).or_default().ownership = Some(SingletonOwnership {
+            label: label.to_string(),
+            owner_node_id: Some(owner_node_id.to_string()),
+            generation,
+            phase: SingletonPhase::Active,
+        });
         Ok(generation)
     }
 
     async fn claim_seq(&self, label: &str) -> Result<SingletonGeneration, String> {
         let mut state = self.state.lock().expect("generation source mutex poisoned");
-        match state.get_mut(label) {
+        match state.get_mut(label).and_then(|s| s.ownership.as_mut()) {
             Some(ownership) => {
                 ownership.generation.seq += 1;
                 Ok(ownership.generation)
@@ -303,7 +367,32 @@ impl GenerationSource for CoordinatorGenerationSource {
             .lock()
             .expect("generation source mutex poisoned")
             .get(label)
-            .cloned())
+            .and_then(|s| s.ownership.clone()))
+    }
+
+    async fn put_spec(&self, label: &str, spec: &SingletonSpec) -> Result<(), String> {
+        self.state
+            .lock()
+            .expect("generation source mutex poisoned")
+            .entry(label.to_string())
+            .or_default()
+            .spec = Some(spec.clone());
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<SingletonRecord>, String> {
+        Ok(self
+            .state
+            .lock()
+            .expect("generation source mutex poisoned")
+            .values()
+            .filter_map(|s| {
+                s.spec.clone().map(|spec| SingletonRecord {
+                    spec,
+                    ownership: s.ownership.clone(),
+                })
+            })
+            .collect())
     }
 }
 
@@ -312,15 +401,11 @@ mod tests {
     use super::*;
     use crate::app::node_info::NodeInfo;
     use crate::cluster::config::NodeIdentity;
+    use std::collections::HashMap;
 
     fn make_node(name: &str, incarnation: u64, class: NodeClass) -> NodeInfo {
         NodeInfo::new(
-            NodeIdentity {
-                name: name.into(),
-                host: "127.0.0.1".into(),
-                port: 7100,
-                incarnation,
-            },
+            NodeIdentity::for_test(name, incarnation),
             class,
             HashMap::new(),
         )
@@ -378,7 +463,12 @@ mod tests {
         let election = OldestNode::any();
         let owner = resolve_owner(&SingletonAnchor::Leader, &view, &election).unwrap();
         assert_eq!(owner, election.elect(&view).unwrap());
-        assert!(owner.contains("alpha"), "oldest should win, got {owner}");
+        assert!(
+            owner.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string()
+            ),
+            "oldest should win, got {owner}"
+        );
     }
 
     #[test]
@@ -398,7 +488,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            owner.contains("beta"),
+            owner.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "oldest Coordinator should win, got {owner}"
         );
     }
@@ -469,5 +561,37 @@ mod tests {
     async fn test_ram_source_current_unknown_is_none() {
         let src = CoordinatorGenerationSource::new();
         assert!(src.current("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ram_source_put_spec_and_list_for_leader_rebuild() {
+        let src = CoordinatorGenerationSource::new();
+
+        // A claim with no persisted spec is invisible to `list` (rebuild only
+        // surfaces singletons whose spec is known).
+        let _ = src.claim_term("catalog", "node-a").await.unwrap();
+        assert!(src.list().await.unwrap().is_empty());
+
+        // Persist the spec → list returns it with the latest ownership.
+        let spec = SingletonSpec::new("catalog", "T", SingletonAnchor::Leader);
+        src.put_spec("catalog", &spec).await.unwrap();
+        let records = src.list().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].spec.label, "catalog");
+        assert_eq!(
+            records[0]
+                .ownership
+                .as_ref()
+                .and_then(|o| o.owner_node_id.as_deref()),
+            Some("node-a")
+        );
+
+        // A later claim bumps the term but the spec is preserved — exactly what a
+        // new leader needs to rebuild (spec) + fence (higher term).
+        let g2 = src.claim_term("catalog", "node-b").await.unwrap();
+        let records = src.list().await.unwrap();
+        assert_eq!(records[0].ownership.as_ref().unwrap().generation, g2);
+        assert_eq!(g2.term, 2);
+        assert_eq!(records[0].spec.label, "catalog");
     }
 }

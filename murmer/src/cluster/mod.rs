@@ -1,9 +1,13 @@
-pub mod certs;
+pub mod allowlist;
 pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod framing;
+pub mod identity_key;
 pub mod membership;
+/// The `Net` seam: the transport abstraction `ClusterSystem` runs over (real
+/// iroh in production, an in-memory fabric in simulation). See the module docs.
+pub mod net;
 pub mod remote;
 pub mod sync;
 pub mod transport;
@@ -17,6 +21,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::instrument;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::{
     Actor, DispatchRequest, Endpoint, Listing, OpType, ReceptionKey, Receptionist,
     ReceptionistConfig, RemoteDispatch, RemoteInvocation,
@@ -26,8 +31,27 @@ use config::{ClusterConfig, NodeClass, NodeIdentity};
 use error::ClusterError;
 use framing::ControlMessage;
 use membership::{ClusterEvent, ClusterMembership, FocaRuntime, TimerEvent, spawn_timer_manager};
+use net::{ConnectionEvent, IncomingConnection, Net, NodeId, PeerAddr};
 use sync::{SpawnRegistry, TypeRegistry};
-use transport::{ConnectionEvent, Transport};
+use transport::Transport;
+
+/// Install the process-wide rustls crypto provider (ring) that iroh/QUIC's TLS
+/// needs before any handshake — and that constructing an [`iroh::SecretKey`]
+/// touches even on paths that never hit the network.
+///
+/// Idempotent and safe to call from multiple entry points: the first call wins
+/// and later calls are a no-op (the `install_default` error is intentionally
+/// ignored). Binaries, examples, the sim harness, and tests call this once at
+/// startup so they don't each re-implement the one-liner.
+pub fn install_default_crypto() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Extract the endpoint-id portion (the abstract [`NodeId`]) out of a
+/// `node_id_string` of the form `endpoint_id#incarnation`.
+fn node_id_of(node_id: &str) -> Option<NodeId> {
+    node_id.split('#').next().map(|id| NodeId(id.to_string()))
+}
 
 // =============================================================================
 // NODE REGISTRY — tracks node class and metadata from handshakes
@@ -97,7 +121,12 @@ impl NodeRegistry {
 /// membership, mDNS/seed discovery, and OpLog-based registry replication.
 pub struct ClusterSystem {
     receptionist: Receptionist,
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
+    runtime: Arc<dyn Runtime>,
+    /// Sender for the discovery event stream — retained both to keep the event
+    /// loop's `discovery_rx` arm live and to inject peers via
+    /// [`inject_discovered`](Self::inject_discovered).
+    discovery_tx: mpsc::UnboundedSender<discovery::DiscoveryEvent>,
     #[allow(dead_code)]
     config: ClusterConfig,
     identity: NodeIdentity,
@@ -130,38 +159,120 @@ impl ClusterSystem {
         type_registry: TypeRegistry,
         spawn_registry: SpawnRegistry,
     ) -> Result<Self, ClusterError> {
+        Self::start_with_runtime(
+            config,
+            type_registry,
+            spawn_registry,
+            Arc::new(TokioRuntime),
+        )
+        .await
+    }
+
+    /// Like [`start`](Self::start) but on an explicit [`Runtime`] — the
+    /// deterministic `SimRuntime` under simulation, so the whole cluster
+    /// (event loop, timers, spawned stream handlers) runs on the virtual clock.
+    /// `start` is the production path (Tokio).
+    ///
+    /// This is the iroh entry point: it owns the transport-specific setup
+    /// (allowlist + [`Transport::bind`]) and then hands the bound [`Net`] off to
+    /// [`start_with_net`](Self::start_with_net), which is transport-agnostic. To
+    /// boot on the in-memory simulation fabric, build a `SimNet` and call
+    /// `start_with_net` directly (there is no `Transport::bind` in that path).
+    pub async fn start_with_runtime(
+        config: ClusterConfig,
+        type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<Self, ClusterError> {
         let identity = config.identity.clone();
         let shutdown = CancellationToken::new();
-        let (event_tx, _) = broadcast::channel(256);
 
-        // Receptionist with this node's identity
-        let receptionist = Receptionist::with_config(ReceptionistConfig {
-            node_id: identity.node_id_string(),
-            origin_addr: format!("{}:{}", identity.host, identity.port),
-            ..Default::default()
-        });
-
-        // Type manifest from the registry
+        // Type manifest from the registry (borrowed before the registry is moved
+        // into start_with_net below).
         let type_manifest = type_registry.known_types();
 
-        // Bind QUIC transport with tuned parameters
+        // Build the zero-trust allowlist (hot-reloaded in Enforced mode).
+        let allowlist = allowlist::Allowlist::new(config.allowlist.clone(), shutdown.clone())?;
+
+        // Bind the iroh transport with tuned parameters and the allowlist hook,
+        // then erase it behind the `Net` seam — the rest of the system is
+        // transport-agnostic (and swappable for the in-memory sim fabric).
         let (transport, incoming_rx, connection_events_rx) = Transport::bind(
             identity.clone(),
+            config.secret_key.clone(),
             config.cookie.clone(),
             type_manifest,
             config.node_class.clone(),
             config.node_metadata.clone(),
             config.transport.clone(),
+            allowlist,
             shutdown.clone(),
         )
         .await?;
+        let net: Arc<dyn Net> = transport;
+
+        Ok(Self::start_with_net(
+            config,
+            type_registry,
+            spawn_registry,
+            runtime,
+            net,
+            incoming_rx,
+            connection_events_rx,
+            shutdown,
+        ))
+    }
+
+    /// Boot a `ClusterSystem` over an already-bound [`Net`] — the
+    /// transport-agnostic constructor that both the iroh and simulation paths
+    /// share.
+    ///
+    /// Everything here is independent of *how* the network was created: it wires
+    /// the receptionist, discovery, SWIM membership, and the main event loop onto
+    /// the supplied `net`, `incoming_rx` (handshaked inbound connections), and
+    /// `connection_events_rx` (connect/disconnect lifecycle). The caller owns the
+    /// `shutdown` token — it must be the *same* token the `Net` impl was built
+    /// with, so cancelling it tears down both the transport and the event loop
+    /// together (iroh: [`Transport::bind`] takes it; sim: `SimFabric::bind`).
+    ///
+    /// This is synchronous and infallible: all the fallible/async work (binding a
+    /// socket) lives in the impl-specific constructor. Under `SimRuntime` the
+    /// spawned event loop only enters the runtime inbox here — the world must be
+    /// pumped to actually run it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_net(
+        config: ClusterConfig,
+        type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
+        runtime: Arc<dyn Runtime>,
+        net: Arc<dyn Net>,
+        incoming_rx: mpsc::UnboundedReceiver<IncomingConnection>,
+        connection_events_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let identity = config.identity.clone();
+        let (event_tx, _) = broadcast::channel(256);
+
+        // Receptionist with this node's identity, on the same runtime seam.
+        let receptionist = Receptionist::with_config_and_runtime(
+            ReceptionistConfig {
+                node_id: identity.node_id_string(),
+                origin_addr: format!("{}:{}", identity.host, identity.port),
+                ..Default::default()
+            },
+            Arc::clone(&runtime),
+        );
 
         // Start discovery
-        let discovery_rx =
+        let (discovery_tx, discovery_rx) =
             discovery::start_discovery(&identity, &config.discovery, shutdown.clone());
 
         // Initialize SWIM membership
-        let membership = ClusterMembership::new(identity.clone(), event_tx.clone());
+        let membership = ClusterMembership::new(
+            identity.clone(),
+            event_tx.clone(),
+            runtime.derive_seed("foca-prng"),
+        );
 
         let type_registry = Arc::new(type_registry);
         let spawn_registry = Arc::new(spawn_registry);
@@ -170,7 +281,9 @@ impl ClusterSystem {
         // Spawn the main event loop
         let system = Self {
             receptionist: receptionist.clone(),
-            transport: Arc::clone(&transport),
+            net: Arc::clone(&net),
+            runtime: Arc::clone(&runtime),
+            discovery_tx,
             config: config.clone(),
             identity: identity.clone(),
             event_tx: event_tx.clone(),
@@ -182,7 +295,8 @@ impl ClusterSystem {
 
         spawn_event_loop(
             receptionist,
-            transport,
+            net,
+            runtime,
             membership,
             identity,
             event_tx,
@@ -197,7 +311,7 @@ impl ClusterSystem {
 
         tracing::info!("ClusterSystem started: {}", system.identity);
 
-        Ok(system)
+        system
     }
 
     /// Start a local actor and register it with the receptionist.
@@ -286,14 +400,35 @@ impl ClusterSystem {
         &self.node_registry
     }
 
-    /// Access the underlying transport (for orchestration integration).
-    pub fn transport(&self) -> &Arc<Transport> {
-        &self.transport
+    /// Access the underlying network seam (for orchestration integration).
+    pub fn net(&self) -> &Arc<dyn Net> {
+        &self.net
+    }
+
+    /// The [`Runtime`] seam this system runs on — Tokio in production, the
+    /// deterministic `SimRuntime` under simulation. Parity with
+    /// [`SimWorld::runtime`](crate::sim::SimWorld::runtime) so a consumer can
+    /// install a per-node spawn seam (or run blocking work via the seam) without
+    /// reaching through `receptionist().runtime()`.
+    pub fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.runtime
     }
 
     /// Get the actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> std::net::SocketAddr {
-        self.transport.local_addr()
+        self.net.local_addr()
+    }
+
+    /// Inject a discovered peer, as if a discovery backend had found it: feeds
+    /// `PeerDiscovered` into the event loop, which dials and handshakes it (the
+    /// allowlist still gates authorization). This is the programmatic discovery
+    /// seam — the cluster's own way to learn of a peer without mDNS/seed config,
+    /// and how simulation wires topology (mDNS/seed are real-network paths,
+    /// bypassed under sim). No-op if the event loop has stopped.
+    pub fn inject_discovered(&self, addr: net::PeerAddr) {
+        let _ = self
+            .discovery_tx
+            .send(discovery::DiscoveryEvent::PeerDiscovered(addr));
     }
 
     /// Shut down the cluster system gracefully.
@@ -303,10 +438,10 @@ impl ClusterSystem {
     pub async fn shutdown(&self) {
         // Broadcast departure to all connected peers
         let departure = ControlMessage::Departure(self.identity.clone());
-        self.transport.broadcast_control(&departure).await;
+        self.net.broadcast_control(&departure).await;
 
         // Small grace period for message delivery
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.runtime.sleep(Duration::from_millis(50)).await;
 
         // Cancel the event loop
         self.shutdown.cancel();
@@ -320,16 +455,17 @@ impl ClusterSystem {
 #[allow(clippy::too_many_arguments)]
 fn spawn_event_loop(
     receptionist: Receptionist,
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
+    rt: Arc<dyn Runtime>,
     mut membership: ClusterMembership,
     identity: NodeIdentity,
     event_tx: broadcast::Sender<ClusterEvent>,
     type_registry: Arc<TypeRegistry>,
     spawn_registry: Arc<SpawnRegistry>,
     node_registry: NodeRegistry,
-    mut incoming_rx: mpsc::UnboundedReceiver<transport::IncomingConnection>,
+    mut incoming_rx: mpsc::UnboundedReceiver<IncomingConnection>,
     mut discovery_rx: mpsc::UnboundedReceiver<discovery::DiscoveryEvent>,
-    mut conn_events: mpsc::UnboundedReceiver<transport::ConnectionEvent>,
+    mut conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     shutdown: CancellationToken,
 ) {
     // Channels for the foca runtime
@@ -340,31 +476,40 @@ fn spawn_event_loop(
     // Bridge for outbound connections: discovery spawns connect(), sends the
     // resulting IncomingConnection here so the event loop can set up stream
     // acceptance, foca membership, and initial sync — same as for inbound.
-    let (connected_tx, mut connected_rx) =
-        mpsc::unbounded_channel::<transport::IncomingConnection>();
+    let (connected_tx, mut connected_rx) = mpsc::unbounded_channel::<IncomingConnection>();
 
     // Subscribe to cluster events for NodeLeft pruning
     let mut cluster_event_rx = event_tx.subscribe();
 
-    // Spawn centralized timer manager — replaces per-timer tokio::spawn
-    let timer_cmd_tx = spawn_timer_manager(timer_tx);
-
+    // Foca timers ride the runtime seam via the centralized timer manager.
+    let timer_cmd_tx = spawn_timer_manager(Arc::clone(&rt), timer_tx);
     let mut runtime = FocaRuntime::new(identity.clone(), event_tx.clone(), swim_tx, timer_cmd_tx);
 
-    // Periodic sync interval
-    let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
+    // Track node ids we're currently connecting to, to avoid duplicates.
+    let connecting = Arc::new(tokio::sync::Mutex::new(
+        std::collections::HashSet::<NodeId>::new(),
+    ));
 
-    // Track addresses we're currently connecting to, to avoid duplicates
-    let connecting = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<
-        SocketAddr,
-    >::new()));
-
-    tokio::spawn(async move {
+    // The event loop runs on the runtime seam (Tokio in prod, the deterministic
+    // SimRuntime under simulation). `loop_rt` is the clone the loop uses for its
+    // own spawns/timers; `tokio::select!` itself is just a poll combinator and
+    // needs no reactor.
+    let loop_rt = Arc::clone(&rt);
+    rt.spawn(Box::pin(async move {
+        // Periodic registry sync, on the runtime clock. `tokio::time::interval`
+        // fired its first tick immediately, so arm the first sleep at ZERO to
+        // preserve "sync at t≈0", then re-arm at 5s.
+        let mut sync_timer = loop_rt.sleep(Duration::from_secs(0));
         // Helper closure factored into an inline fn below to handle a new
         // connection identically regardless of inbound vs outbound origin.
 
         loop {
             tokio::select! {
+                // Deterministic branch priority under the sim runtime (see
+                // supervisor.rs): a fixed poll order so a step with several ready
+                // channels replays identically instead of letting select!'s RNG
+                // pick which connection/event is handled first.
+                biased;
                 // ── Incoming handshaked connections (accepted by accept_loop) ─
                 Some(incoming) = incoming_rx.recv() => {
                     handle_new_connection(
@@ -374,8 +519,9 @@ fn spawn_event_loop(
                         &control_in_tx,
                         &shutdown,
                         &receptionist,
-                        &transport,
+                        &net,
                         &node_registry,
+                        &loop_rt,
                     ).await;
                 }
 
@@ -388,8 +534,9 @@ fn spawn_event_loop(
                         &control_in_tx,
                         &shutdown,
                         &receptionist,
-                        &transport,
+                        &net,
                         &node_registry,
+                        &loop_rt,
                     ).await;
                 }
 
@@ -397,30 +544,31 @@ fn spawn_event_loop(
                 Some(event) = discovery_rx.recv() => {
                     match event {
                         discovery::DiscoveryEvent::PeerDiscovered(addr) => {
-                            let transport = Arc::clone(&transport);
+                            let peer_id = addr.id.clone();
+                            let net = Arc::clone(&net);
                             let connecting = Arc::clone(&connecting);
                             let mut lock = connecting.lock().await;
-                            if lock.contains(&addr) {
+                            if lock.contains(&peer_id) {
                                 continue;
                             }
-                            lock.insert(addr);
+                            lock.insert(peer_id.clone());
                             drop(lock);
 
                             let connecting2 = Arc::clone(&connecting);
                             let connected_tx = connected_tx.clone();
-                            tokio::spawn(async move {
-                                match transport.connect(addr).await {
+                            loop_rt.spawn(Box::pin(async move {
+                                match net.connect(addr).await {
                                     Ok(ic) => {
-                                        tracing::info!("Connected to discovered peer: {addr}");
+                                        tracing::info!("Connected to discovered peer: {peer_id}");
                                         // Feed back into event loop for stream-accept handling
                                         let _ = connected_tx.send(ic);
                                     }
                                     Err(e) => {
-                                        tracing::debug!("Failed to connect to {addr}: {e}");
+                                        tracing::debug!("Failed to connect to {peer_id}: {e}");
                                     }
                                 }
-                                connecting2.lock().await.remove(&addr);
-                            });
+                                connecting2.lock().await.remove(&peer_id);
+                            }));
                         }
                     }
                 }
@@ -437,7 +585,7 @@ fn spawn_event_loop(
                 Some((target, data)) = swim_rx.recv() => {
                     let node_id = target.node_id_string();
                     let msg = ControlMessage::Swim(data);
-                    if let Err(e) = transport.send_control(&node_id, msg).await {
+                    if let Err(e) = net.send_control(&node_id, msg).await {
                         tracing::trace!("Failed to send SWIM to {node_id}: {e}");
                     }
                 }
@@ -458,12 +606,12 @@ fn spawn_event_loop(
                                 &type_registry,
                                 &node_id,
                                 &event_tx,
-                                &transport,
+                                &net,
                             );
 
                             // Eager connect: if ops mention nodes we're not
                             // connected to, initiate a connection immediately.
-                            let connected = transport.connected_nodes().await;
+                            let connected = net.connected_nodes().await;
                             for op in &ops {
                                 if let OpType::Register { origin_addr, .. } = &op.op_type {
                                     // Skip ops from our own node
@@ -474,34 +622,48 @@ fn spawn_event_loop(
                                     if connected.contains(&op.node_id) {
                                         continue;
                                     }
-                                    if let Ok(addr) = origin_addr.parse::<SocketAddr>() {
+                                    // The op's node_id is `endpoint_id#incarnation`; the
+                                    // origin_addr is a host:port hint. Build the abstract
+                                    // PeerAddr to dial. Gossip carries addressing hints
+                                    // only — the allowlist hook decides authorization, so a
+                                    // gossiped peer that isn't allowlisted is rejected on dial.
+                                    let Some(peer_id) = node_id_of(&op.node_id) else {
+                                        continue;
+                                    };
+                                    let Ok(sock) = origin_addr.parse::<SocketAddr>() else {
+                                        continue;
+                                    };
+                                    let peer_addr = PeerAddr {
+                                        id: peer_id.clone(),
+                                        hint: vec![sock],
+                                    };
+                                    {
                                         let mut lock = connecting.lock().await;
-                                        if lock.contains(&addr) {
+                                        if lock.contains(&peer_id) {
                                             continue;
                                         }
-                                        lock.insert(addr);
-                                        drop(lock);
-
-                                        let transport_clone = Arc::clone(&transport);
-                                        let connecting_clone = Arc::clone(&connecting);
-                                        let connected_tx = connected_tx.clone();
-                                        tokio::spawn(async move {
-                                            match transport_clone.connect(addr).await {
-                                                Ok(ic) => {
-                                                    tracing::info!(
-                                                        "Eager connect to {addr} succeeded"
-                                                    );
-                                                    let _ = connected_tx.send(ic);
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!(
-                                                        "Eager connect to {addr} failed: {e}"
-                                                    );
-                                                }
-                                            }
-                                            connecting_clone.lock().await.remove(&addr);
-                                        });
+                                        lock.insert(peer_id.clone());
                                     }
+
+                                    let net = Arc::clone(&net);
+                                    let connecting_clone = Arc::clone(&connecting);
+                                    let connected_tx = connected_tx.clone();
+                                    loop_rt.spawn(Box::pin(async move {
+                                        match net.connect(peer_addr).await {
+                                            Ok(ic) => {
+                                                tracing::info!(
+                                                    "Eager connect to {peer_id} succeeded"
+                                                );
+                                                let _ = connected_tx.send(ic);
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    "Eager connect to {peer_id} failed: {e}"
+                                                );
+                                            }
+                                        }
+                                        connecting_clone.lock().await.remove(&peer_id);
+                                    }));
                                 }
                             }
                         }
@@ -512,14 +674,14 @@ fn spawn_event_loop(
                                 .unwrap_or(false);
                             if is_edge {
                                 sync::send_public_sync_to_peer(
-                                    &transport,
+                                    &net,
                                     &receptionist,
                                     &node_id,
                                     &peer_vv,
                                 ).await;
                             } else {
                                 sync::send_sync_to_peer(
-                                    &transport,
+                                    &net,
                                     &receptionist,
                                     &node_id,
                                     &peer_vv,
@@ -527,7 +689,7 @@ fn spawn_event_loop(
                             }
                         }
                         ControlMessage::Ping => {
-                            let _ = transport.send_control(
+                            let _ = net.send_control(
                                 &node_id,
                                 ControlMessage::Pong,
                             ).await;
@@ -541,7 +703,7 @@ fn spawn_event_loop(
                             instrument::cluster_node_left();
                             let _ = event_tx.send(ClusterEvent::NodeLeft(identity.clone()));
                             receptionist.prune_node(&departing_id);
-                            transport.remove_connection(&departing_id).await;
+                            net.remove_connection(&departing_id).await;
                             let _ = event_tx.send(ClusterEvent::NodePruned(identity.clone()));
                         }
                         ControlMessage::SpawnActor(ref request) => {
@@ -560,7 +722,7 @@ fn spawn_event_loop(
                                         "Spawned {} (type: {}) successfully",
                                         request.label, request.actor_type_name
                                     );
-                                    let _ = transport.send_control(
+                                    let _ = net.send_control(
                                         &node_id,
                                         ControlMessage::SpawnAckOk {
                                             request_id: request.request_id,
@@ -573,7 +735,7 @@ fn spawn_event_loop(
                                         "Failed to spawn {}: {e}",
                                         request.label
                                     );
-                                    let _ = transport.send_control(
+                                    let _ = net.send_control(
                                         &node_id,
                                         ControlMessage::SpawnAckErr {
                                             request_id: request.request_id,
@@ -611,7 +773,7 @@ fn spawn_event_loop(
                                 "StopSingleton from {node_id} for {label} (gen={generation}) — stopping local instance"
                             );
                             receptionist.stop(label);
-                            let _ = transport
+                            let _ = net
                                 .send_control(
                                     &node_id,
                                     ControlMessage::SingletonStoppedAck {
@@ -643,7 +805,7 @@ fn spawn_event_loop(
                             let node_id = identity.node_id_string();
                             tracing::info!("Node departed: {node_id} — pruning actors");
                             receptionist.prune_node(&node_id);
-                            transport.remove_connection(&node_id).await;
+                            net.remove_connection(&node_id).await;
                             node_registry.remove(&node_id);
                             let _ = event_tx.send(ClusterEvent::NodePruned(identity.clone()));
                         }
@@ -673,9 +835,10 @@ fn spawn_event_loop(
                     }
                 }
 
-                // ── Periodic registry sync ──────────────────────────────
-                _ = sync_interval.tick() => {
-                    sync::periodic_sync(&transport, &receptionist, &node_registry).await;
+                // ── Periodic registry sync (on the runtime clock) ───────
+                _ = &mut sync_timer => {
+                    sync::periodic_sync(&net, &receptionist, &node_registry).await;
+                    sync_timer = loop_rt.sleep(Duration::from_secs(5));
                 }
 
                 // ── Shutdown ────────────────────────────────────────────
@@ -685,7 +848,7 @@ fn spawn_event_loop(
                 }
             }
         }
-    });
+    }));
 }
 
 /// Handles a newly established connection (inbound or outbound):
@@ -693,14 +856,15 @@ fn spawn_event_loop(
 /// stream acceptor for subsequent bi-streams, and requests initial sync.
 #[allow(clippy::too_many_arguments)]
 async fn handle_new_connection(
-    incoming: transport::IncomingConnection,
+    incoming: IncomingConnection,
     membership: &mut ClusterMembership,
     runtime: &mut FocaRuntime,
     control_in_tx: &mpsc::UnboundedSender<(String, ControlMessage)>,
     shutdown: &CancellationToken,
     receptionist: &Receptionist,
-    transport: &Arc<Transport>,
+    net: &Arc<dyn Net>,
     node_registry: &NodeRegistry,
+    rt: &Arc<dyn Runtime>,
 ) {
     let node_id = incoming.remote_identity.node_id_string();
     let is_edge_client = incoming.is_edge_client;
@@ -730,30 +894,38 @@ async fn handle_new_connection(
 
     // Spawn control stream reader — reads ongoing control messages from
     // the handshake stream (which survived read_handshake).
-    tokio::spawn(transport::run_control_stream_reader(
+    rt.spawn(Box::pin(net::run_control_stream_reader(
         incoming.control_recv,
         control_in_tx.clone(),
         node_id.clone(),
         shutdown.clone(),
-    ));
+    )));
 
     // Spawn a task to accept additional bi streams from this connection.
-    // New streams are actor streams or control continuations.
+    // New streams are actor streams or control continuations. The boxed
+    // connection is *moved* into this task — the transport keeps its own handle
+    // in the connection pool, and `Box<dyn Connection>` isn't `Clone`.
     let control_tx = control_in_tx.clone();
     let shutdown_clone = shutdown.clone();
-    let conn = incoming.connection.clone();
+    let conn = incoming.connection;
     let nid = node_id.clone();
     let receptionist_for_streams = receptionist.clone();
-    tokio::spawn(async move {
+    let accept_rt = Arc::clone(rt);
+    rt.spawn(Box::pin(async move {
         loop {
             tokio::select! {
+                // Deterministic branch priority (see supervisor.rs): process a
+                // ready stream before a same-step shutdown, so it replays.
+                biased;
                 result = conn.accept_bi() => {
                     match result {
-                        Ok((send, recv)) => {
+                        // `accept_bi` yields `None` when the connection closes,
+                        // which drives this accept loop's exit.
+                        Some((send, recv)) => {
                             let receptionist_clone = receptionist_for_streams.clone();
                             let ctrl_tx = control_tx.clone();
                             let nid2 = nid.clone();
-                            tokio::spawn(async move {
+                            accept_rt.spawn(Box::pin(async move {
                                 handle_incoming_stream(
                                     receptionist_clone,
                                     send,
@@ -761,10 +933,10 @@ async fn handle_new_connection(
                                     ctrl_tx,
                                     nid2,
                                 ).await;
-                            });
+                            }));
                         }
-                        Err(e) => {
-                            tracing::debug!("Peer {nid} stopped accepting streams: {e}");
+                        None => {
+                            tracing::debug!("Peer {nid} stopped accepting streams");
                             break;
                         }
                     }
@@ -772,12 +944,12 @@ async fn handle_new_connection(
                 _ = shutdown_clone.cancelled() => break,
             }
         }
-    });
+    }));
 
     // Only request bidirectional sync for full cluster members.
     // Edge clients send their own RegistrySyncRequest on connect.
     if !is_edge_client {
-        sync::request_sync_from_peer(transport, receptionist, &node_id).await;
+        sync::request_sync_from_peer(net, receptionist, &node_id).await;
     }
 }
 
@@ -792,8 +964,8 @@ async fn handle_new_connection(
 /// distinctive, while ControlMessages have different structure.
 async fn handle_incoming_stream(
     receptionist: Receptionist,
-    send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    send: Box<dyn net::SendHalf>,
+    mut recv: Box<dyn net::RecvHalf>,
     control_tx: mpsc::UnboundedSender<(String, ControlMessage)>,
     node_id: String,
 ) {
@@ -827,8 +999,7 @@ async fn handle_incoming_stream(
     if let Ok(msg) = framing::decode_message::<ControlMessage>(&first_frame) {
         let _ = control_tx.send((node_id.clone(), msg));
         // Continue reading control messages from this stream
-        transport::run_control_stream_reader(recv, control_tx, node_id, CancellationToken::new())
-            .await;
+        net::run_control_stream_reader(recv, control_tx, node_id, CancellationToken::new()).await;
     } else {
         tracing::warn!("Could not decode first frame from {node_id}");
     }
@@ -837,8 +1008,8 @@ async fn handle_incoming_stream(
 /// Handle an actor stream where StreamInit has already been consumed.
 async fn handle_actor_stream_after_init(
     receptionist: Receptionist,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: Box<dyn net::SendHalf>,
+    mut recv: Box<dyn net::RecvHalf>,
     mut codec: framing::FrameCodec,
     actor_label: &str,
 ) {
@@ -886,7 +1057,7 @@ async fn handle_actor_stream_after_init(
 /// response, and write it back. Returns false if the stream should be closed.
 async fn dispatch_and_respond(
     dispatch_tx: &mpsc::UnboundedSender<DispatchRequest>,
-    send: &mut quinn::SendStream,
+    send: &mut Box<dyn net::SendHalf>,
     frame: &[u8],
     actor_label: &str,
 ) -> bool {
@@ -1066,6 +1237,10 @@ mod tests {
     fn test_config(name: &str) -> ClusterConfig {
         ClusterConfigBuilder::new()
             .name(name)
+            // Each test node needs its OWN identity. Without an explicit key the
+            // builder loads a shared default key file, so every node would get
+            // the same endpoint id and the cluster couldn't tell them apart.
+            .secret_key(iroh::SecretKey::generate())
             .listen("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
             .cookie("test-cookie")
             .discovery(Discovery::None)
@@ -1073,19 +1248,33 @@ mod tests {
             .unwrap()
     }
 
-    fn test_config_with_seed(name: &str, seed: std::net::SocketAddr) -> ClusterConfig {
+    fn test_config_with_seed(
+        name: &str,
+        seed_id: NodeId,
+        seed: std::net::SocketAddr,
+    ) -> ClusterConfig {
+        // Build the seed as a full iroh EndpointAddr: the seed node's real,
+        // cryptographically-authenticated endpoint id (so the dial actually
+        // resolves to it) plus its real OS-assigned bound address. We must use
+        // the seed system's true endpoint id here — these are live connectivity
+        // tests that assert the nodes actually connect — not a derived test key.
+        // The identity carries a `NodeId`; parse it back into the iroh key.
+        let seed_eid: iroh::EndpointId = seed_id.0.parse().expect("seed node id is a valid key");
+        let seed_addr = iroh::EndpointAddr::from_parts(seed_eid, [iroh::TransportAddr::Ip(seed)]);
         ClusterConfigBuilder::new()
             .name(name)
+            // Distinct per-node identity (see `test_config`).
+            .secret_key(iroh::SecretKey::generate())
             .listen("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
             .cookie("test-cookie")
-            .seed_nodes([seed])
+            .seed_nodes([seed_addr])
             .build()
             .unwrap()
     }
 
     /// Install rustls ring crypto provider (idempotent).
     fn init_crypto() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        super::install_default_crypto();
     }
 
     /// Polls a closure until it returns true, with a timeout.
@@ -1121,21 +1310,22 @@ mod tests {
         let addr_a = system_a.local_addr();
 
         // Node B uses A as a seed
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
 
         // Wait for the connection to establish (discovery fires, connect happens)
-        let transport_a = &system_a.transport;
+        let net_a = &system_a.net;
         poll_until(Duration::from_secs(5), || async {
-            !transport_a.connected_nodes().await.is_empty()
+            !net_a.connected_nodes().await.is_empty()
         })
         .await;
 
         // Both should see each other
-        let a_peers = system_a.transport.connected_nodes().await;
-        let b_peers = system_b.transport.connected_nodes().await;
+        let a_peers = system_a.net.connected_nodes().await;
+        let b_peers = system_b.net.connected_nodes().await;
         assert!(!a_peers.is_empty(), "A should have peers");
         assert!(!b_peers.is_empty(), "B should have peers");
 
@@ -1163,7 +1353,8 @@ mod tests {
         assert_eq!(result, 5);
 
         // Start node B with A as seed
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1204,7 +1395,8 @@ mod tests {
 
         system_a.start_actor("counter/a", TestCounter, TestCounterState { count: 100 });
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1257,7 +1449,8 @@ mod tests {
             TestCounterState { count: 42 },
         );
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1314,7 +1507,8 @@ mod tests {
             TestCounterState { count: 77 },
         );
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1366,7 +1560,8 @@ mod tests {
             TestCounterState { count: 10 },
         );
 
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1390,7 +1585,8 @@ mod tests {
         .await;
 
         // Now start a NEW node A and connect it to B (rejoin)
-        let config_a2 = test_config_with_seed("node-a-2", addr_b);
+        let config_a2 =
+            test_config_with_seed("node-a-2", system_b.identity().endpoint_id.clone(), addr_b);
         let system_a2 = ClusterSystem::start(config_a2, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1524,7 +1720,8 @@ mod tests {
         system_a.start_actor("counter/r2", TestCounter, TestCounterState { count: 0 });
 
         // Node B: connect to A as seed
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1597,7 +1794,8 @@ mod tests {
         );
 
         // Node B: start "ref-receiver/main" (RefReceiver)
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b =
             ClusterSystem::start(config_b, extended_type_registry(), SpawnRegistry::new())
                 .await
@@ -1666,7 +1864,8 @@ mod tests {
         system_a.start_actor("counter/on-a", TestCounter, TestCounterState { count: 10 });
 
         // Node B: seed = A, start "counter/on-b"
-        let config_b = test_config_with_seed("node-b", addr_a);
+        let config_b =
+            test_config_with_seed("node-b", system_a.identity().endpoint_id.clone(), addr_a);
         let system_b = ClusterSystem::start(config_b, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();
@@ -1700,7 +1899,8 @@ mod tests {
         assert_eq!(count, 20, "A reads B's counter directly");
 
         // Node C: seed = B only (no direct connection to A)
-        let config_c = test_config_with_seed("node-c", addr_b);
+        let config_c =
+            test_config_with_seed("node-c", system_b.identity().endpoint_id.clone(), addr_b);
         let system_c = ClusterSystem::start(config_c, test_type_registry(), SpawnRegistry::new())
             .await
             .unwrap();

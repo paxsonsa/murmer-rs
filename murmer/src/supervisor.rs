@@ -51,11 +51,16 @@ where
 
     loop {
         tokio::select! {
+            // Deterministic branch priority: under a deterministic runtime,
+            // `select!`'s default random branch order would break replay. The
+            // ordering here (shutdown-ish signals after messages) is a
+            // deliberate, stable policy.
+            biased;
             msg = mailbox_rx.recv() => {
                 match msg {
                     Some(envelope) => {
                         #[cfg(feature = "monitor")]
-                        let start = std::time::Instant::now();
+                        let start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (measurement, not control flow)
 
                         let fut = envelope.handle(&ctx, &mut actor, &mut state);
                         let result = AssertUnwindSafe(fut).catch_unwind().await;
@@ -71,7 +76,7 @@ where
 
                         msg_count += 1;
                         if msg_count.is_multiple_of(64) {
-                            tokio::task::yield_now().await;
+                            crate::runtime::yield_now().await;
                         }
                     }
                     None => break,
@@ -81,7 +86,7 @@ where
                 match req {
                     Some(request) => {
                         #[cfg(feature = "monitor")]
-                        let start = std::time::Instant::now();
+                        let start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (measurement, not control flow)
 
                         let fut = actor.dispatch_remote(
                             &ctx,
@@ -117,7 +122,7 @@ where
                         }
                         msg_count += 1;
                         if msg_count.is_multiple_of(64) {
-                            tokio::task::yield_now().await;
+                            crate::runtime::yield_now().await;
                         }
                     }
                     None => break,

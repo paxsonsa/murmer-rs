@@ -5,8 +5,8 @@ use crate::{Op, OpType, Receptionist, RemoteInvocation, ResponseRegistry};
 
 use super::framing::ControlMessage;
 use super::membership::ClusterEvent;
+use super::net::Net;
 use super::remote;
-use super::transport::Transport;
 
 use tokio::sync::{broadcast, mpsc};
 
@@ -16,12 +16,12 @@ use tokio::sync::{broadcast, mpsc};
 
 /// Request a delta from a peer by sending our version vector.
 pub async fn request_sync_from_peer(
-    transport: &Arc<Transport>,
+    net: &Arc<dyn Net>,
     receptionist: &Receptionist,
     node_id: &str,
 ) {
     let our_vv = receptionist.version_vector();
-    if let Err(e) = transport
+    if let Err(e) = net
         .send_control(node_id, ControlMessage::RegistrySyncRequest(our_vv))
         .await
     {
@@ -31,7 +31,7 @@ pub async fn request_sync_from_peer(
 
 /// Send our delta to a peer (ops they haven't seen).
 pub async fn send_sync_to_peer(
-    transport: &Arc<Transport>,
+    net: &Arc<dyn Net>,
     receptionist: &Receptionist,
     node_id: &str,
     peer_vv: &crate::VersionVector,
@@ -41,7 +41,7 @@ pub async fn send_sync_to_peer(
         return;
     }
     tracing::debug!("Sending {} ops to {node_id}", delta.len());
-    if let Err(e) = transport
+    if let Err(e) = net
         .send_control(node_id, ControlMessage::RegistrySync(delta))
         .await
     {
@@ -55,7 +55,7 @@ pub async fn send_sync_to_peer(
 /// propagated so Edge clients are notified when a public actor they know about
 /// is removed.
 pub async fn send_public_sync_to_peer(
-    transport: &Arc<Transport>,
+    net: &Arc<dyn Net>,
     receptionist: &Receptionist,
     peer_node_id: &str,
     peer_vv: &crate::VersionVector,
@@ -65,7 +65,7 @@ pub async fn send_public_sync_to_peer(
         return;
     }
     tracing::debug!("Sending {} public ops to edge {peer_node_id}", delta.len());
-    if let Err(e) = transport
+    if let Err(e) = net
         .send_control(peer_node_id, ControlMessage::RegistrySync(delta))
         .await
     {
@@ -76,11 +76,11 @@ pub async fn send_public_sync_to_peer(
 /// Periodic sync: exchange deltas with all connected peers.
 /// Skips Edge clients — they pull on their own schedule.
 pub async fn periodic_sync(
-    transport: &Arc<Transport>,
+    net: &Arc<dyn Net>,
     receptionist: &Receptionist,
     node_registry: &crate::cluster::NodeRegistry,
 ) {
-    let nodes = transport.connected_nodes().await;
+    let nodes = net.connected_nodes().await;
     for node_id in &nodes {
         // Edge clients pull on their own schedule — skip server-initiated sync
         if node_registry
@@ -90,7 +90,7 @@ pub async fn periodic_sync(
         {
             continue;
         }
-        request_sync_from_peer(transport, receptionist, node_id).await;
+        request_sync_from_peer(net, receptionist, node_id).await;
     }
 }
 
@@ -273,7 +273,7 @@ pub fn apply_remote_ops(
     type_registry: &TypeRegistry,
     _remote_node_id: &str,
     event_tx: &broadcast::Sender<ClusterEvent>,
-    transport: &Arc<Transport>,
+    net: &Arc<dyn Net>,
 ) {
     // First, let the receptionist apply ops for its VersionVector tracking
     // and event emission (Register events are emitted even for unknown types).
@@ -326,13 +326,21 @@ pub fn apply_remote_ops(
                 // establishes the connection.
                 let target_node_id = op.node_id.clone();
 
-                tokio::spawn(remote::run_actor_stream_writer(
-                    Arc::clone(transport),
-                    target_node_id,
-                    label.clone(),
-                    wire_rx,
-                    response_registry,
-                ));
+                // Route through the Runtime seam (not a raw tokio::spawn) so this
+                // is sim-runnable: under SimWorld a raw spawn calls Handle::current
+                // and panics ("no reactor"). This is the FIRST site a cross-node
+                // consumer hits — it fires the moment a remote actor registration
+                // syncs here. The runtime is already in scope (2nd arg below).
+                receptionist
+                    .runtime()
+                    .spawn(Box::pin(remote::run_actor_stream_writer(
+                        Arc::clone(net),
+                        receptionist.runtime().clone(),
+                        target_node_id,
+                        label.clone(),
+                        wire_rx,
+                        response_registry,
+                    )));
 
                 let _ = event_tx.send(ClusterEvent::ActorRegistered {
                     label: label.clone(),

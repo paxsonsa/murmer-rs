@@ -366,7 +366,12 @@ let config = ClusterConfig::builder()
     .name("my-node")
     .listen("0.0.0.0:7100".parse()?)
     .cookie("my-cluster-secret")
-    .seed_nodes(["192.168.1.1:7100".parse()?])
+    // Seeds are dialed by key. Run `murmer id` on the seed node to get its
+    // endpoint id, then build its address from the id plus host:port.
+    .seed_nodes([iroh::EndpointAddr::from_parts(
+        seed_endpoint_id,
+        [iroh::TransportAddr::Ip("192.168.1.1:7100".parse()?)],
+    )])
     .build()?;
 
 let system = System::clustered_auto(config).await?;
@@ -374,7 +379,7 @@ let system = System::clustered_auto(config).await?;
 
 Everything else — `system.start(...)`, `system.lookup(...)`, `endpoint.send(...)` — stays identical. Actors on remote nodes appear in your local receptionist automatically via registry replication.
 
-See the [Clustering](./clustering.md) chapter for the full walkthrough, including Docker deployment and the interactive `cluster_chat` example.
+A node is now identified by a persistent key (its iroh endpoint id), not by its address. See the [Clustering](./clustering.md) chapter for the full walkthrough, and [Administration & Security](./administration.md) for key management and the cluster allowlist.
 
 ## Build and test
 

@@ -37,7 +37,12 @@ let config = ClusterConfig::builder()
     .listen("0.0.0.0:7100".parse()?)
     .advertise("192.168.1.5:7100".parse()?)
     .cookie("my-cluster-secret")
-    .seed_nodes(["192.168.1.1:7100".parse()?])
+    // Seeds are dialed by endpoint id, not bare address. Get the seed's id by
+    // running `murmer id` on it (or read the `seed:` line it prints at startup).
+    .seed_nodes([iroh::EndpointAddr::from_parts(
+        seed_endpoint_id,
+        [iroh::TransportAddr::Ip("192.168.1.1:7100".parse()?)],
+    )])
     .build()?;
 
 // clustered_auto() discovers all #[handlers]-annotated actor types automatically
@@ -85,39 +90,68 @@ cargo run -p murmer-examples --bin cluster_chat -- --local
 Same binary, same commands — just add cluster config:
 
 ```sh
-# Terminal 1 — seed node
+# Terminal 1: seed node. On startup it prints a line like:
+#   seed: 5e9c...f0a8@127.0.0.1:7100  (pass to another node with --seed)
 cargo run -p murmer-examples --bin cluster_chat -- --node alpha --port 7100
 
-# Terminal 2 — joins via seed
-cargo run -p murmer-examples --bin cluster_chat -- --node beta --port 7200 --seed 127.0.0.1:7100
+# Terminal 2: joins via the seed's id@address (copy alpha's `seed:` line)
+cargo run -p murmer-examples --bin cluster_chat -- \
+    --node beta --port 7200 --seed 5e9c...f0a8@127.0.0.1:7100
 ```
+
+> Each node now has a persistent identity key (its iroh endpoint id). The
+> `cluster_chat` example writes one to `<node-name>.key` so the id is stable
+> across restarts. A seed is `<endpoint-id>@<host:port>`, because iroh dials by
+> key and the address alone is no longer enough. See
+> [Administration & Security](./administration.md).
 
 ## Step 4: Deploy with Docker
 
-The `docker-compose.yml` in the repo runs a 3-node cluster:
+The `docker-compose.yml` in the repo runs a 3-node cluster with no manual setup:
 
 ```sh
 docker compose up --build
 ```
 
-This starts three containers — `alpha`, `beta`, and `gamma` — each running the `cluster_chat` example:
+Nodes are dialed by key, so the joiners need the seed's endpoint id. The container
+entrypoint (`docker-entrypoint.sh`) handles that automatically. Each node generates
+its own persistent key in a shared `./keys` volume, publishes its public endpoint
+id to `/keys/<node>.id`, and the joiners wait for the seed's id file and dial it by
+key. The compose file just names each node and points the joiners at the seed:
 
 ```yaml
 services:
   alpha:
     build: .
-    command: ["--node", "alpha", "--port", "7100"]
+    environment:
+      MURMER_NODE: alpha          # seed node (no MURMER_SEED)
+    volumes:
+      - ./keys:/keys
 
   beta:
     build: .
-    command: ["--node", "beta", "--port", "7100", "--seed", "alpha:7100"]
+    environment:
+      MURMER_NODE: beta
+      MURMER_SEED: alpha          # join via alpha's published id
+    volumes:
+      - ./keys:/keys
 
   gamma:
     build: .
-    command: ["--node", "gamma", "--port", "7100", "--seed", "alpha:7100"]
+    environment:
+      MURMER_NODE: gamma
+      MURMER_SEED: alpha
+    volumes:
+      - ./keys:/keys
 ```
 
-Beta and gamma seed from alpha and automatically mesh together.
+Beta and gamma seed from alpha and mesh together. Keys persist in `./keys`, so node
+identities are stable across `docker compose restart`. Only the public `.id` files
+are read by other nodes; each node's secret key stays in its own `.key` file.
+
+> On a flat LAN you can skip seeds entirely and let mDNS discover peers (it now
+> advertises each node's endpoint id). Multicast across a Docker bridge network is
+> unreliable, which is why the compose demo uses id-based seeds instead.
 
 ## How clustering works
 
@@ -131,11 +165,11 @@ When an actor system starts in clustered mode, it runs a server that listens for
 
 ### Networking layer
 
-The networking layer is built on **QUIC** (via the `quinn` crate) and **SWIM** (via the `foca` crate):
+The networking layer is built on **iroh** (a QUIC stack) and **SWIM** (via the `foca` crate):
 
-- **QUIC** provides a reliable, low-latency transport with built-in TLS encryption. Each node pair shares a single QUIC connection, multiplexed over per-actor streams.
-- **SWIM** handles cluster membership — failure detection, protocol-level heartbeats, and member state dissemination.
-- **mDNS** provides optional zero-configuration discovery for LAN environments.
+- **iroh** provides a reliable, low-latency QUIC transport where each peer is identified and authenticated by an ed25519 **endpoint id** (a public key), not by IP address. host:port becomes an addressing hint iroh uses to establish the direct connection. Each node pair shares a single connection, multiplexed over per-actor streams. The authenticated endpoint id is what makes the [zero-trust allowlist](./administration.md#the-allowlist) possible.
+- **SWIM** handles cluster membership — failure detection, protocol-level heartbeats, and member state dissemination. Membership is keyed on the endpoint id.
+- **mDNS** provides optional zero-configuration discovery for LAN environments, advertising each node's endpoint id so peers can dial it by key.
 
 ### Stream architecture
 

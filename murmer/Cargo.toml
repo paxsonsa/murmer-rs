@@ -14,8 +14,16 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 [features]
 default = ["macros"]
 macros = ["dep:murmer-macros"]
-app = ["dep:async-trait"]
+app = []
 monitor = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+# The `murmer` CLI (key + allowlist management). Pulls in clap.
+cli = ["dep:clap"]
+# Deterministic simulation runtime + single-node SimWorld harness.
+sim = ["dep:rand_chacha"]
+
+[[bin]]
+name = "murmer"
+required-features = ["cli"]
 
 [dependencies]
 bincode = { workspace = true }
@@ -26,10 +34,7 @@ tokio = { workspace = true }
 murmer-macros = { workspace = true, optional = true }
 
 # Networking & clustering
-quinn = { version = "0.11", features = ["rustls"] }
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2.0"
-rcgen = "0.13"
 foca = { version = "0.19", features = ["bincode-codec"] }
 mdns-sd = "0.18"
 rand = { workspace = true }
@@ -41,7 +46,13 @@ tokio-util = { version = "0.7", features = ["full"] }
 linkme = "0.3"
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
-async-trait = { version = "0.1", optional = true }
+async-trait = "0.1"
+iroh = "1.0.0"
+clap = { version = "4", features = ["derive"], optional = true }
+# Simulation runtime (feature = "sim"): deterministic, seedable PRNG for the
+# single-threaded sim executor. Kept out of the default build. (The executor
+# itself is hand-rolled in `sim.rs`; see `SimExecutor`.)
+rand_chacha = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

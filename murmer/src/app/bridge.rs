@@ -21,8 +21,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::cluster::ClusterSystem;
 use crate::cluster::framing::ControlMessage;
 use crate::cluster::membership::ClusterEvent;
-use crate::cluster::transport::Transport;
+use crate::cluster::net::Net;
 use crate::prelude::*;
+use crate::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use crate::app::coordinator::{
@@ -70,42 +71,49 @@ pub fn start_coordinator(
 
     let coordinator_ep = cluster.start_actor("coordinator", Coordinator, state);
 
+    // The runtime seam (Tokio in prod, the deterministic SimRuntime under
+    // simulation). The bridge's background loops route through it so the whole
+    // app orchestration can boot under `SimWorld` — `runtime.spawn` is an
+    // `#[inline]` passthrough to `tokio::spawn` in production.
+    let runtime = cluster.receptionist().runtime().clone();
+
     // Spawn bridge (ClusterEvents → Coordinator)
     let bridge_ep = coordinator_ep.clone();
     let mut events = cluster.subscribe_events();
     let node_registry = cluster.node_registry().clone();
-    tokio::spawn(async move {
+    runtime.spawn(Box::pin(async move {
         run_bridge_loop(&mut events, &node_registry, &bridge_ep).await;
-    });
+    }));
 
-    // Spawn drain loop (SpawnRequests → transport or local spawn)
-    let transport = Arc::clone(cluster.transport());
+    // Spawn drain loop (SpawnRequests → net or local spawn)
+    let net = Arc::clone(cluster.net());
     let local_node_id = cluster.identity().node_id_string();
     let spawn_registry = Arc::clone(cluster.spawn_registry());
     let receptionist = cluster.receptionist().clone();
     let ack_ep = coordinator_ep.clone();
-    tokio::spawn(run_spawn_drain_loop(
-        transport,
+    runtime.spawn(Box::pin(run_spawn_drain_loop(
+        Arc::clone(&runtime),
+        net,
         local_node_id,
         spawn_registry,
         receptionist,
         ack_ep,
         spawn_rx,
         queue_depth,
-    ));
+    )));
 
     // Drain loop for graceful singleton stops (the inner half of the drain handoff).
-    let stop_transport = Arc::clone(cluster.transport());
+    let stop_net = Arc::clone(cluster.net());
     let stop_local_node_id = cluster.identity().node_id_string();
     let stop_receptionist = cluster.receptionist().clone();
     let stop_ep = coordinator_ep.clone();
-    tokio::spawn(run_singleton_stop_drain_loop(
-        stop_transport,
+    runtime.spawn(Box::pin(run_singleton_stop_drain_loop(
+        stop_net,
         stop_local_node_id,
         stop_receptionist,
         stop_ep,
         stop_rx,
-    ));
+    )));
 
     coordinator_ep
 }
@@ -141,6 +149,7 @@ async fn run_bridge_loop(
                             node_id,
                             info: SerializableNodeInfo {
                                 name: identity.name,
+                                endpoint_id: identity.endpoint_id,
                                 host: identity.host,
                                 port: identity.port,
                                 incarnation: identity.incarnation,
@@ -219,14 +228,16 @@ async fn run_bridge_loop(
 /// reaching `ack`, `Drop` fires a detached task to send a failure ack so
 /// `pending_spawns` in the Coordinator never leaks a stale entry.
 struct AckGuard {
+    runtime: Arc<dyn Runtime>,
     coordinator: Endpoint<Coordinator>,
     request_id: u64,
     sent: bool,
 }
 
 impl AckGuard {
-    fn new(coordinator: Endpoint<Coordinator>, request_id: u64) -> Self {
+    fn new(runtime: Arc<dyn Runtime>, coordinator: Endpoint<Coordinator>, request_id: u64) -> Self {
         Self {
+            runtime,
             coordinator,
             request_id,
             sent: false,
@@ -237,7 +248,7 @@ impl AckGuard {
         self.sent = true;
         let coord = self.coordinator.clone();
         let id = self.request_id;
-        tokio::spawn(async move {
+        self.runtime.spawn(Box::pin(async move {
             let _ = coord
                 .send(NotifySpawnAck {
                     request_id: id,
@@ -245,7 +256,7 @@ impl AckGuard {
                     error,
                 })
                 .await;
-        });
+        }));
     }
 }
 
@@ -254,13 +265,18 @@ impl Drop for AckGuard {
         if self.sent {
             return;
         }
-        // Guard against dropping after the tokio runtime has shut down.
-        if tokio::runtime::Handle::try_current().is_err() {
+        // Guard against spawning into a dead runtime (prod teardown), via the
+        // seam's `can_spawn` rather than `tokio::runtime::Handle`. Under sim
+        // `can_spawn` is true, so the failure-ack IS delivered — previously the
+        // raw Handle check early-returned here and silently swallowed it, leaking
+        // the Coordinator's `pending_spawns` entry, so a sim test driving a
+        // panicking factory hung instead of seeing the failure ack.
+        if !self.runtime.can_spawn() {
             return;
         }
         let coord = self.coordinator.clone();
         let id = self.request_id;
-        tokio::spawn(async move {
+        self.runtime.spawn(Box::pin(async move {
             let _ = coord
                 .send(NotifySpawnAck {
                     request_id: id,
@@ -268,7 +284,7 @@ impl Drop for AckGuard {
                     error: Some("spawn task panicked or was cancelled".into()),
                 })
                 .await;
-        });
+        }));
     }
 }
 
@@ -283,8 +299,10 @@ impl Drop for AckGuard {
 /// Fan-out is naturally bounded by the upstream admission control on the
 /// caller's side (e.g. the supervisor semaphore in datastorekit). Murmer does
 /// not impose its own cap.
+#[allow(clippy::too_many_arguments)]
 async fn run_spawn_drain_loop(
-    transport: Arc<Transport>,
+    runtime: Arc<dyn Runtime>,
+    net: Arc<dyn Net>,
     local_node_id: String,
     spawn_registry: Arc<crate::cluster::sync::SpawnRegistry>,
     receptionist: crate::receptionist::Receptionist,
@@ -307,9 +325,13 @@ async fn run_spawn_drain_loop(
             );
             let registry = Arc::clone(&spawn_registry);
             let receptionist = receptionist.clone();
-            let guard = AckGuard::new(coordinator.clone(), request.request_id);
-            tokio::spawn(async move {
-                let factory_start = std::time::Instant::now();
+            let guard = AckGuard::new(
+                Arc::clone(&runtime),
+                coordinator.clone(),
+                request.request_id,
+            );
+            runtime.spawn(Box::pin(async move {
+                let factory_start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (spawn_drain_factory timing, never feeds control flow)
                 let result = registry
                     .spawn(
                         receptionist,
@@ -323,24 +345,24 @@ async fn run_spawn_drain_loop(
                     Ok(()) => guard.ack(true, None),
                     Err(e) => guard.ack(false, Some(e.to_string())),
                 }
-            });
+            }));
         } else {
             tracing::debug!(
                 "Sending SpawnActor to {node_id}: label={}, type={}",
                 request.label,
                 request.actor_type_name
             );
-            let transport = Arc::clone(&transport);
-            tokio::spawn(async move {
-                let factory_start = std::time::Instant::now();
-                if let Err(e) = transport
+            let net = Arc::clone(&net);
+            runtime.spawn(Box::pin(async move {
+                let factory_start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (spawn_drain_factory timing, never feeds control flow)
+                if let Err(e) = net
                     .send_control(&node_id, ControlMessage::SpawnActor(request))
                     .await
                 {
                     tracing::warn!("Failed to send spawn request to {node_id}: {e}");
                 }
                 crate::instrument::spawn_drain_factory("remote", factory_start.elapsed());
-            });
+            }));
         }
     }
 }
@@ -350,7 +372,7 @@ async fn run_spawn_drain_loop(
 /// `StopSingleton` control message to the remote owner (whose ack returns as
 /// `ClusterEvent::SingletonStopped`).
 async fn run_singleton_stop_drain_loop(
-    transport: Arc<Transport>,
+    net: Arc<dyn Net>,
     local_node_id: String,
     receptionist: crate::receptionist::Receptionist,
     coordinator: Endpoint<Coordinator>,
@@ -372,7 +394,7 @@ async fn run_singleton_stop_drain_loop(
                 req.target_node_id,
                 req.label
             );
-            if let Err(e) = transport
+            if let Err(e) = net
                 .send_control(
                     &req.target_node_id,
                     ControlMessage::StopSingleton {

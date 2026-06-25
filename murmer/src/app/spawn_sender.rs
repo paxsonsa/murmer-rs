@@ -31,7 +31,7 @@ impl SpawnSender {
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         if self
             .tx
-            .send((target_node_id.to_string(), request, Instant::now()))
+            .send((target_node_id.to_string(), request, Instant::now())) // determinism-gate: allow — monitor instrumentation (enqueue timestamp for spawn_drain_dispatch, never feeds control flow)
             .is_err()
         {
             self.queue_depth.fetch_sub(1, Ordering::Relaxed);

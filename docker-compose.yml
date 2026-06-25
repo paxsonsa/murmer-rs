@@ -1,33 +1,45 @@
 # Runs a 3-node murmer cluster using the cluster_chat example.
 #
-# Usage:
 #   docker compose up --build
 #
-# Each node starts a chat room actor. The beta and gamma nodes
-# join the cluster by seeding from alpha.
+# No manual key setup. The entrypoint (docker-entrypoint.sh) generates each
+# node's persistent key in the shared ./keys volume, publishes its public
+# endpoint id, and the joiners (beta, gamma) dial the seed (alpha) by that id.
+# Keys persist in ./keys across restarts, so node identities are stable.
 
 services:
   alpha:
     build: .
-    command: ["--node", "alpha", "--port", "7100"]
+    environment:
+      MURMER_NODE: alpha          # seed node (no MURMER_SEED)
     ports:
       - "7100:7100/udp"
+    volumes:
+      - ./keys:/keys
     networks:
       - murmer
 
   beta:
     build: .
-    command: ["--node", "beta", "--port", "7100", "--seed", "alpha:7100"]
+    environment:
+      MURMER_NODE: beta
+      MURMER_SEED: alpha          # join via alpha's published id
     depends_on:
       - alpha
+    volumes:
+      - ./keys:/keys
     networks:
       - murmer
 
   gamma:
     build: .
-    command: ["--node", "gamma", "--port", "7100", "--seed", "alpha:7100"]
+    environment:
+      MURMER_NODE: gamma
+      MURMER_SEED: alpha
     depends_on:
       - alpha
+    volumes:
+      - ./keys:/keys
     networks:
       - murmer
 

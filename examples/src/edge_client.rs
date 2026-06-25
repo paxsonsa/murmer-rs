@@ -96,7 +96,7 @@ mod tests {
     use murmer::{ClientOptions, MurmerClient, System};
 
     fn init_tracing() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        murmer::cluster::install_default_crypto();
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .with_test_writer()
@@ -130,7 +130,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let server_addr = server.local_addr().unwrap();
+        let server_addr = server.endpoint_addr().unwrap();
 
         // Register a PUBLIC actor — Edge clients will discover this
         server.start_public(
@@ -197,7 +197,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let server_addr = server.local_addr().unwrap();
+        let server_addr = server.endpoint_addr().unwrap();
 
         // Connect BEFORE the actor exists
         let client = MurmerClient::connect(server_addr, "edge-client-example")
@@ -251,7 +251,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let server_addr = server.local_addr().unwrap();
+        let server_addr = server.endpoint_addr().unwrap();
 
         // Connect with a 500 ms pull interval (fast for testing)
         let client = MurmerClient::connect_with_options(

@@ -5,3 +5,11 @@ CLAUDE.md
 thoughts/
 nohup.out
 book/build/
+
+# Local agent scratch (project-scoped memory + clipboard dumps), never commit
+memory/
+pbcopy
+
+# murmer node key files (generated at runtime — never commit secret keys)
+keys/
+*.key

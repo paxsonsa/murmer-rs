@@ -106,12 +106,7 @@ mod tests {
 
     fn make_node(name: &str, incarnation: u64, class: NodeClass) -> NodeInfo {
         NodeInfo::new(
-            NodeIdentity {
-                name: name.into(),
-                host: "127.0.0.1".into(),
-                port: 7100,
-                incarnation,
-            },
+            NodeIdentity::for_test(name, incarnation),
             class,
             HashMap::new(),
         )
@@ -126,7 +121,12 @@ mod tests {
 
         let election = OldestNode::any();
         let leader = election.elect(&view).unwrap();
-        assert!(leader.contains("alpha"), "expected alpha, got {leader}");
+        assert!(
+            leader.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string()
+            ),
+            "expected alpha, got {leader}"
+        );
     }
 
     #[test]
@@ -141,7 +141,12 @@ mod tests {
 
         let election = OldestNode::any();
         let leader = election.elect(&view).unwrap();
-        assert!(leader.contains("beta"), "expected beta, got {leader}");
+        assert!(
+            leader.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
+            "expected beta, got {leader}"
+        );
     }
 
     #[test]
@@ -154,7 +159,12 @@ mod tests {
 
         let election = OldestNode::with_class(NodeClass::Coordinator);
         let leader = election.elect(&view).unwrap();
-        assert!(leader.contains("beta"), "expected beta, got {leader}");
+        assert!(
+            leader.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
+            "expected beta, got {leader}"
+        );
     }
 
     #[test]

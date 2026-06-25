@@ -5,10 +5,11 @@
 //! channel, looks up the target actor's dispatch channel via the receptionist,
 //! and forwards the request. Responses are sent back through the response channel.
 //!
-//! In the real cluster implementation, this role is handled by
-//! [`cluster::remote::handle_actor_stream`](crate::cluster::remote::handle_actor_stream)
-//! which operates directly on QUIC streams. This function is primarily used
-//! for testing and simulated multi-node scenarios.
+//! In the real cluster implementation, this role is handled by the inbound
+//! stream handlers in the cluster event loop (`cluster::mod`'s
+//! `handle_incoming_stream` / `handle_actor_stream_after_init`), which operate
+//! over the [`Net`](crate::cluster::net::Net) seam. This function is primarily
+//! used for testing and simulated multi-node scenarios.
 
 use std::sync::Arc;
 

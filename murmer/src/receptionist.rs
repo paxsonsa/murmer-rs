@@ -20,12 +20,11 @@
 //! This design means the receptionist never needs to be generic over actor types.
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +41,7 @@ use crate::listing::{
 };
 use crate::oplog::{Op, OpLog, OpType, VersionVector};
 use crate::ready::ReadyHandle;
+use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::supervisor::{run_supervisor, should_restart};
 use crate::wire::{DispatchRequest, EnvelopeProxy, RemoteInvocation, ResponseRegistry};
 
@@ -253,7 +253,11 @@ struct PendingListingNotification {
 
 struct ReceptionistInner {
     config: ReceptionistConfig,
-    entries: Mutex<HashMap<String, ActorEntry>>,
+    // BTreeMap (not HashMap): iteration order over entries is observable — the
+    // listing()/watched_listing() backfill loops emit endpoints into the listing
+    // channel in iteration order, which a deterministic sim must reproduce.
+    // Keyed by label (String: Ord), so by-key access is unchanged.
+    entries: Mutex<BTreeMap<String, ActorEntry>>,
     event_subscribers: Mutex<Vec<mpsc::UnboundedSender<ActorEvent>>>,
     listing_subscribers: Mutex<Vec<Box<dyn ErasedListingSender>>>,
     watched_listing_subscribers: Mutex<Vec<Box<dyn ErasedWatchedListingSender>>>,
@@ -261,7 +265,10 @@ struct ReceptionistInner {
     observed_versions: Mutex<VersionVector>,
     watches: Mutex<HashMap<String, Vec<WatchEntry>>>,
     pending_notifications: Mutex<Vec<PendingListingNotification>>,
-    blip_pending: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    blip_pending: Mutex<HashMap<String, SpawnHandle>>,
+    /// The runtime seam: all supervisor/background spawns and timers go through
+    /// this, so a deterministic `SimRuntime` can drive the whole node.
+    runtime: Arc<dyn Runtime>,
 }
 
 // =============================================================================
@@ -310,13 +317,20 @@ impl Receptionist {
     }
 
     pub fn with_config(config: ReceptionistConfig) -> Self {
+        Self::with_config_and_runtime(config, Arc::new(TokioRuntime))
+    }
+
+    /// Build a receptionist on a specific [`Runtime`]. The runtime drives every
+    /// supervisor task, scheduled timer, and the notification-flush loop, so a
+    /// deterministic runtime makes the whole node deterministic.
+    pub fn with_config_and_runtime(config: ReceptionistConfig, runtime: Arc<dyn Runtime>) -> Self {
         let node_id = config.node_id.clone();
         let flush_interval = config.flush_interval;
 
         let receptionist = Self {
             inner: Arc::new(ReceptionistInner {
                 config,
-                entries: Mutex::new(HashMap::new()),
+                entries: Mutex::new(BTreeMap::new()),
                 event_subscribers: Mutex::new(Vec::new()),
                 listing_subscribers: Mutex::new(Vec::new()),
                 watched_listing_subscribers: Mutex::new(Vec::new()),
@@ -325,22 +339,29 @@ impl Receptionist {
                 watches: Mutex::new(HashMap::new()),
                 pending_notifications: Mutex::new(Vec::new()),
                 blip_pending: Mutex::new(HashMap::new()),
+                runtime,
             }),
         };
 
-        // Spawn the flush task if configured
+        // Spawn the flush task if configured. A self-rescheduling sleep loop
+        // (rather than a tokio interval) keeps it on the runtime seam.
         if let Some(interval) = flush_interval {
             let r = receptionist.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
+            let runtime = receptionist.inner.runtime.clone();
+            receptionist.inner.runtime.spawn(Box::pin(async move {
                 loop {
-                    ticker.tick().await;
+                    runtime.sleep(interval).await;
                     r.flush_pending_notifications();
                 }
-            });
+            }));
         }
 
         receptionist
+    }
+
+    /// The runtime seam this receptionist (and its actors) run on.
+    pub fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.inner.runtime
     }
 
     pub fn node_id(&self) -> &str {
@@ -389,7 +410,7 @@ impl Receptionist {
         };
 
         // Spawn the supervisor task
-        tokio::spawn(async move {
+        self.inner.runtime.spawn(Box::pin(async move {
             let _ = run_supervisor(
                 actor,
                 state,
@@ -402,7 +423,7 @@ impl Receptionist {
                 guard,
             )
             .await;
-        });
+        }));
 
         // Create the user's endpoint
         let endpoint = Endpoint::local(mailbox_tx.clone());
@@ -509,7 +530,7 @@ impl Receptionist {
             reply_token: std::sync::Mutex::new(None),
         };
 
-        tokio::spawn(async move {
+        self.inner.runtime.spawn(Box::pin(async move {
             let _ = run_supervisor(
                 actor,
                 state,
@@ -522,7 +543,7 @@ impl Receptionist {
                 guard,
             )
             .await;
-        });
+        }));
 
         let endpoint = Endpoint::local(mailbox_tx.clone());
 
@@ -768,9 +789,13 @@ impl Receptionist {
         let receptionist = self.clone();
         let label_owned = label.to_string();
         let node_id = self.inner.config.node_id.clone();
+        let runtime = self.inner.runtime.clone();
 
-        tokio::spawn(async move {
-            let mut restart_times: VecDeque<Instant> = VecDeque::new();
+        self.inner.runtime.spawn(Box::pin(async move {
+            // Virtual time from the runtime seam (Duration since start), not
+            // wall-clock Instant — so restart-rate limiting is deterministic
+            // under simulation.
+            let mut restart_times: VecDeque<Duration> = VecDeque::new();
             let mut backoff_duration = config.backoff.initial;
 
             // First run uses the actor/state/channels created above
@@ -797,10 +822,10 @@ impl Receptionist {
             // Restart loop with limits and backoff
             loop {
                 // Prune timestamps outside the rolling window
-                let now = Instant::now();
+                let now = runtime.now();
                 while restart_times
                     .front()
-                    .is_some_and(|t| now.duration_since(*t) > config.window)
+                    .is_some_and(|t| now.saturating_sub(*t) > config.window)
                 {
                     restart_times.pop_front();
                 }
@@ -841,7 +866,7 @@ impl Receptionist {
                 restart_times.push_back(now);
 
                 // Apply backoff delay
-                tokio::time::sleep(backoff_duration).await;
+                runtime.sleep(backoff_duration).await;
                 backoff_duration = Duration::from_secs_f64(
                     (backoff_duration.as_secs_f64() * config.backoff.multiplier)
                         .min(config.backoff.max.as_secs_f64()),
@@ -919,7 +944,7 @@ impl Receptionist {
                     break;
                 }
             }
-        });
+        }));
 
         endpoint
     }
@@ -1523,8 +1548,15 @@ impl Receptionist {
             let key_ids = key_ids.to_vec();
 
             let label_for_insert = label_owned.clone();
-            let handle = tokio::spawn(async move {
-                tokio::time::sleep(window).await;
+            // Routed through the Runtime seam so the blip debounce is sim-runnable:
+            // a raw tokio::spawn + tokio::time::sleep would panic under SimWorld
+            // (no reactor / no timer driver), and `runtime.sleep` runs on virtual
+            // time under sim. This path is reachable only when a consumer sets a
+            // non-default `blip_window`.
+            let runtime = self.inner.runtime.clone();
+            let sleep_rt = runtime.clone();
+            let handle = runtime.spawn(Box::pin(async move {
+                sleep_rt.sleep(window).await;
 
                 // If the actor is still registered after the window, commit the op
                 let still_exists = receptionist
@@ -1556,7 +1588,7 @@ impl Receptionist {
                     .lock()
                     .unwrap()
                     .remove(&label_owned);
-            });
+            }));
 
             self.inner
                 .blip_pending

@@ -116,7 +116,11 @@ impl<A: Actor + RemoteDispatch + 'static> ReadyHandle<A> {
             .take()
             .expect("ReadyHandle: deregister_guard already taken");
 
-        tokio::spawn(async move {
+        // Route through the runtime seam (not tokio::spawn directly) so a
+        // deferred-start actor runs on whatever runtime the system was built
+        // with — including a deterministic sim runtime.
+        let runtime = ctx.receptionist.runtime().clone();
+        runtime.spawn(Box::pin(async move {
             let _ = run_supervisor(
                 actor,
                 state,
@@ -129,6 +133,6 @@ impl<A: Actor + RemoteDispatch + 'static> ReadyHandle<A> {
                 guard,
             )
             .await;
-        });
+        }));
     }
 }

@@ -96,6 +96,24 @@ impl System {
         }
     }
 
+    /// Create a local system on a custom [`Runtime`](crate::runtime::Runtime).
+    ///
+    /// Behaves exactly like [`local()`](Self::local) but routes every supervisor
+    /// task, scheduled timer, and background loop through the supplied runtime.
+    /// Pair it with a deterministic `SimRuntime` (feature `sim`) to drive the
+    /// whole node from a seed — this is what [`SimWorld`](crate::sim::SimWorld)
+    /// uses under the hood.
+    pub fn with_runtime(runtime: std::sync::Arc<dyn crate::runtime::Runtime>) -> Self {
+        Self {
+            inner: SystemInner::Local {
+                receptionist: Receptionist::with_config_and_runtime(
+                    crate::receptionist::ReceptionistConfig::default(),
+                    runtime,
+                ),
+            },
+        }
+    }
+
     /// Create a clustered system with QUIC transport and automatic discovery.
     ///
     /// Binds a QUIC listener, starts SWIM membership, and begins peer
@@ -107,6 +125,27 @@ impl System {
         spawn_registry: SpawnRegistry,
     ) -> Result<Self, ClusterError> {
         let cluster = ClusterSystem::start(config, type_registry, spawn_registry).await?;
+        Ok(Self {
+            inner: SystemInner::Clustered {
+                cluster: Box::new(cluster),
+            },
+        })
+    }
+
+    /// Like [`clustered`](Self::clustered) but on an explicit [`Runtime`]
+    /// (`crate::runtime::Runtime`) — the deterministic `SimRuntime` under
+    /// simulation, so the whole cluster runs on the virtual clock. The entire
+    /// cluster (event loop, foca timers, spawned stream handlers) is driven by
+    /// `runtime`. `clustered` is the production (Tokio) path.
+    pub async fn clustered_with_runtime(
+        config: ClusterConfig,
+        type_registry: TypeRegistry,
+        spawn_registry: SpawnRegistry,
+        runtime: std::sync::Arc<dyn crate::runtime::Runtime>,
+    ) -> Result<Self, ClusterError> {
+        let cluster =
+            ClusterSystem::start_with_runtime(config, type_registry, spawn_registry, runtime)
+                .await?;
         Ok(Self {
             inner: SystemInner::Clustered {
                 cluster: Box::new(cluster),
@@ -442,6 +481,36 @@ impl System {
         match &self.inner {
             SystemInner::Local { .. } => None,
             SystemInner::Clustered { cluster } => Some(cluster.local_addr()),
+        }
+    }
+
+    /// This node's iroh endpoint id, if clustered. Combine with [`local_addr`]
+    /// to build an [`iroh::EndpointAddr`] other nodes can use as a seed.
+    ///
+    /// [`local_addr`]: Self::local_addr
+    pub fn endpoint_id(&self) -> Option<iroh::EndpointId> {
+        match &self.inner {
+            SystemInner::Local { .. } => None,
+            // The identity now carries a transport-neutral `NodeId`; parse it back
+            // into an iroh key for this iroh-typed convenience accessor.
+            SystemInner::Clustered { cluster } => cluster.identity().endpoint_id.0.parse().ok(),
+        }
+    }
+
+    /// This node's iroh [`EndpointAddr`](iroh::EndpointAddr) (endpoint id +
+    /// bound address) — a ready-made seed for other nodes to dial. `None` if not
+    /// clustered.
+    pub fn endpoint_addr(&self) -> Option<iroh::EndpointAddr> {
+        match &self.inner {
+            SystemInner::Local { .. } => None,
+            SystemInner::Clustered { cluster } => {
+                cluster.identity().endpoint_id.0.parse().ok().map(|id| {
+                    iroh::EndpointAddr::from_parts(
+                        id,
+                        [iroh::TransportAddr::Ip(cluster.local_addr())],
+                    )
+                })
+            }
         }
     }
 }

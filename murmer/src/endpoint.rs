@@ -177,7 +177,7 @@ impl<A: Actor + 'static> Endpoint<A> {
             } => {
                 instrument::send_remote(actor_type);
                 #[cfg(feature = "monitor")]
-                let start = std::time::Instant::now();
+                let start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (remote-path measurement, not control flow)
 
                 let call_id = next_call_id();
                 let payload = bincode::serde::encode_to_vec(&message, bincode::config::standard())
@@ -266,7 +266,7 @@ impl<A: Actor + 'static> Endpoint<A> {
             } => {
                 instrument::send_remote(actor_type);
                 #[cfg(feature = "monitor")]
-                let start = std::time::Instant::now();
+                let start = std::time::Instant::now(); // determinism-gate: allow — monitor instrumentation (remote-path measurement, not control flow)
 
                 // Remote path is identical — serialization doesn't care about sync/async
                 let call_id = next_call_id();

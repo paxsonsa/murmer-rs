@@ -28,7 +28,7 @@ use murmer::prelude::*;
 use murmer_cluster_tests::actors::{CatalogLike, CatalogState, Whoami};
 
 fn init() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    murmer::cluster::install_default_crypto();
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 }
 
@@ -36,10 +36,12 @@ fn init() {
 fn node_config(
     name: &str,
     class: NodeClass,
-    seeds: &[SocketAddr],
+    seeds: &[iroh::EndpointAddr],
 ) -> murmer::cluster::config::ClusterConfig {
     let mut builder = ClusterConfigBuilder::new()
         .name(name)
+        // Distinct per-node iroh identity (avoid the shared-default-key collision).
+        .secret_key(iroh::SecretKey::generate())
         .listen("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .cookie("singleton-test")
         .discovery(Discovery::None)
@@ -158,6 +160,7 @@ async fn notify_joined(
             node_id: identity.node_id_string(),
             info: SerializableNodeInfo {
                 name: name.into(),
+                endpoint_id: identity.endpoint_id.clone(),
                 host: identity.host.clone(),
                 port: identity.port,
                 incarnation: identity.incarnation,
@@ -215,7 +218,11 @@ async fn test_singleton_starts_and_runs_on_single_node() {
     // Ownership flips to Active once the spawn ack is observed.
     let active = wait_for_singleton_active(&coord_ep, "catalog", Duration::from_secs(10)).await;
     assert_eq!(active.phase, SingletonPhase::Active);
-    assert!(active.owner_node_id.unwrap().contains("solo"));
+    assert_eq!(
+        active.owner_node_id.as_deref(),
+        Some(cluster.identity().node_id_string().as_str()),
+        "the single node owns the singleton"
+    );
 
     node.shutdown().await;
 }
@@ -234,17 +241,25 @@ async fn test_singleton_fails_over_on_owner_departure_with_higher_term() {
     )
     .await
     .unwrap();
-    let gw_addr = gateway.local_addr().unwrap();
+    let gw_addr = gateway.endpoint_addr().unwrap();
 
     let worker_a = System::clustered(
-        node_config("worker-a", NodeClass::Worker, &[gw_addr]),
+        node_config(
+            "worker-a",
+            NodeClass::Worker,
+            std::slice::from_ref(&gw_addr),
+        ),
         TypeRegistry::from_auto(),
         catalog_registry(),
     )
     .await
     .unwrap();
     let worker_b = System::clustered(
-        node_config("worker-b", NodeClass::Worker, &[gw_addr]),
+        node_config(
+            "worker-b",
+            NodeClass::Worker,
+            std::slice::from_ref(&gw_addr),
+        ),
         TypeRegistry::from_auto(),
         catalog_registry(),
     )
@@ -287,14 +302,16 @@ async fn test_singleton_fails_over_on_owner_departure_with_higher_term() {
         .unwrap();
     assert_eq!(first.generation.term, 1);
     let first_owner = first.owner_node_id.clone().unwrap();
+    let a_node_id = a_id.node_id_string();
+    let b_node_id = b_id.node_id_string();
     assert!(
-        first_owner.contains("worker-a") || first_owner.contains("worker-b"),
+        first_owner == a_node_id || first_owner == b_node_id,
         "owner should be a worker, got {first_owner}"
     );
     wait_for_singleton_active(&coord_ep, "catalog", Duration::from_secs(10)).await;
 
     // Gracefully shut down the owner worker → NodeLeft → fenced re-drive.
-    if first_owner.contains("worker-a") {
+    if first_owner == a_node_id {
         worker_a.shutdown().await;
     } else {
         worker_b.shutdown().await;
@@ -314,7 +331,7 @@ async fn test_singleton_fails_over_on_owner_departure_with_higher_term() {
     );
 
     gateway.shutdown().await;
-    if first_owner.contains("worker-a") {
+    if first_owner == a_node_id {
         worker_b.shutdown().await;
     } else {
         worker_a.shutdown().await;

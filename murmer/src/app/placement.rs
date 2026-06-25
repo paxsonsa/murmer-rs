@@ -142,12 +142,31 @@ impl PlacementStrategy for LeastLoaded {
 ///
 /// All eligible nodes get equal fitness, so the winner depends on
 /// floating-point comparison of random values — effectively uniform random.
-pub struct RandomPlacement;
+pub struct RandomPlacement {
+    /// Seeded RNG behind a mutex. `fitness` takes `&self`, so the draw needs
+    /// interior mutability; the sim is single-threaded so this never contends.
+    /// Seeding off the world seed is what makes placement replay deterministically
+    /// (the old `rand::rng()` form drew from global OS entropy and diverged
+    /// run-to-run on the same seed, silently breaking the simulation guarantee).
+    rng: std::sync::Mutex<rand::rngs::StdRng>,
+}
+
+impl RandomPlacement {
+    /// Seed the placement RNG. Under simulation pass `world.derive_seed("placement")`
+    /// (or any per-run derived seed) so placement decisions descend from the world
+    /// seed; in production seed from a source of your choosing.
+    pub fn new(seed: u64) -> Self {
+        use rand::SeedableRng;
+        Self {
+            rng: std::sync::Mutex::new(rand::rngs::StdRng::seed_from_u64(seed)),
+        }
+    }
+}
 
 impl PlacementStrategy for RandomPlacement {
     fn fitness(&self, _node: &NodeInfo, _spec: &ActorSpec, _view: &ClusterView) -> f64 {
         use rand::Rng;
-        rand::rng().random::<f64>()
+        self.rng.lock().unwrap().random::<f64>()
     }
 
     fn name(&self) -> &str {
@@ -184,12 +203,7 @@ mod tests {
 
     fn make_node(name: &str, incarnation: u64, actors: Vec<String>) -> NodeInfo {
         NodeInfo {
-            identity: NodeIdentity {
-                name: name.into(),
-                host: "127.0.0.1".into(),
-                port: 7100,
-                incarnation,
-            },
+            identity: NodeIdentity::for_test(name, incarnation),
             class: NodeClass::Worker,
             metadata: HashMap::new(),
             running_actors: actors,
@@ -217,7 +231,9 @@ mod tests {
 
         // Beta has 0 actors, alpha has 2 — beta should win
         assert!(
-            decision.node_id.contains("beta"),
+            decision.node_id.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "expected beta, got {}",
             decision.node_id
         );
@@ -266,7 +282,11 @@ mod tests {
         let alpha_id = view
             .nodes
             .keys()
-            .find(|k| k.contains("alpha"))
+            .find(|k| {
+                k.contains(
+                    &crate::cluster::config::NodeIdentity::test_endpoint_id("alpha").to_string(),
+                )
+            })
             .unwrap()
             .clone();
         view.mark_failed(&alpha_id);
@@ -276,7 +296,9 @@ mod tests {
 
         // Only beta is alive
         assert!(
-            decision.node_id.contains("beta"),
+            decision.node_id.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "expected beta, got {}",
             decision.node_id
         );
@@ -298,7 +320,9 @@ mod tests {
         );
         let decision = select_node(&LeastLoaded, &spec, &view).unwrap();
         assert!(
-            decision.node_id.contains("beta"),
+            decision.node_id.contains(
+                &crate::cluster::config::NodeIdentity::test_endpoint_id("beta").to_string()
+            ),
             "colocate_with should pin to the anchor's node (beta), got {}",
             decision.node_id
         );

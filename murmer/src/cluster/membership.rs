@@ -4,16 +4,18 @@
 //! protocol notifications into [`ClusterEvent`]s that drive the rest
 //! of the cluster system (connection management, receptionist sync, etc.).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use foca::{BincodeCodec, Foca, Notification, Runtime, Timer};
-use futures_util::StreamExt;
 use rand::SeedableRng;
 use tokio::sync::{broadcast, mpsc};
-use tokio_util::time::DelayQueue;
 
 use crate::instrument;
+// The Runtime *seam* (Tokio in prod, SimRuntime in sim). Aliased so it doesn't
+// collide with foca's own `Runtime` trait, which `FocaRuntime` implements.
+use crate::runtime::Runtime as SeamRuntime;
 
 use super::config::NodeIdentity;
 
@@ -62,13 +64,112 @@ pub enum ClusterEvent {
 }
 
 // =============================================================================
-// TIMER EVENTS — bridge foca timers into tokio
+// TIMER EVENTS — bridge foca timers onto the runtime seam
 // =============================================================================
 
 #[derive(Debug)]
 pub struct TimerEvent {
     pub timer: Timer<NodeIdentity>,
     pub timer_id: u64,
+}
+
+/// Commands sent from `FocaRuntime` to the centralized timer manager task.
+pub(crate) enum TimerCommand {
+    /// Schedule a timer to fire after the given duration.
+    Insert {
+        timer: Timer<NodeIdentity>,
+        timer_id: u64,
+        delay: Duration,
+    },
+    /// Cancel all pending timers (used during shutdown).
+    CancelAll,
+}
+
+/// A timer scheduled at an absolute deadline (on the runtime clock). Ordered by
+/// `(deadline, seq)` so the manager's min-heap fires due timers in a single
+/// deterministic order — `seq` (monotonic insertion index) breaks deadline ties
+/// reproducibly, which `tokio_util`'s `DelayQueue` did not guarantee.
+struct Scheduled {
+    deadline: Duration,
+    seq: u64,
+    event: TimerEvent,
+}
+
+impl PartialEq for Scheduled {
+    fn eq(&self, other: &Self) -> bool {
+        (self.deadline, self.seq) == (other.deadline, other.seq)
+    }
+}
+impl Eq for Scheduled {}
+impl Ord for Scheduled {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.deadline, self.seq).cmp(&(other.deadline, other.seq))
+    }
+}
+impl PartialOrd for Scheduled {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A single task that owns the timer heap and fires due foca timers, on the
+/// runtime seam. Replaces the old `tokio_util::DelayQueue` manager: under
+/// `SimRuntime` the `runtime.sleep` to the next deadline registers on the
+/// virtual clock, so `advance()` fires foca's timers deterministically; under
+/// Tokio it behaves like the queue did. One task, drained when `FocaRuntime`
+/// drops its `cmd_tx` — so teardown stays clean (no per-timer task leak).
+pub(crate) fn spawn_timer_manager(
+    runtime: Arc<dyn SeamRuntime>,
+    timer_tx: mpsc::UnboundedSender<TimerEvent>,
+) -> mpsc::UnboundedSender<TimerCommand> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TimerCommand>();
+    let sleep_rt = Arc::clone(&runtime);
+
+    runtime.spawn(Box::pin(async move {
+        let mut heap: BinaryHeap<Reverse<Scheduled>> = BinaryHeap::new();
+        let mut seq: u64 = 0;
+
+        loop {
+            let now = sleep_rt.now();
+            let next_deadline = heap.peek().map(|Reverse(s)| s.deadline);
+
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(TimerCommand::Insert { timer, timer_id, delay }) => {
+                            heap.push(Reverse(Scheduled {
+                                deadline: now + delay,
+                                seq,
+                                event: TimerEvent { timer, timer_id },
+                            }));
+                            seq += 1;
+                        }
+                        Some(TimerCommand::CancelAll) => heap.clear(),
+                        None => break, // FocaRuntime dropped its cmd_tx → exit
+                    }
+                }
+                // Sleep until the earliest deadline, then drain everything due.
+                _ = sleep_rt.sleep(next_deadline.unwrap_or(Duration::ZERO).saturating_sub(now)),
+                    if next_deadline.is_some() =>
+                {
+                    let now = sleep_rt.now();
+                    while let Some(Reverse(s)) = heap.peek() {
+                        if s.deadline <= now {
+                            let Reverse(s) = heap.pop().unwrap();
+                            let _ = timer_tx.send(s.event);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }));
+
+    cmd_tx
 }
 
 // =============================================================================
@@ -87,9 +188,17 @@ pub struct ClusterMembership {
 }
 
 impl ClusterMembership {
-    pub fn new(identity: NodeIdentity, event_tx: broadcast::Sender<ClusterEvent>) -> Self {
+    /// `foca_seed` seeds foca's PRNG (probe-target selection, gossip fanout,
+    /// suspicion jitter). Callers pass `runtime.derive_seed("foca-prng")`: fresh
+    /// entropy under `TokioRuntime` (production stays randomized), a reproducible
+    /// value under `SimRuntime` (deterministic membership).
+    pub fn new(
+        identity: NodeIdentity,
+        event_tx: broadcast::Sender<ClusterEvent>,
+        foca_seed: u64,
+    ) -> Self {
         let config = foca::Config::simple();
-        let rng = rand::rngs::StdRng::from_os_rng();
+        let rng = rand::rngs::StdRng::seed_from_u64(foca_seed);
         let foca = Foca::new(
             identity,
             config,
@@ -102,75 +211,22 @@ impl ClusterMembership {
 }
 
 // =============================================================================
-// TIMER COMMANDS — sent from FocaRuntime to the centralized timer manager
+// FOCA RUNTIME — implements foca::Runtime over the Runtime seam
 // =============================================================================
 
-/// Commands sent from FocaRuntime to the centralized timer manager task.
-pub(crate) enum TimerCommand {
-    /// Schedule a timer to fire after the given duration.
-    Insert {
-        timer: Timer<NodeIdentity>,
-        timer_id: u64,
-        delay: Duration,
-    },
-    /// Cancel all pending timers (used during shutdown).
-    CancelAll,
-}
-
-/// Spawns a task that owns a single `DelayQueue` and processes timer commands.
-///
-/// Instead of spawning one tokio task per foca timer, all timers are managed
-/// by this single task through a `DelayQueue`. Expired timers are forwarded
-/// to `timer_tx` for the main event loop to process.
-pub(crate) fn spawn_timer_manager(
-    timer_tx: mpsc::UnboundedSender<TimerEvent>,
-) -> mpsc::UnboundedSender<TimerCommand> {
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TimerCommand>();
-
-    tokio::spawn(async move {
-        let mut queue = DelayQueue::new();
-
-        loop {
-            tokio::select! {
-                // Process commands from FocaRuntime
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(TimerCommand::Insert { timer, timer_id, delay }) => {
-                            queue.insert(TimerEvent { timer, timer_id }, delay);
-                        }
-                        Some(TimerCommand::CancelAll) => {
-                            queue.clear();
-                        }
-                        None => break, // command channel closed, exit
-                    }
-                }
-                // Fire expired timers
-                Some(expired) = queue.next(), if !queue.is_empty() => {
-                    let timer_event = expired.into_inner();
-                    let _ = timer_tx.send(timer_event);
-                }
-            }
-        }
-    });
-
-    cmd_tx
-}
-
-// =============================================================================
-// FOCA RUNTIME — implements foca::Runtime for tokio integration
-// =============================================================================
-
-/// Bridges foca's synchronous `Runtime` trait into async tokio land.
+/// Bridges foca's synchronous `Runtime` trait onto the async [`SeamRuntime`].
 ///
 /// - `notify()`: converts foca Notifications into ClusterEvents
 /// - `send_to()`: queues SWIM bytes to be sent over control streams
-/// - `submit_after()`: schedules timers via a centralized `DelayQueue` manager
+/// - `submit_after()`: schedules a timer as a `runtime.sleep` task (so foca
+///   timers fire on the virtual clock under `SimRuntime`, and on real time under
+///   Tokio) via the centralized [`spawn_timer_manager`] task.
 pub struct FocaRuntime {
     event_tx: broadcast::Sender<ClusterEvent>,
     local_identity: NodeIdentity,
     /// Outbound SWIM data: (target_addr, data)
     swim_tx: mpsc::UnboundedSender<(NodeIdentity, Vec<u8>)>,
-    /// Command channel to the centralized timer manager task
+    /// Command channel to the centralized timer manager task.
     timer_cmd_tx: mpsc::UnboundedSender<TimerCommand>,
     timer_id_counter: AtomicU64,
 }
@@ -254,13 +310,13 @@ impl Drop for FocaRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::TokioRuntime;
 
     #[tokio::test]
-    async fn test_timer_manager_fires_timer() {
+    async fn timer_manager_fires_timer() {
         let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<TimerEvent>();
-        let cmd_tx = spawn_timer_manager(timer_tx);
+        let cmd_tx = spawn_timer_manager(Arc::new(TokioRuntime), timer_tx);
 
-        // Insert a timer with a short delay
         cmd_tx
             .send(TimerCommand::Insert {
                 timer: Timer::ProbeRandomMember(0),
@@ -269,21 +325,18 @@ mod tests {
             })
             .unwrap();
 
-        // Wait for the timer to fire
         let event = tokio::time::timeout(Duration::from_secs(1), timer_rx.recv())
             .await
             .expect("timer should fire within 1s")
             .expect("channel should not close");
-
         assert_eq!(event.timer_id, 1);
     }
 
     #[tokio::test]
-    async fn test_timer_manager_cancel_all() {
+    async fn timer_manager_cancel_all_prevents_firing() {
         let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<TimerEvent>();
-        let cmd_tx = spawn_timer_manager(timer_tx);
+        let cmd_tx = spawn_timer_manager(Arc::new(TokioRuntime), timer_tx);
 
-        // Insert a timer with a longer delay
         cmd_tx
             .send(TimerCommand::Insert {
                 timer: Timer::ProbeRandomMember(0),
@@ -291,12 +344,83 @@ mod tests {
                 delay: Duration::from_millis(200),
             })
             .unwrap();
-
-        // Cancel before it fires
         cmd_tx.send(TimerCommand::CancelAll).unwrap();
 
-        // Verify it doesn't fire
         let result = tokio::time::timeout(Duration::from_millis(400), timer_rx.recv()).await;
-        assert!(result.is_err(), "timer should NOT fire after CancelAll");
+        assert!(result.is_err(), "timer must NOT fire after CancelAll");
+    }
+
+    #[tokio::test]
+    async fn timer_manager_fires_in_deadline_order() {
+        // Insert out of order; the heap must deliver by (deadline, seq).
+        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<TimerEvent>();
+        let cmd_tx = spawn_timer_manager(Arc::new(TokioRuntime), timer_tx);
+
+        for (timer_id, ms) in [(1u64, 60u64), (2, 20), (3, 40)] {
+            cmd_tx
+                .send(TimerCommand::Insert {
+                    timer: Timer::ProbeRandomMember(0),
+                    timer_id,
+                    delay: Duration::from_millis(ms),
+                })
+                .unwrap();
+        }
+
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(Duration::from_secs(1), timer_rx.recv())
+                .await
+                .expect("timer fires")
+                .expect("channel open");
+            order.push(ev.timer_id);
+        }
+        assert_eq!(order, vec![2, 3, 1], "earliest deadline first");
+    }
+
+    /// The linchpin of the pump-only multi-node convergence proof: foca emits
+    /// `MemberUp` **synchronously** during `apply_many` (it takes `&mut runtime`
+    /// precisely so it can `notify` inline). There is no `announce` call anywhere
+    /// in the cluster — production learns a peer exactly this way, on each
+    /// handshake — so a node's `NodeJoined` needs no timer or gossip round to
+    /// fire. This is why the 3-node `MemberUp` simulation converges on `pump()`
+    /// alone, without advancing the virtual clock (which would instead start the
+    /// failure detector — Phase 3 territory).
+    #[cfg(feature = "sim")]
+    #[test]
+    fn apply_many_emits_member_up_synchronously_under_sim() {
+        use crate::cluster::net::NodeId;
+        use crate::sim::SimRuntime;
+
+        let rt: Arc<dyn SeamRuntime> = Arc::new(SimRuntime::new(1));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let local =
+            NodeIdentity::new_seeded("local", NodeId("local-id".into()), "127.0.0.1", 7001, 1);
+        let mut membership =
+            ClusterMembership::new(local.clone(), event_tx.clone(), rt.derive_seed("foca-prng"));
+
+        let (swim_tx, _swim_rx) = mpsc::unbounded_channel();
+        let (timer_tx, _timer_rx) = mpsc::unbounded_channel();
+        let timer_cmd_tx = spawn_timer_manager(Arc::clone(&rt), timer_tx);
+        let mut foca_rt = FocaRuntime::new(local, event_tx, swim_tx, timer_cmd_tx);
+
+        let other =
+            NodeIdentity::new_seeded("other", NodeId("other-id".into()), "127.0.0.1", 7002, 1);
+        membership
+            .foca
+            .apply_many(
+                std::iter::once(foca::Member::alive(other.clone())),
+                false,
+                &mut foca_rt,
+            )
+            .expect("apply_many succeeds");
+
+        // No pump, no advance: the notification is already on the channel.
+        match event_rx.try_recv() {
+            Ok(ClusterEvent::NodeJoined(id)) => {
+                assert_eq!(id.endpoint_id, other.endpoint_id, "joined peer is `other`");
+            }
+            got => panic!("expected NodeJoined synchronously, got {got:?}"),
+        }
     }
 }
