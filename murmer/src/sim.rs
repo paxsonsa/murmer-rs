@@ -224,10 +224,11 @@ impl ReadyState {
     /// Take all currently-ready ids for the policy to order. Clears the dedup set:
     /// a task re-woken while its id is already in the driver's working batch will
     /// be re-enqueued — at worst one extra, harmless poll (futures tolerate
-    /// spurious polls).
-    fn drain(&mut self) -> Vec<TaskId> {
+    /// spurious polls). Returns the queue itself (wake order preserved) so the
+    /// driver can pop the front in O(1).
+    fn drain(&mut self) -> VecDeque<TaskId> {
         self.queued.clear();
-        self.queue.drain(..).collect()
+        std::mem::take(&mut self.queue)
     }
 }
 
@@ -251,8 +252,10 @@ impl ArcWake for SimWaker {
 /// nasty interleavings. Implementations must be deterministic given their own
 /// state, and must not spawn tasks or touch the runtime — they only choose order.
 pub trait ReadyPolicy {
-    /// `ready` is always non-empty. The returned index must be in bounds.
-    fn pick(&mut self, ready: &[TaskId]) -> usize;
+    /// `ready` is always non-empty. The returned index must be in bounds. Index
+    /// `0` is the front (oldest wake), removed in O(1); a non-zero index costs
+    /// O(n) to remove, so prefer the front unless deliberately reordering.
+    fn pick(&mut self, ready: &VecDeque<TaskId>) -> usize;
 }
 
 /// The default policy: always poll the earliest-woken ready task. Draws no
@@ -261,7 +264,7 @@ pub trait ReadyPolicy {
 pub struct FifoPolicy;
 
 impl ReadyPolicy for FifoPolicy {
-    fn pick(&mut self, _ready: &[TaskId]) -> usize {
+    fn pick(&mut self, _ready: &VecDeque<TaskId>) -> usize {
         0
     }
 }
@@ -292,7 +295,7 @@ impl RandomPolicy {
 }
 
 impl ReadyPolicy for RandomPolicy {
-    fn pick(&mut self, ready: &[TaskId]) -> usize {
+    fn pick(&mut self, ready: &VecDeque<TaskId>) -> usize {
         // Modulo over a tiny ready set; the negligible bias is irrelevant to a
         // fault explorer (it only needs to reach orderings, not sample uniformly).
         (self.rng.next_u64() % ready.len() as u64) as usize
@@ -347,7 +350,7 @@ impl SimExecutor {
     }
 
     /// Take the currently-ready ids (drains the shared ready set).
-    fn take_ready(&self) -> Vec<TaskId> {
+    fn take_ready(&self) -> VecDeque<TaskId> {
         self.ready.lock().unwrap().drain()
     }
 }
@@ -518,7 +521,14 @@ impl SimWorld {
             }
             while !ready.is_empty() {
                 let idx = self.policy.pick(&ready);
-                let id = ready.remove(idx);
+                // Front removal (the FifoPolicy default) is O(1); a non-zero
+                // index falls back to an order-preserving O(n) remove, which only
+                // the deliberately-tiny RandomPolicy sets ever hit.
+                let id = if idx == 0 {
+                    ready.pop_front().expect("ready is non-empty")
+                } else {
+                    ready.remove(idx).expect("policy index in bounds")
+                };
                 self.executor.poll_task(id);
                 // Fold in anything this poll woke before picking the next task.
                 ready.extend(self.executor.take_ready());
