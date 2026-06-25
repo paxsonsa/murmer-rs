@@ -69,10 +69,9 @@ const BASE_PORT: u16 = 7001;
 
 /// Install the rustls ring provider (idempotent). Needed only because the sim
 /// [`ClusterConfig`] carries a throwaway `iroh::SecretKey` whose construction
-/// touches the crypto provider; nothing in the sim path uses the network. Mirrors
-/// the `install_crypto` helper the hand-written tests called.
+/// touches the crypto provider; nothing in the sim path uses the network.
 fn install_crypto() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::cluster::install_default_crypto();
 }
 
 /// A [`ClusterConfig`] for a sim node: built through the normal builder, then its
@@ -724,9 +723,7 @@ mod tests {
                 reg.register(
                     "test::Spawnable",
                     Box::new(|_receptionist, _label, _state: Vec<u8>| {
-                        Box::pin(async move {
-                            Ok::<(), crate::cluster::sync::SpawnError>(())
-                        })
+                        Box::pin(async move { Ok::<(), crate::cluster::sync::SpawnError>(()) })
                     }),
                 );
                 reg
@@ -740,7 +737,10 @@ mod tests {
         );
         for n in ["node-a", "node-b"] {
             assert!(
-                c.system(n).spawn_registry().get("test::Spawnable").is_some(),
+                c.system(n)
+                    .spawn_registry()
+                    .get("test::Spawnable")
+                    .is_some(),
                 "{n} boots with the consumer's spawn factory wired in"
             );
         }

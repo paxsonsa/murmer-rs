@@ -125,7 +125,7 @@ mod tests {
     use murmer::cluster::sync::{SpawnRegistry, TypeRegistry};
 
     fn init_tracing() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        murmer::cluster::install_default_crypto();
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .with_test_writer()

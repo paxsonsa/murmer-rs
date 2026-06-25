@@ -674,7 +674,7 @@ mod allowlist_tests {
     use std::collections::HashSet;
 
     fn install_crypto() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::cluster::install_default_crypto();
     }
 
     fn tmp(tag: &str) -> std::path::PathBuf {

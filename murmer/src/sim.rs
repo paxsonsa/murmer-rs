@@ -155,13 +155,6 @@ impl Runtime for SimRuntime {
         label.hash(&mut h);
         h.finish()
     }
-
-    fn run_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()> {
-        // Inline-atomic: run synchronously on the deterministic thread. Valid
-        // because sim "blocking" work returns promptly from in-memory state.
-        work();
-        Box::pin(async {})
-    }
 }
 
 /// Future returned by [`SimRuntime::sleep`]. Registers a timer with the shared
@@ -918,7 +911,10 @@ mod tests {
             }
             last
         });
-        assert_eq!(last, 1, "round-robin hit each of the 2 async actors exactly once");
+        assert_eq!(
+            last, 1,
+            "round-robin hit each of the 2 async actors exactly once"
+        );
         let _ = kept;
     }
 

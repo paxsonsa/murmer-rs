@@ -8,7 +8,7 @@ use murmer_cluster_tests::actors::*;
 
 fn init() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    murmer::cluster::install_default_crypto();
 }
 
 // =============================================================================

@@ -64,14 +64,6 @@ pub trait Runtime: Send + Sync + 'static {
     /// dependency — the caller seeds whatever PRNG it likes.
     fn derive_seed(&self, label: &str) -> u64;
 
-    /// Run a synchronous, potentially blocking unit of work.
-    ///
-    /// Production offloads to a dedicated blocking thread so real I/O never
-    /// stalls the actor pool. Sim runs it inline on the deterministic thread as
-    /// one atomic step. This is deliberately **not** `tokio::spawn_blocking`:
-    /// a sim scheduler cannot observe an uncontrolled thread pool.
-    fn run_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()>;
-
     /// Whether [`spawn`](Self::spawn) can accept a task right now. The sim runtime
     /// always can (it queues into the world), so this defaults to `true`. The
     /// Tokio default overrides it: it can only spawn inside a live runtime
@@ -156,13 +148,6 @@ impl Runtime for TokioRuntime {
     fn derive_seed(&self, _label: &str) -> u64 {
         // Production is not reproducible by design; hand back fresh entropy.
         rand::random()
-    }
-
-    #[inline]
-    fn run_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let _ = tokio::task::spawn_blocking(work).await;
-        })
     }
 }
 

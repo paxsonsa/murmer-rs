@@ -568,7 +568,10 @@ mod tests {
                 .await
                 .expect("send_async routes to the AsyncHandler");
         }
-        assert_eq!(last, 2, "round-robin spread the 4 sends evenly across 2 async actors");
+        assert_eq!(
+            last, 2,
+            "round-robin spread the 4 sends evenly across 2 async actors"
+        );
     }
 
     #[tokio::test]

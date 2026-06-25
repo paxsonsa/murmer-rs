@@ -28,7 +28,7 @@ use murmer::prelude::*;
 use murmer_cluster_tests::actors::{CatalogLike, CatalogState, Whoami};
 
 fn init() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    murmer::cluster::install_default_crypto();
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 }
 

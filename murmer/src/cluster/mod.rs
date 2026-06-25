@@ -35,6 +35,18 @@ use net::{ConnectionEvent, IncomingConnection, Net, NodeId, PeerAddr};
 use sync::{SpawnRegistry, TypeRegistry};
 use transport::Transport;
 
+/// Install the process-wide rustls crypto provider (ring) that iroh/QUIC's TLS
+/// needs before any handshake — and that constructing an [`iroh::SecretKey`]
+/// touches even on paths that never hit the network.
+///
+/// Idempotent and safe to call from multiple entry points: the first call wins
+/// and later calls are a no-op (the `install_default` error is intentionally
+/// ignored). Binaries, examples, the sim harness, and tests call this once at
+/// startup so they don't each re-implement the one-liner.
+pub fn install_default_crypto() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Extract the endpoint-id portion (the abstract [`NodeId`]) out of a
 /// `node_id_string` of the form `endpoint_id#incarnation`.
 fn node_id_of(node_id: &str) -> Option<NodeId> {
@@ -1262,7 +1274,7 @@ mod tests {
 
     /// Install rustls ring crypto provider (idempotent).
     fn init_crypto() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        super::install_default_crypto();
     }
 
     /// Polls a closure until it returns true, with a timeout.
