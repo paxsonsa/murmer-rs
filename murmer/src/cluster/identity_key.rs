@@ -59,9 +59,7 @@ pub fn persist(path: impl AsRef<Path>, key: &SecretKey) -> Result<(), ClusterErr
         std::fs::create_dir_all(parent)
             .map_err(|e| ClusterError::KeyFile(format!("create dir {}: {e}", parent.display())))?;
     }
-    std::fs::write(path, key.to_bytes())
-        .map_err(|e| ClusterError::KeyFile(format!("write {}: {e}", path.display())))?;
-    restrict_permissions(path)?;
+    write_secret(path, &key.to_bytes())?;
     Ok(())
 }
 
@@ -70,17 +68,35 @@ pub fn endpoint_id_of(path: impl AsRef<Path>) -> Result<EndpointId, ClusterError
     Ok(load(path)?.public())
 }
 
+/// Write `bytes` to `path`, ensuring the file never exists with secret content
+/// at permissions looser than `0600`.
+///
+/// New files are created `0600` atomically (the mode is applied at `open`, so
+/// there is no world-readable window). For a pre-existing file the create-time
+/// mode is ignored by the OS, so we tighten permissions on the open descriptor
+/// *before* writing any secret bytes.
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), ClusterError> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms)
-        .map_err(|e| ClusterError::KeyFile(format!("chmod {}: {e}", path.display())))
+fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), ClusterError> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| ClusterError::KeyFile(format!("open {}: {e}", path.display())))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| ClusterError::KeyFile(format!("chmod {}: {e}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(|e| ClusterError::KeyFile(format!("write {}: {e}", path.display())))
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), ClusterError> {
-    Ok(())
+fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), ClusterError> {
+    std::fs::write(path, bytes)
+        .map_err(|e| ClusterError::KeyFile(format!("write {}: {e}", path.display())))
 }
 
 #[cfg(test)]
@@ -100,6 +116,28 @@ mod tests {
 
         // endpoint_id_of agrees without loading the secret elsewhere.
         assert_eq!(endpoint_id_of(&path).unwrap(), key1.public());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_key_is_0600_even_over_a_loose_preexisting_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("murmer-key-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key");
+
+        // Pre-create the file world-readable to simulate the old write-then-chmod
+        // exposure: the fix must tighten perms before writing secret bytes.
+        std::fs::write(&path, b"placeholder").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        persist(&path, &SecretKey::generate()).expect("persist");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "key file must be 0600, got {:o}", mode);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
