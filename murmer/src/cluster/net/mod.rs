@@ -7,14 +7,11 @@
 //! node id — behind a trait, so the cluster can run either over real iroh/QUIC
 //! (production) or over an in-memory deterministic fabric (simulation).
 //!
-//! **Status: foundation only.** These trait/type definitions are landed
-//! additively and are not yet wired into [`ClusterSystem`](super::ClusterSystem)
-//! — today's cluster code still uses [`super::transport::Transport`] directly.
-//! The wiring (Phase 0: make `IrohTransport` implement `Net`, switch
-//! `ClusterSystem` to `Arc<dyn Net>`, box the iroh stream types where they leak)
-//! is the next focused chunk, done against the `murmer-cluster-tests` suite as
-//! the oracle. See `.llm/shared/context/2026-06-21-net-seam-blueprint.md` and
-//! `.llm/shared/plans/2026-06-21-net-seam-execution.md`.
+//! [`ClusterSystem`](super::ClusterSystem) holds an `Arc<dyn Net>`:
+//! [`super::transport::Transport`] implements `Net` over real iroh/QUIC for
+//! production, and the `sim` fabric implements it in-memory for deterministic
+//! tests. The iroh stream types are boxed behind [`SendHalf`]/[`RecvHalf`]
+//! where they would otherwise leak.
 //!
 //! # Why one primitive
 //!

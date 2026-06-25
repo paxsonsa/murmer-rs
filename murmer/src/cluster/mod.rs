@@ -5,8 +5,8 @@ pub mod error;
 pub mod framing;
 pub mod identity_key;
 pub mod membership;
-/// The `Net` seam (multi-node simulation foundation — not yet wired; see the
-/// module docs and `.llm/shared/plans/2026-06-21-net-seam-execution.md`).
+/// The `Net` seam: the transport abstraction `ClusterSystem` runs over (real
+/// iroh in production, an in-memory fabric in simulation). See the module docs.
 pub mod net;
 pub mod remote;
 pub mod sync;

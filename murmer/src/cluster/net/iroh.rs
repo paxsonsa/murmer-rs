@@ -3,13 +3,8 @@
 //!
 //! Thin newtype wrappers over iroh's QUIC `SendStream` / `RecvStream` /
 //! `Connection` — every method is a one-line delegation plus an error map. This
-//! is the production side of the seam.
-//!
-//! **Status: foundation only.** These wrappers compile and are the building
-//! blocks for `IrohNet` (the `Net` impl), but nothing constructs them yet —
-//! `ClusterSystem` still uses [`super::super::transport::Transport`] directly.
-//! Phase 0 fits `Transport` to `Net` using these. See
-//! `.llm/shared/plans/2026-06-21-net-seam-execution.md`.
+//! is the production side of the seam: [`super::super::transport::Transport`]
+//! implements `Net` and constructs these wrappers when it opens iroh streams.
 
 use async_trait::async_trait;
 use iroh::endpoint::{Connection as QuicConnection, RecvStream, SendStream, VarInt};
