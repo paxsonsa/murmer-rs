@@ -80,6 +80,17 @@ impl<A: Actor + 'static> Router<A> {
         }
     }
 
+    /// Pick the endpoint index for the current strategy. Callers must guard
+    /// `len > 0` first (the empty case is a `MailboxClosed` error). Broadcast via
+    /// the single-send paths targets index 0; the real fan-out is `broadcast()`.
+    fn pick_index(&self, len: usize) -> usize {
+        match self.strategy {
+            RoutingStrategy::RoundRobin => self.counter.fetch_add(1, Ordering::Relaxed) % len,
+            RoutingStrategy::Random => (self.runtime.rng_u64() % len as u64) as usize,
+            RoutingStrategy::Broadcast => 0,
+        }
+    }
+
     /// Send a message to one endpoint based on the routing strategy.
     pub async fn send<M>(&self, msg: M) -> Result<M::Result, SendError>
     where
@@ -91,20 +102,8 @@ impl<A: Actor + 'static> Router<A> {
             return Err(SendError::MailboxClosed);
         }
 
-        match self.strategy {
-            RoutingStrategy::RoundRobin => {
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
-                self.endpoints[idx].send(msg).await
-            }
-            RoutingStrategy::Random => {
-                let idx = (self.runtime.rng_u64() % self.endpoints.len() as u64) as usize;
-                self.endpoints[idx].send(msg).await
-            }
-            RoutingStrategy::Broadcast => {
-                // For broadcast via send(), just send to the first endpoint
-                self.endpoints[0].send(msg).await
-            }
-        }
+        let idx = self.pick_index(self.endpoints.len());
+        self.endpoints[idx].send(msg).await
     }
 
     /// Like [`send`](Self::send) but routes to an [`AsyncHandler<M>`] — the
@@ -123,17 +122,8 @@ impl<A: Actor + 'static> Router<A> {
             return Err(SendError::MailboxClosed);
         }
 
-        match self.strategy {
-            RoutingStrategy::RoundRobin => {
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
-                self.endpoints[idx].send_async(msg).await
-            }
-            RoutingStrategy::Random => {
-                let idx = (self.runtime.rng_u64() % self.endpoints.len() as u64) as usize;
-                self.endpoints[idx].send_async(msg).await
-            }
-            RoutingStrategy::Broadcast => self.endpoints[0].send_async(msg).await,
-        }
+        let idx = self.pick_index(self.endpoints.len());
+        self.endpoints[idx].send_async(msg).await
     }
 
     /// Send a message to ALL endpoints. Returns a Vec of results.
@@ -408,6 +398,18 @@ impl<A: Actor + 'static> PoolRouter<A> {
         }
     }
 
+    /// Pick the endpoint index for the current strategy. Callers hold the pool
+    /// read-lock and must have guarded `len > 0` (empty is a `MailboxClosed`
+    /// error). Broadcast via the single-send paths targets index 0; the real
+    /// fan-out is `broadcast()`.
+    fn pick_index(&self, len: usize) -> usize {
+        match self.strategy {
+            RoutingStrategy::RoundRobin => self.counter.fetch_add(1, Ordering::Relaxed) % len,
+            RoutingStrategy::Random => (self.runtime.rng_u64() % len as u64) as usize,
+            RoutingStrategy::Broadcast => 0,
+        }
+    }
+
     /// Send a message to one endpoint based on the routing strategy.
     pub async fn send<M>(&self, msg: M) -> Result<M::Result, SendError>
     where
@@ -421,14 +423,7 @@ impl<A: Actor + 'static> PoolRouter<A> {
                 return Err(SendError::MailboxClosed);
             }
 
-            let idx = match self.strategy {
-                RoutingStrategy::RoundRobin => {
-                    self.counter.fetch_add(1, Ordering::Relaxed) % pool.len()
-                }
-                RoutingStrategy::Random => (self.runtime.rng_u64() % pool.len() as u64) as usize,
-                RoutingStrategy::Broadcast => 0,
-            };
-
+            let idx = self.pick_index(pool.len());
             pool[idx].1.clone()
         }; // lock released here
 
@@ -450,14 +445,7 @@ impl<A: Actor + 'static> PoolRouter<A> {
                 return Err(SendError::MailboxClosed);
             }
 
-            let idx = match self.strategy {
-                RoutingStrategy::RoundRobin => {
-                    self.counter.fetch_add(1, Ordering::Relaxed) % pool.len()
-                }
-                RoutingStrategy::Random => (self.runtime.rng_u64() % pool.len() as u64) as usize,
-                RoutingStrategy::Broadcast => 0,
-            };
-
+            let idx = self.pick_index(pool.len());
             pool[idx].1.clone()
         }; // lock released here
 
