@@ -91,6 +91,22 @@ impl Allowlist {
         }
     }
 
+    /// An enforced allowlist seeded with `set` and **no** background watcher.
+    /// Lets tests exercise reload/revocation policy directly without the 1s
+    /// timer or a real file.
+    #[cfg(test)]
+    fn enforced_for_test(set: HashSet<EndpointId>) -> Self {
+        let (revoked_tx, _) = broadcast::channel(64);
+        Self {
+            inner: Arc::new(Inner {
+                mode: Mode::Enforced {
+                    set: RwLock::new(set),
+                    revoked_tx,
+                },
+            }),
+        }
+    }
+
     /// Whether `id` is authorized to participate in the cluster.
     pub fn is_allowed(&self, id: &EndpointId) -> bool {
         match &self.inner.mode {
@@ -182,11 +198,25 @@ impl EndpointHooks for AllowlistHook {
 
 /// Parse an allowlist file into a set of endpoint ids. Missing file = empty set
 /// (a node that trusts nobody yet, rather than a hard error).
+///
+/// This collapses "absent" into "empty", which is the right startup default but
+/// wrong for hot-reload — see [`load_file_opt`], which keeps the distinction so
+/// the watcher can skip a transient gap instead of revoking every peer.
 pub fn load_file(path: impl AsRef<Path>) -> Result<HashSet<EndpointId>, ClusterError> {
+    Ok(load_file_opt(path)?.unwrap_or_default())
+}
+
+/// Like [`load_file`] but distinguishes a missing file (`Ok(None)`) from a
+/// present, parseable one (`Ok(Some(set))`). The hot-reload watcher uses this to
+/// tell "operator emptied the file" (present → apply, revoking removed peers)
+/// from "file momentarily gone" (absent → skip, keep the current set). Applying
+/// an empty set on a transient gap would revoke every peer and partition the
+/// cluster (issue #7).
+pub fn load_file_opt(path: impl AsRef<Path>) -> Result<Option<HashSet<EndpointId>>, ClusterError> {
     let path = path.as_ref();
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(ClusterError::AllowlistFile(format!(
                 "read {}: {e}",
@@ -209,7 +239,7 @@ pub fn load_file(path: impl AsRef<Path>) -> Result<HashSet<EndpointId>, ClusterE
         })?;
         set.insert(id);
     }
-    Ok(set)
+    Ok(Some(set))
 }
 
 /// Atomically write an allowlist file (one id per line, sorted for stable diffs).
@@ -265,19 +295,33 @@ fn spawn_watcher(allowlist: Allowlist, path: PathBuf, shutdown: CancellationToke
                     let fingerprint = file_fingerprint(&path);
                     if fingerprint != last_fingerprint {
                         last_fingerprint = fingerprint;
-                        match load_file(&path) {
-                            Ok(next) => {
-                                tracing::info!(path = %path.display(), count = next.len(), "allowlist reloaded");
-                                allowlist.apply_reload(next);
-                            }
-                            Err(e) => tracing::error!("allowlist reload failed: {e}"),
-                        }
+                        reload_once(&allowlist, &path);
                     }
                 }
                 _ = shutdown.cancelled() => break,
             }
         }
     });
+}
+
+/// React to one detected change of the allowlist file. Applies the new set when
+/// the file is present and parseable; **skips** a transient missing file rather
+/// than applying an empty set (which would revoke every peer and partition the
+/// cluster, issue #7). A present-but-empty file is a deliberate revoke-all and
+/// is applied. Extracted from the watcher loop so the policy is unit-testable
+/// without the 1s timer.
+fn reload_once(allowlist: &Allowlist, path: &Path) {
+    match load_file_opt(path) {
+        Ok(Some(next)) => {
+            tracing::info!(path = %path.display(), count = next.len(), "allowlist reloaded");
+            allowlist.apply_reload(next);
+        }
+        Ok(None) => tracing::warn!(
+            path = %path.display(),
+            "allowlist file missing on reload; keeping current set (no revocation)"
+        ),
+        Err(e) => tracing::error!("allowlist reload failed: {e}"),
+    }
 }
 
 /// Change-detection fingerprint for the allowlist file: a hash of its bytes.
@@ -335,6 +379,74 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         assert!(load_file(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn transient_missing_file_keeps_set_no_revocation() {
+        // A file that momentarily reads as missing (delete-then-recreate during
+        // a deploy) must NOT revoke every peer — that would partition the
+        // cluster from a 200ms gap (issue #7).
+        let a = SecretKey::generate().public();
+        let b = SecretKey::generate().public();
+        let allow = Allowlist::enforced_for_test(HashSet::from([a, b]));
+        let mut rev = allow.subscribe_revocations().unwrap();
+
+        let path = temp_path("transient-missing");
+        let _ = std::fs::remove_file(&path); // ensure absent
+
+        reload_once(&allow, &path);
+
+        assert!(
+            allow.is_allowed(&a) && allow.is_allowed(&b),
+            "a transient missing file must not drop peers"
+        );
+        assert!(
+            rev.try_recv().is_err(),
+            "a transient missing file must broadcast no revocations"
+        );
+    }
+
+    #[test]
+    fn present_empty_file_revokes_all() {
+        // An operator who intentionally empties a *present* file does mean
+        // "revoke everyone" — that path is preserved.
+        let a = SecretKey::generate().public();
+        let allow = Allowlist::enforced_for_test(HashSet::from([a]));
+        let mut rev = allow.subscribe_revocations().unwrap();
+
+        let path = temp_path("present-empty");
+        std::fs::write(&path, "# intentionally empty\n").unwrap();
+
+        reload_once(&allow, &path);
+
+        assert!(
+            !allow.is_allowed(&a),
+            "an intentionally emptied present file revokes everyone"
+        );
+        assert_eq!(rev.try_recv().ok(), Some(a));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reload_revokes_only_removed_id() {
+        let a = SecretKey::generate().public();
+        let b = SecretKey::generate().public();
+        let allow = Allowlist::enforced_for_test(HashSet::from([a, b]));
+        let mut rev = allow.subscribe_revocations().unwrap();
+
+        let path = temp_path("partial-reload");
+        write_file(&path, &HashSet::from([a])).unwrap(); // b removed
+
+        reload_once(&allow, &path);
+
+        assert!(allow.is_allowed(&a), "a is still allowed");
+        assert!(!allow.is_allowed(&b), "b was removed and revoked");
+        assert_eq!(rev.try_recv().ok(), Some(b));
+        assert!(
+            rev.try_recv().is_err(),
+            "only the genuinely removed id is revoked"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
