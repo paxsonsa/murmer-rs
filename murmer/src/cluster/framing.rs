@@ -9,6 +9,11 @@ use crate::{Op, VersionVector};
 /// Maximum frame size (4 MB).
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
+/// Per-read scratch buffer size for the frame-read loops (handshake, control,
+/// response, and actor streams). One place so a tuning change is a single edit
+/// rather than a hunt across every stream reader.
+pub const FRAME_READ_BUF: usize = 8192;
+
 // =============================================================================
 // CONTROL MESSAGES — sent on stream 0 (long-lived, bidirectional)
 // =============================================================================

@@ -625,7 +625,7 @@ async fn read_handshake(
     mut recv: RecvStream,
 ) -> Result<(HandshakePayload, RecvStream), ClusterError> {
     let mut codec = FrameCodec::new();
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; framing::FRAME_READ_BUF];
 
     let frame = loop {
         match recv

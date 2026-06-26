@@ -33,6 +33,7 @@ pub mod sim_cluster;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -217,6 +218,40 @@ pub async fn run_control_stream_writer(
     let _ = send.finish();
 }
 
+/// Read length-prefixed frames from `recv` until clean EOF or a read/stream
+/// error, calling `on_frame` for each decoded frame and `on_read` with the byte
+/// count of each raw read (for metrics). Returns `Ok(())` on clean EOF, `Err`
+/// on a read error; stops early and returns `Ok(())` if `on_frame` signals
+/// [`ControlFlow::Break`]. Owns the read scratch buffer ([`framing::FRAME_READ_BUF`]).
+///
+/// Shared by the read-only forwarder loops (control + response streams). The
+/// actor stream and handshake keep bespoke loops: the actor stream's per-frame
+/// action is async and writes back through its `SendHalf` (a sync `on_frame`
+/// can't hold that await without boxing a future per frame), and the handshake
+/// reads a concrete pre-`Net` iroh stream and hands it back live.
+pub async fn pump_frames(
+    recv: &mut dyn RecvHalf,
+    codec: &mut FrameCodec,
+    mut on_read: impl FnMut(usize),
+    mut on_frame: impl FnMut(Vec<u8>) -> ControlFlow<()>,
+) -> Result<(), ClusterError> {
+    let mut buf = vec![0u8; framing::FRAME_READ_BUF];
+    loop {
+        match recv.read(&mut buf).await? {
+            Some(n) => {
+                on_read(n);
+                codec.push_data(&buf[..n]);
+                while let Ok(Some(frame)) = codec.next_frame() {
+                    if on_frame(frame).is_break() {
+                        return Ok(());
+                    }
+                }
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
 /// Background task: reads length-prefixed frames from a [`RecvHalf`] and sends
 /// them as `ControlMessage`s to the provided channel, tagged with `node_id`.
 pub async fn run_control_stream_reader(
@@ -226,38 +261,29 @@ pub async fn run_control_stream_reader(
     shutdown: CancellationToken,
 ) {
     let mut codec = FrameCodec::new();
-    let mut buf = vec![0u8; 8192];
-
-    loop {
-        tokio::select! {
-            result = recv.read(&mut buf) => {
-                match result {
-                    Ok(Some(n)) => {
-                        codec.push_data(&buf[..n]);
-                        while let Ok(Some(frame)) = codec.next_frame() {
-                            match framing::decode_message::<ControlMessage>(&frame) {
-                                Ok(msg) => {
-                                    if tx.send((node_id.clone(), msg)).is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to decode control message from {node_id}: {e}");
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::debug!("Control stream from {node_id} closed");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Control stream read error from {node_id}: {e}");
-                        break;
-                    }
+    let pump = pump_frames(
+        recv.as_mut(),
+        &mut codec,
+        |_| {},
+        |frame| match framing::decode_message::<ControlMessage>(&frame) {
+            Ok(msg) => {
+                if tx.send((node_id.clone(), msg)).is_ok() {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(()) // channel closed — receiver gone
                 }
             }
-            _ = shutdown.cancelled() => break,
-        }
+            Err(e) => {
+                tracing::warn!("Failed to decode control message from {node_id}: {e}");
+                ControlFlow::Continue(())
+            }
+        },
+    );
+    tokio::select! {
+        result = pump => match result {
+            Ok(()) => tracing::debug!("Control stream from {node_id} closed"),
+            Err(e) => tracing::warn!("Control stream read error from {node_id}: {e}"),
+        },
+        _ = shutdown.cancelled() => {}
     }
 }

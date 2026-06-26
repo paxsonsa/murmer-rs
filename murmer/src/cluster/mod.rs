@@ -970,7 +970,7 @@ async fn handle_incoming_stream(
     node_id: String,
 ) {
     let mut codec = framing::FrameCodec::new();
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; framing::FRAME_READ_BUF];
 
     // Read until we get the first frame
     let first_frame = loop {
@@ -1024,7 +1024,7 @@ async fn handle_actor_stream_after_init(
         }
     };
 
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; framing::FRAME_READ_BUF];
 
     // Process any frames already buffered in the codec from the initial read
     while let Ok(Some(frame)) = codec.next_frame() {

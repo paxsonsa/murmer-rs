@@ -119,36 +119,31 @@ async fn read_responses(
     actor_label: String,
 ) {
     let mut codec = FrameCodec::new();
-    let mut buf = vec![0u8; 8192];
 
-    let close_reason = loop {
-        match recv.read(&mut buf).await {
-            Ok(Some(n)) => {
-                instrument::network_bytes_received(n as u64);
-                codec.push_data(&buf[..n]);
-                while let Ok(Some(frame)) = codec.next_frame() {
-                    match framing::decode_response_frame(&frame) {
-                        Ok(decoded) => {
-                            let response = RemoteResponse {
-                                call_id: decoded.call_id,
-                                result: decoded.result.map(|bytes| bytes.to_vec()),
-                            };
-                            response_registry.complete(response);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to decode response for {actor_label}: {e}");
-                        }
-                    }
-                }
+    let close_reason = match super::net::pump_frames(
+        recv.as_mut(),
+        &mut codec,
+        |n| instrument::network_bytes_received(n as u64),
+        |frame| {
+            match framing::decode_response_frame(&frame) {
+                Ok(decoded) => response_registry.complete(RemoteResponse {
+                    call_id: decoded.call_id,
+                    result: decoded.result.map(|bytes| bytes.to_vec()),
+                }),
+                Err(e) => tracing::warn!("Failed to decode response for {actor_label}: {e}"),
             }
-            Ok(None) => {
-                tracing::debug!("Response stream for {actor_label} closed");
-                break "response stream closed by peer".to_string();
-            }
-            Err(e) => {
-                tracing::error!("Response stream read error for {actor_label}: {e}");
-                break format!("response stream error: {e}");
-            }
+            std::ops::ControlFlow::Continue(())
+        },
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::debug!("Response stream for {actor_label} closed");
+            "response stream closed by peer".to_string()
+        }
+        Err(e) => {
+            tracing::error!("Response stream read error for {actor_label}: {e}");
+            format!("response stream error: {e}")
         }
     };
 
