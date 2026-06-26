@@ -736,9 +736,14 @@ impl Coordinator {
         let generation = gen_source.claim_term(&label, &owner).await?;
         // Persist the spec to the backend so a future leader can rebuild this
         // singleton (closes the amnesia gap when a shared/durable source is used).
-        if let Err(e) = gen_source.put_spec(&label, &msg.spec).await {
-            tracing::warn!("singleton {label}: put_spec failed: {e}");
-        }
+        // Fail the grant if the spec does not persist: placing without a stored
+        // spec is exactly the amnesia the backend exists to prevent — a future
+        // leader's `list()` would not see this singleton and never re-place it.
+        // The already-advanced term is harmless (monotonic); a retry just bumps it.
+        gen_source
+            .put_spec(&label, &msg.spec)
+            .await
+            .map_err(|e| format!("singleton {label}: put_spec failed: {e}"))?;
         let ownership = SingletonOwnership {
             label: label.clone(),
             owner_node_id: Some(owner.clone()),
@@ -1379,9 +1384,9 @@ mod tests {
     use crate::app::singleton::{SingletonAnchor, SingletonGeneration, SingletonSpec};
     use crate::cluster::config::{NodeClass, NodeIdentity};
 
-    fn make_system_and_coordinator() -> (crate::System, Endpoint<Coordinator>) {
-        let system = crate::System::local();
-
+    /// Build a leader Coordinator state with a two-node (alpha, beta) view.
+    /// `alpha` (incarnation 1) is the oldest, so the leader anchor resolves to it.
+    fn make_coordinator_state() -> CoordinatorState {
         let alpha_identity = NodeIdentity::for_test("alpha", 1);
         let local_node_id = alpha_identity.node_id_string();
 
@@ -1408,8 +1413,80 @@ mod tests {
             HashMap::new(),
         ));
 
-        let ep = system.start("coordinator", Coordinator, state);
+        state
+    }
+
+    fn make_system_and_coordinator() -> (crate::System, Endpoint<Coordinator>) {
+        let system = crate::System::local();
+        let ep = system.start("coordinator", Coordinator, make_coordinator_state());
         (system, ep)
+    }
+
+    /// A [`GenerationSource`] that mints terms normally but always fails
+    /// `put_spec`, modelling a transient backend write error on the placement
+    /// path. Used to prove the Coordinator fails the grant instead of placing a
+    /// singleton whose spec never persisted (issue #4).
+    #[derive(Default)]
+    struct FailingPutSpec {
+        inner: CoordinatorGenerationSource,
+    }
+
+    #[async_trait::async_trait]
+    impl GenerationSource for FailingPutSpec {
+        async fn claim_term(
+            &self,
+            label: &str,
+            owner_node_id: &str,
+        ) -> Result<SingletonGeneration, String> {
+            self.inner.claim_term(label, owner_node_id).await
+        }
+        async fn claim_seq(&self, label: &str) -> Result<SingletonGeneration, String> {
+            self.inner.claim_seq(label).await
+        }
+        async fn current(&self, label: &str) -> Result<Option<SingletonOwnership>, String> {
+            self.inner.current(label).await
+        }
+        async fn put_spec(&self, _label: &str, _spec: &SingletonSpec) -> Result<(), String> {
+            Err("simulated backend write failure".into())
+        }
+        async fn list(
+            &self,
+        ) -> Result<Vec<crate::app::singleton::SingletonRecord>, String> {
+            self.inner.list().await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_singleton_fails_grant_when_put_spec_fails() {
+        let system = crate::System::local();
+        let state =
+            make_coordinator_state().with_generation_source(Arc::new(FailingPutSpec::default()));
+        let coordinator = system.start("coordinator", Coordinator, state);
+
+        // The grant must fail rather than place a singleton whose spec never
+        // persisted (which a future leader's rebuild would silently drop).
+        let result = coordinator
+            .send_async(StartSingleton {
+                spec: SingletonSpec::new("catalog", "app::Catalog", SingletonAnchor::Leader),
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "put_spec failure must fail the grant, got {result:?}"
+        );
+
+        // And nothing must have been placed: no ownership is queryable.
+        let queried = coordinator
+            .send(GetSingleton {
+                label: "catalog".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            queried.is_none(),
+            "a failed grant must not leave a placed singleton, got {queried:?}"
+        );
     }
 
     #[tokio::test]

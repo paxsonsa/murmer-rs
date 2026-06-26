@@ -277,18 +277,18 @@ pub trait GenerationSource: Send + Sync {
     /// Persist a singleton's spec, so a newly-elected leader can rebuild the full
     /// managed set (not just its ownership). Idempotent.
     ///
-    /// Default: a no-op. A source that does not persist specs simply offers no
-    /// leader-rebuild — a new leader stays amnesiac about singletons it did not
-    /// place itself. The in-RAM and durable sources override this.
-    async fn put_spec(&self, _label: &str, _spec: &SingletonSpec) -> Result<(), String> {
-        Ok(())
-    }
+    /// Intentionally **not** defaulted: a no-op default let a durable backend
+    /// that forgot to override it compile cleanly, fence correctly, yet rebuild
+    /// an empty set on leader change — silently orphaning every singleton it did
+    /// not place (issue #14). A source that genuinely cannot persist must stub
+    /// this consciously (e.g. an explicit "rebuild unsupported" error).
+    async fn put_spec(&self, label: &str, spec: &SingletonSpec) -> Result<(), String>;
 
     /// List every known singleton (spec + latest ownership) — the leader-rebuild
-    /// read. Default: empty (no rebuild). Sources that persist specs override it.
-    async fn list(&self) -> Result<Vec<SingletonRecord>, String> {
-        Ok(Vec::new())
-    }
+    /// read. Not defaulted for the same reason as [`Self::put_spec`]: an empty
+    /// default is silent leader amnesia. Sources that persist specs return them;
+    /// others must consciously stub it.
+    async fn list(&self) -> Result<Vec<SingletonRecord>, String>;
 }
 
 /// One stored singleton in the in-RAM source: its spec (set by `put_spec`) and
