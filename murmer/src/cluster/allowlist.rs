@@ -63,7 +63,18 @@ impl Allowlist {
                 inner: Arc::new(Inner { mode: Mode::Open }),
             }),
             AllowlistMode::Enforced(path) => {
-                let initial = load_file(&path)?;
+                // Fail fast on a missing file: in Enforced mode an absent file
+                // would load as "trust nobody" and silently reject every peer,
+                // so a typo'd or unprovisioned path must not boot. A present-but-
+                // empty file is a deliberate "start locked, hot-add later" state
+                // and is allowed (load_file_opt -> Some(empty)).
+                let initial = load_file_opt(&path)?.ok_or_else(|| {
+                    ClusterError::AllowlistFile(format!(
+                        "enforced allowlist file {} not found; refusing to start \
+                         (a missing file would silently reject every peer)",
+                        path.display()
+                    ))
+                })?;
                 tracing::info!(
                     path = %path.display(),
                     count = initial.len(),
@@ -379,6 +390,34 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         assert!(load_file(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enforced_missing_file_fails_fast() {
+        // A typo'd / unprovisioned path in Enforced mode must refuse to start,
+        // not boot a node that silently rejects every peer (issue #13).
+        let path = temp_path("enforced-missing");
+        let _ = std::fs::remove_file(&path);
+        let shutdown = CancellationToken::new();
+        let result = Allowlist::new(AllowlistMode::Enforced(path), shutdown);
+        assert!(
+            result.is_err(),
+            "enforced mode with a missing file must fail fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_present_empty_file_starts() {
+        // A present-but-empty file is a deliberate "start locked, hot-add later"
+        // state and must still boot (distinct from the missing-file case above).
+        let path = temp_path("enforced-present-empty");
+        std::fs::write(&path, "# intentionally empty\n").unwrap();
+        let shutdown = CancellationToken::new();
+        let allow = Allowlist::new(AllowlistMode::Enforced(path.clone()), shutdown.clone())
+            .expect("a present empty file is a valid locked allowlist");
+        assert!(allow.is_enforced());
+        shutdown.cancel(); // stop the spawned watcher
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
