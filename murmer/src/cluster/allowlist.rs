@@ -63,6 +63,12 @@ impl Allowlist {
                 inner: Arc::new(Inner { mode: Mode::Open }),
             }),
             AllowlistMode::Enforced(path) => {
+                if !path.exists() {
+                    return Err(ClusterError::AllowlistFile(format!(
+                        "{} does not exist",
+                        path.display()
+                    )));
+                }
                 let initial = load_file(&path)?;
                 tracing::info!(
                     path = %path.display(),
@@ -335,6 +341,17 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         assert!(load_file(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enforced_missing_file_fails_fast() {
+        let path = temp_path("enforced-missing");
+        let _ = std::fs::remove_file(&path);
+        let err = Allowlist::new(AllowlistMode::Enforced(path.clone()), CancellationToken::new())
+            .expect_err("enforced mode must reject a missing allowlist file");
+        assert!(matches!(err, ClusterError::AllowlistFile(_)));
+        assert!(err.to_string().contains(&path.display().to_string()));
+        assert!(err.to_string().contains("does not exist"));
     }
 
     #[test]
