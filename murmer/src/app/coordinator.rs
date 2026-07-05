@@ -1449,9 +1449,7 @@ mod tests {
         async fn put_spec(&self, _label: &str, _spec: &SingletonSpec) -> Result<(), String> {
             Err("simulated backend write failure".into())
         }
-        async fn list(
-            &self,
-        ) -> Result<Vec<crate::app::singleton::SingletonRecord>, String> {
+        async fn list(&self) -> Result<Vec<crate::app::singleton::SingletonRecord>, String> {
             self.inner.list().await
         }
     }
