@@ -75,8 +75,11 @@ use crate::wire::SendError;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// A pending timer: wake `waker` once virtual time reaches `deadline`.
+/// A pending timer: wake `waker` once virtual time reaches `deadline`. The `id`
+/// ties the entry back to the owning [`Sleep`] so a re-poll updates in place
+/// (rather than pushing a duplicate) and a drop-before-firing removes it.
 struct Timer {
+    id: u64,
     deadline: Duration,
     waker: Waker,
 }
@@ -93,6 +96,8 @@ struct SimShared {
     /// `!Send` [`SimExecutor`] that actually owns the tasks.
     inbox: Vec<BoxFuture<'static, ()>>,
     timers: Vec<Timer>,
+    /// Monotonic, never-reused id source for [`Timer`] entries.
+    next_timer_id: u64,
 }
 
 /// Deterministic [`Runtime`]: seeded scheduler + virtual clock.
@@ -116,6 +121,7 @@ impl SimRuntime {
                 rng: ChaCha8Rng::seed_from_u64(seed),
                 inbox: Vec::new(),
                 timers: Vec::new(),
+                next_timer_id: 0,
             })),
         }
     }
@@ -134,6 +140,7 @@ impl Runtime for SimRuntime {
             shared: self.shared.clone(),
             deadline: None,
             dur,
+            timer_id: None,
         })
     }
 
@@ -158,11 +165,15 @@ impl Runtime for SimRuntime {
 }
 
 /// Future returned by [`SimRuntime::sleep`]. Registers a timer with the shared
-/// state on first poll and parks until virtual time reaches its deadline.
+/// state on first pending poll (exactly once, tracked by `timer_id`) and parks
+/// until virtual time reaches its deadline.
 struct Sleep {
     shared: Arc<Mutex<SimShared>>,
     deadline: Option<Duration>,
     dur: Duration,
+    /// `Some(id)` once this sleep has a live entry in `SimShared.timers`; `None`
+    /// before first registration and after the entry has fired or been removed.
+    timer_id: Option<u64>,
 }
 
 impl Future for Sleep {
@@ -174,13 +185,44 @@ impl Future for Sleep {
         let now = s.now;
         let deadline = *this.deadline.get_or_insert(now + this.dur);
         if now >= deadline {
-            Poll::Ready(())
-        } else {
-            s.timers.push(Timer {
-                deadline,
-                waker: cx.waker().clone(),
-            });
-            Poll::Pending
+            // Fired: `set_now_and_fire` already removed our entry, so forget the
+            // id — nothing left for `Drop` to clean up.
+            this.timer_id = None;
+            return Poll::Ready(());
+        }
+        // Re-poll while still pending: refresh the waker in place rather than
+        // pushing a duplicate. (If the entry is gone we were spuriously woken just
+        // before firing; it is re-registered below.)
+        if let Some(id) = this.timer_id {
+            if let Some(timer) = s.timers.iter_mut().find(|t| t.id == id) {
+                timer.waker.clone_from(cx.waker());
+                return Poll::Pending;
+            }
+            this.timer_id = None;
+        }
+        // First registration (or re-registration after a spurious wake).
+        let id = s.next_timer_id;
+        s.next_timer_id += 1;
+        this.timer_id = Some(id);
+        s.timers.push(Timer {
+            id,
+            deadline,
+            waker: cx.waker().clone(),
+        });
+        Poll::Pending
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        // Remove an unfired entry so a sleep dropped before its deadline (e.g. a
+        // cancelled `select!` arm) does not leak into `SimShared.timers`. A fired
+        // timer has already cleared `timer_id`, so this is a no-op then.
+        if let Some(id) = self.timer_id
+            && let Ok(mut s) = self.shared.lock()
+            && let Some(pos) = s.timers.iter().position(|t| t.id == id)
+        {
+            s.timers.swap_remove(pos);
         }
     }
 }
@@ -712,6 +754,49 @@ mod tests {
         assert_eq!(world.send(&ep, Increment { amount: 5 }).unwrap(), 5);
         assert_eq!(world.send(&ep, Increment { amount: 3 }).unwrap(), 8);
         assert_eq!(world.send(&ep, Get).unwrap(), 8);
+    }
+
+    // Regression for #9: a `Sleep` re-polled while pending must register exactly
+    // one timer (not one per poll), and dropping it before it fires must remove
+    // that entry — otherwise `SimShared.timers` grows unbounded over a long run.
+    #[test]
+    fn sleep_registers_one_timer_and_cleans_up_on_drop() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let rt = SimRuntime::new(1);
+        let timer_len = || rt.shared.lock().unwrap().timers.len();
+
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut sleep = Box::pin(Sleep {
+            shared: rt.shared.clone(),
+            deadline: None,
+            dur: Duration::from_millis(10),
+            timer_id: None,
+        });
+
+        for _ in 0..100 {
+            assert_eq!(sleep.as_mut().poll(&mut cx), Poll::Pending);
+        }
+        assert_eq!(timer_len(), 1, "re-polls must not accumulate timer entries");
+
+        // A second concurrent sleep registers its own single entry.
+        let mut other = Box::pin(Sleep {
+            shared: rt.shared.clone(),
+            deadline: None,
+            dur: Duration::from_millis(20),
+            timer_id: None,
+        });
+        assert_eq!(other.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(timer_len(), 2);
+
+        // Dropping an unfired sleep removes only its own entry.
+        drop(sleep);
+        assert_eq!(timer_len(), 1, "dropped sleep must not leak its timer");
+        drop(other);
+        assert_eq!(timer_len(), 0);
     }
 
     #[test]
