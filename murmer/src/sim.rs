@@ -237,12 +237,11 @@ impl Drop for Sleep {
         // was already `swap_remove`d by `set_now_and_fire`, so this is a no-op in
         // that case. Guard against a poisoned lock during unwind — panicking in a
         // destructor would abort the process.
-        if let Some(id) = self.id {
-            if let Ok(mut s) = self.shared.lock() {
-                if let Some(pos) = s.timers.iter().position(|t| t.id == id) {
-                    s.timers.swap_remove(pos);
-                }
-            }
+        if let Some(id) = self.id
+            && let Ok(mut s) = self.shared.lock()
+            && let Some(pos) = s.timers.iter().position(|t| t.id == id)
+        {
+            s.timers.swap_remove(pos);
         }
     }
 }
