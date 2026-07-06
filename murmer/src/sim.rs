@@ -75,8 +75,17 @@ use crate::wire::SendError;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// A pending timer: wake `waker` once virtual time reaches `deadline`.
+/// A monotonic, never-reused timer id. Minted from [`SimShared::next_timer_id`]
+/// so it is a pure function of the (seeded) execution — never wall-clock or
+/// unseeded randomness. It gives each [`Sleep`] a stable identity so a re-poll
+/// updates its single entry in place (rather than pushing a duplicate) and
+/// `Drop` can remove an unfired entry.
+type TimerId = u64;
+
+/// A pending timer: wake `waker` once virtual time reaches `deadline`. `id`
+/// identifies the owning [`Sleep`] for dedup-on-repoll and removal-on-drop.
 struct Timer {
+    id: TimerId,
     deadline: Duration,
     waker: Waker,
 }
@@ -93,6 +102,9 @@ struct SimShared {
     /// `!Send` [`SimExecutor`] that actually owns the tasks.
     inbox: Vec<BoxFuture<'static, ()>>,
     timers: Vec<Timer>,
+    /// Monotonic source of [`TimerId`]s. Incrementing counter, never recycled —
+    /// deterministic given deterministic execution (no wall-clock, no rng draw).
+    next_timer_id: TimerId,
 }
 
 /// Deterministic [`Runtime`]: seeded scheduler + virtual clock.
@@ -116,6 +128,7 @@ impl SimRuntime {
                 rng: ChaCha8Rng::seed_from_u64(seed),
                 inbox: Vec::new(),
                 timers: Vec::new(),
+                next_timer_id: 0,
             })),
         }
     }
@@ -134,6 +147,7 @@ impl Runtime for SimRuntime {
             shared: self.shared.clone(),
             deadline: None,
             dur,
+            id: None,
         })
     }
 
@@ -163,6 +177,10 @@ struct Sleep {
     shared: Arc<Mutex<SimShared>>,
     deadline: Option<Duration>,
     dur: Duration,
+    /// This sleep's registered timer id, minted lazily on the first `Pending`
+    /// poll. `Some` means an entry may be live in `SimShared::timers`; used to
+    /// dedup on re-poll and to remove the entry on `Drop`.
+    id: Option<TimerId>,
 }
 
 impl Future for Sleep {
@@ -176,11 +194,54 @@ impl Future for Sleep {
         if now >= deadline {
             Poll::Ready(())
         } else {
-            s.timers.push(Timer {
-                deadline,
-                waker: cx.waker().clone(),
-            });
+            // At-most-once registration: a Sleep owns a single timer entry keyed
+            // by its `TimerId`. On the first Pending poll we mint an id and push;
+            // on any later poll we refresh the waker on the existing entry in
+            // place (the executor may hand us a fresh `cx.waker()`) rather than
+            // pushing a duplicate — which is what previously leaked the Vec.
+            match this.id {
+                Some(id) => {
+                    if let Some(t) = s.timers.iter_mut().find(|t| t.id == id) {
+                        t.waker = cx.waker().clone();
+                    } else {
+                        // Entry is gone but our deadline is still in the future
+                        // (spurious wake before firing): re-register under the
+                        // same id so identity stays stable for Drop.
+                        s.timers.push(Timer {
+                            id,
+                            deadline,
+                            waker: cx.waker().clone(),
+                        });
+                    }
+                }
+                None => {
+                    let id = s.next_timer_id;
+                    s.next_timer_id += 1;
+                    this.id = Some(id);
+                    s.timers.push(Timer {
+                        id,
+                        deadline,
+                        waker: cx.waker().clone(),
+                    });
+                }
+            }
             Poll::Pending
+        }
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        // Remove our unfired entry so a Sleep dropped before its deadline (a
+        // cancelled/timed-out await) leaves no stale timer behind. A fired timer
+        // was already `swap_remove`d by `set_now_and_fire`, so this is a no-op in
+        // that case. Guard against a poisoned lock during unwind — panicking in a
+        // destructor would abort the process.
+        if let Some(id) = self.id
+            && let Ok(mut s) = self.shared.lock()
+            && let Some(pos) = s.timers.iter().position(|t| t.id == id)
+        {
+            s.timers.swap_remove(pos);
         }
     }
 }
@@ -413,6 +474,14 @@ impl SimWorld {
     /// Current virtual time (since the world started).
     pub fn now(&self) -> Duration {
         self.runtime.shared.lock().unwrap().now
+    }
+
+    /// Test-only: number of live entries in the timer set. Used by the timer-leak
+    /// regression tests to assert `Sleep` registers at most once and cleans up on
+    /// drop.
+    #[cfg(test)]
+    fn timer_count(&self) -> usize {
+        self.runtime.shared.lock().unwrap().timers.len()
     }
 
     /// Draw a deterministic `u64` from the world's seeded RNG. Use this to make
@@ -964,6 +1033,88 @@ mod tests {
             SimWorld::new(100).rng_u64(),
             "derive_seed must not consume from the primary rng stream"
         );
+    }
+
+    // ── timer registration / leak regression (issue #9) ──────────────────────
+
+    #[test]
+    fn repeated_poll_of_sleep_registers_at_most_one_timer() {
+        // Re-polling a still-pending Sleep must update its single entry in place,
+        // not push a duplicate on every poll (the original leak). Poll a fresh
+        // sleep many times without advancing time and assert the timer set never
+        // grows past one entry.
+        use futures_util::task::noop_waker;
+
+        let world = SimWorld::new(1);
+        let mut sleep = world.runtime().sleep(Duration::from_millis(100));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        for _ in 0..1000 {
+            assert!(sleep.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(
+                world.timer_count(),
+                1,
+                "each re-poll must reuse the single timer entry, not leak duplicates"
+            );
+        }
+
+        // Dropping the still-pending sleep removes its entry entirely.
+        drop(sleep);
+        assert_eq!(world.timer_count(), 0, "drop must clean up the entry");
+    }
+
+    #[test]
+    fn sleep_dropped_before_firing_leaves_no_timer() {
+        // A Sleep that registers and is then dropped before its deadline (a
+        // cancelled/timed-out await) must leave the timer set empty.
+        use futures_util::task::noop_waker;
+
+        let world = SimWorld::new(1);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        {
+            let mut sleep = world.runtime().sleep(Duration::from_secs(5));
+            assert!(sleep.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(world.timer_count(), 1, "poll registers exactly one timer");
+        } // sleep dropped here, before its 5s deadline is ever reached
+
+        assert_eq!(
+            world.timer_count(),
+            0,
+            "a Sleep dropped before firing must remove its timer entry"
+        );
+    }
+
+    #[test]
+    fn many_sleeps_dropped_do_not_accumulate_timers() {
+        // End-to-end: block_on a future that awaits a short sleep many times in a
+        // row. Each completed sleep is dropped when its await returns, so the
+        // timer set must stay bounded (was unbounded before the fix).
+        let mut world = SimWorld::new(3);
+        let rt = world.runtime().clone();
+        let shared = world.runtime().shared.clone();
+        let max_seen = Arc::new(Mutex::new(0usize));
+        let probe = max_seen.clone();
+
+        world.block_on(async move {
+            for _ in 0..100 {
+                rt.sleep(Duration::from_millis(1)).await;
+                let n = shared.lock().unwrap().timers.len();
+                let mut m = probe.lock().unwrap();
+                if n > *m {
+                    *m = n;
+                }
+            }
+        });
+
+        assert!(
+            *max_seen.lock().unwrap() <= 1,
+            "timer set must stay bounded across many sequential sleeps, saw {}",
+            *max_seen.lock().unwrap()
+        );
+        assert_eq!(world.timer_count(), 0, "all timers cleaned up at the end");
     }
 
     // ── adversarial scheduling (the buggify seam) ────────────────────────────
