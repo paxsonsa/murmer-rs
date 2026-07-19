@@ -52,7 +52,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 # Simulation runtime (feature = "sim"): deterministic, seedable PRNG for the
 # single-threaded sim executor. Kept out of the default build. (The executor
 # itself is hand-rolled in `sim.rs`; see `SimExecutor`.)
-rand_chacha = { version = "0.9", optional = true }
+rand_chacha = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
