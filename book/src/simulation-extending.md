@@ -27,7 +27,7 @@ not know about and the oracles that check your application's invariants.
 
 ## The seam primitives you build on
 
-Three primitives carry the whole Layer-3 pattern.
+Four primitives carry the whole Layer-3 pattern.
 
 **One seed, one root.** `world.derive_seed("vfs")` gives you an independent `u64`
 seeded off the world's root seed. You feed it into whatever PRNG your fault stream
@@ -74,6 +74,49 @@ through the runtime, not through `tokio::time` or `Instant::now`. The runtime's
 `sleep` and `now` are virtual under sim, so a fault that fires after a delay (a slow
 disk, a write that lands late) advances when the test advances the clock. If you
 reach for the real clock, your fault stops being deterministic and you have a hole.
+
+**The terminate hook.** Actor deregistration is normally instant. The supervisor
+loop breaks and the `DeregisterGuard` fires in `Drop`, which is synchronous, so
+there is no moment where an actor is stopped but still in the registry. Real
+systems are messier. An actor can accept its stop and then take time to drain a
+mailbox or tear down external resources, staying registered but not serving for a
+while. Callers have to tolerate that window, and you cannot test the tolerance if
+the window is zero-width.
+
+`Receptionist::set_terminate_hook` opens it. The hook is awaited between the
+supervisor exiting and the guard firing, so while it is pending the actor still
+shows up in `lookup`, still appears in listings, and its watches have not fired:
+
+```rust,ignore
+struct SlowToDie {
+    label: &'static str,
+    delay: Duration,
+    runtime: Arc<dyn Runtime>,
+}
+
+impl TerminateHook for SlowToDie {
+    fn before_deregister(&self, label: &str, _r: &TerminationReason) -> BoxFuture<'static, ()> {
+        if label == self.label {
+            self.runtime.sleep(self.delay)   // virtual time, like every other fault
+        } else {
+            Box::pin(std::future::ready(()))
+        }
+    }
+}
+
+world.system().receptionist().set_terminate_hook(Some(Arc::new(SlowToDie {
+    label: "cache/user",
+    delay: Duration::from_secs(5),
+    runtime: Arc::new(world.runtime().clone()),
+})));
+```
+
+Two things to know. The hook fires for every actor terminating on that node,
+including murmer's internal ones, so filter on the label you are handed. And it
+is a fault seam, not a place to do work: it runs on the supervisor's task and it
+holds the registry entry for as long as it stays pending, so a hook that never
+completes leaks the entry. It does not fire on the restart-limit-exceeded path,
+where the receptionist deregisters directly instead of through a supervisor exit.
 
 ## The shape of a Layer-3 add-on
 

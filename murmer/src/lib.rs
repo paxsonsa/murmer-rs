@@ -288,7 +288,8 @@ pub use client::{ClientOptions, MurmerClient};
 pub use cluster::net::sim_cluster::{DrainedEvents, SimCluster, SimClusterBuilder};
 pub use endpoint::Endpoint;
 pub use lifecycle::{
-    ActorFactory, ActorTerminated, BackoffConfig, RestartConfig, RestartPolicy, TerminationReason,
+    ActorFactory, ActorTerminated, BackoffConfig, RestartConfig, RestartPolicy, TerminateHook,
+    TerminationReason,
 };
 pub use listing::{Listing, ListingEvent, ReceptionKey, WatchedListing};
 pub use node::run_node_receiver;
