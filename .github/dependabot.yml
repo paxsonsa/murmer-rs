@@ -9,3 +9,23 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+    ignore:
+      # rand 0.10 is a breaking release and we cannot take it yet: foca types
+      # our SWIM state as `Foca<_, _, StdRng, _>`, so foca and murmer must agree
+      # on which `rand` that `StdRng` comes from. foca depends on `rand ^0.9`
+      # — including foca 1.0.0, checked 2026-07-27 — so bumping murmer alone
+      # puts two `rand` versions in the tree and every `apply_many`/
+      # `handle_timer`/`handle_data` call fails its trait bounds. rand_chacha
+      # 0.10 is the same story: it pairs with rand 0.10, and `SimRuntime`'s
+      # seeded ChaCha8Rng is the root of the whole determinism story.
+      #
+      # This suppressed PRs #21, #26 and #29, which were red for exactly this
+      # reason and could not be fixed on our side.
+      #
+      # REMOVE both entries once foca publishes a release built on rand 0.10;
+      # the two crates then move together in one PR. 0.9.x patches still come
+      # through, so security fixes are not suppressed.
+      - dependency-name: "rand"
+        versions: [">= 0.10"]
+      - dependency-name: "rand_chacha"
+        versions: [">= 0.10"]
