@@ -137,6 +137,20 @@ pub(crate) fn spawn_timer_manager(
             let next_deadline = heap.peek().map(|Reverse(s)| s.deadline);
 
             tokio::select! {
+                // Deterministic branch priority. Under a virtual clock,
+                // "a command arrives at the same instant a deadline is due" is
+                // common rather than rare, and an unbiased `select!` resolved it
+                // with Tokio's RNG — outside the sim seed's control, so a SWIM
+                // round could shift between runs of the same seed.
+                //
+                // Commands win. A `CancelAll` racing a due timer should cancel
+                // it, and an `Insert` with an earlier deadline than the current
+                // head should be visible before anything fires. Draining a burst
+                // of N commands costs N iterations, but `now` does not advance
+                // across them, so due timers still fire at the correct virtual
+                // time — the drain below is `deadline <= now`, not "one per
+                // wakeup". Nothing is lost or deferred in virtual time.
+                biased;
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(TimerCommand::Insert { timer, timer_id, delay }) => {
