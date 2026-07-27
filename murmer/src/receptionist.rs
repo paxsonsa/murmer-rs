@@ -32,8 +32,8 @@ use crate::actor::{Actor, ActorContext, RemoteDispatch};
 use crate::endpoint::Endpoint;
 use crate::instrument;
 use crate::lifecycle::{
-    ActorFactory, ActorTerminated, RestartConfig, RestartPolicy, SystemSignal, TerminationReason,
-    WatchEntry,
+    ActorFactory, ActorTerminated, RestartConfig, RestartPolicy, SystemSignal, TerminateHook,
+    TerminationReason, WatchEntry,
 };
 use crate::listing::{
     ErasedListingSender, ErasedReceptionKey, ErasedWatchedListingSender, Listing, ReceptionKey,
@@ -269,6 +269,12 @@ struct ReceptionistInner {
     /// The runtime seam: all supervisor/background spawns and timers go through
     /// this, so a deterministic `SimRuntime` can drive the whole node.
     runtime: Arc<dyn Runtime>,
+    /// Fault-injection seam: awaited between a supervisor's loop exiting and its
+    /// `DeregisterGuard` firing. `None` in production (one uncontended lock per
+    /// actor exit). Behind a `Mutex` rather than in `ReceptionistConfig` so a
+    /// test can install it on an already-built system, and swap it between
+    /// scenario phases.
+    terminate_hook: Mutex<Option<Arc<dyn TerminateHook>>>,
 }
 
 // =============================================================================
@@ -340,6 +346,7 @@ impl Receptionist {
                 pending_notifications: Mutex::new(Vec::new()),
                 blip_pending: Mutex::new(HashMap::new()),
                 runtime,
+                terminate_hook: Mutex::new(None),
             }),
         };
 
@@ -362,6 +369,25 @@ impl Receptionist {
     /// The runtime seam this receptionist (and its actors) run on.
     pub fn runtime(&self) -> &Arc<dyn Runtime> {
         &self.inner.runtime
+    }
+
+    /// Install (or clear, with `None`) the [`TerminateHook`] for actors on this
+    /// receptionist — the fault-injection seam that widens the window between a
+    /// supervisor exiting and the actor leaving the registry.
+    ///
+    /// Takes effect for every actor that terminates after this call; an actor
+    /// already waiting inside a previously-installed hook is unaffected.
+    ///
+    /// See [`TerminateHook`] for the contract — in particular that it fires for
+    /// *all* actors on the node, so a hook targeting one actor must filter on
+    /// the label it is passed.
+    pub fn set_terminate_hook(&self, hook: Option<Arc<dyn TerminateHook>>) {
+        *self.inner.terminate_hook.lock().unwrap() = hook;
+    }
+
+    /// The currently installed [`TerminateHook`], if any.
+    pub(crate) fn terminate_hook(&self) -> Option<Arc<dyn TerminateHook>> {
+        self.inner.terminate_hook.lock().unwrap().clone()
     }
 
     pub fn node_id(&self) -> &str {

@@ -836,6 +836,135 @@ mod tests {
         assert!(result.is_err(), "block_on should panic on a sim deadlock");
     }
 
+    /// A [`TerminateHook`] that makes one labelled actor slow to de-register,
+    /// on virtual time. Records the labels and reasons it saw.
+    struct SlowToDie {
+        label: &'static str,
+        delay: Duration,
+        runtime: SimRuntime,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl crate::lifecycle::TerminateHook for SlowToDie {
+        fn before_deregister(
+            &self,
+            label: &str,
+            reason: &TerminationReason,
+        ) -> BoxFuture<'static, ()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((label.to_string(), format!("{reason:?}")));
+            if label == self.label {
+                self.runtime.sleep(self.delay)
+            } else {
+                Box::pin(std::future::ready(()))
+            }
+        }
+    }
+
+    /// The fault-injection seam datastorekit needs: an actor that has accepted
+    /// its stop but is slow to die stays *registered but not serving* for the
+    /// hook's duration. Without the hook that window is zero-width, because
+    /// deregistration rides on `DeregisterGuard`'s synchronous `Drop`.
+    #[test]
+    fn terminate_hook_holds_a_dying_actor_registered() {
+        let mut world = SimWorld::new(7);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        world
+            .system()
+            .receptionist()
+            .set_terminate_hook(Some(Arc::new(SlowToDie {
+                label: "counter/dying",
+                delay: Duration::from_secs(5),
+                runtime: world.runtime().clone(),
+                seen: seen.clone(),
+            })));
+
+        let ep = world
+            .system()
+            .start("counter/dying", Counter, CounterState::default());
+        assert_eq!(world.send(&ep, Increment { amount: 1 }).unwrap(), 1);
+
+        world.system().stop("counter/dying");
+        world.pump();
+
+        // The supervisor has exited (stop accepted) and the hook has fired, but
+        // the guard has not: the actor is still discoverable.
+        assert_eq!(
+            &*seen.lock().unwrap(),
+            &[("counter/dying".to_string(), "Stopped".to_string())],
+            "hook should fire exactly once, with the clean-stop reason"
+        );
+        assert!(
+            world.system().lookup::<Counter>("counter/dying").is_some(),
+            "actor must stay registered while the terminate hook is pending"
+        );
+
+        // One second short of the hook's delay — still there.
+        world.advance(Duration::from_secs(4));
+        assert!(
+            world.system().lookup::<Counter>("counter/dying").is_some(),
+            "actor must stay registered until the hook's virtual delay elapses"
+        );
+
+        // Past it: the hook completes, the guard drops, the entry goes.
+        world.advance(Duration::from_secs(2));
+        assert!(
+            world.system().lookup::<Counter>("counter/dying").is_none(),
+            "actor must de-register once the terminate hook completes"
+        );
+    }
+
+    /// The delay is virtual-clock driven, so the window a fault test opens is a
+    /// pure function of the seed — the same property every other sim fault has.
+    #[test]
+    fn terminate_hook_deregistration_time_is_deterministic() {
+        fn dies_at(seed: u64) -> Duration {
+            let mut world = SimWorld::new(seed);
+            world
+                .system()
+                .receptionist()
+                .set_terminate_hook(Some(Arc::new(SlowToDie {
+                    label: "counter/dying",
+                    delay: Duration::from_secs(5),
+                    runtime: world.runtime().clone(),
+                    seen: Arc::new(Mutex::new(Vec::new())),
+                })));
+            let _ep = world
+                .system()
+                .start("counter/dying", Counter, CounterState::default());
+            world.system().stop("counter/dying");
+            world.pump();
+
+            // Step one virtual second at a time until the entry disappears.
+            for _ in 0..60 {
+                if world.system().lookup::<Counter>("counter/dying").is_none() {
+                    break;
+                }
+                world.advance(Duration::from_secs(1));
+            }
+            world.now()
+        }
+
+        assert_eq!(dies_at(1), Duration::from_secs(5));
+        assert_eq!(dies_at(1), dies_at(99), "seed must not change the window");
+    }
+
+    /// No hook installed (the production default) means no behavior change:
+    /// stopping an actor de-registers it without any clock advance.
+    #[test]
+    fn without_a_terminate_hook_deregistration_is_immediate() {
+        let mut world = SimWorld::new(7);
+        let _ep = world
+            .system()
+            .start("counter/dying", Counter, CounterState::default());
+        world.system().stop("counter/dying");
+        world.pump();
+        assert!(world.system().lookup::<Counter>("counter/dying").is_none());
+    }
+
     #[test]
     fn replay_is_stable_across_runs() {
         // Replay covers what SimWorld controls: task scheduling, virtual-time

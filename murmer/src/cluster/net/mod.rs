@@ -198,6 +198,19 @@ pub async fn run_control_stream_writer(
 ) {
     loop {
         tokio::select! {
+            // Deterministic branch priority: an unbiased `select!` here picks
+            // between "write the queued frame" and "we were cancelled" using
+            // Tokio's own RNG, which the sim seed does not control — so a
+            // shutdown racing a queued write was silently nondeterministic.
+            //
+            // Shutdown wins deliberately. `SimCluster::crash` models an abrupt
+            // crash by cancelling this token, and a crashed node that first
+            // flushed its pending control frames would be an unrealistically
+            // graceful corpse. Cancellation drops the queue, as a real crash
+            // does. In the happy path `cancelled()` is pending, so the write
+            // arm runs exactly as before.
+            biased;
+            _ = shutdown.cancelled() => break,
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
                 let frame = match framing::encode_message(&msg) {
@@ -212,7 +225,6 @@ pub async fn run_control_stream_writer(
                     break;
                 }
             }
-            _ = shutdown.cancelled() => break,
         }
     }
     let _ = send.finish();
@@ -280,10 +292,15 @@ pub async fn run_control_stream_reader(
         },
     );
     tokio::select! {
+        // Deterministic branch priority, same reasoning as the writer above:
+        // a cancelled node stops reading inbound frames rather than finishing
+        // the pump, so a crash looks like a crash. `cancelled()` is pending in
+        // the happy path, so the pump runs unchanged.
+        biased;
+        _ = shutdown.cancelled() => {}
         result = pump => match result {
             Ok(()) => tracing::debug!("Control stream from {node_id} closed"),
             Err(e) => tracing::warn!("Control stream read error from {node_id}: {e}"),
         },
-        _ = shutdown.cancelled() => {}
     }
 }

@@ -13,6 +13,11 @@
 //!
 //! On exit, the `DeregisterGuard` RAII type automatically removes the actor
 //! from the receptionist and fires any registered watches.
+//!
+//! Between those two events sits the [`TerminateHook`](crate::lifecycle::TerminateHook)
+//! seam: a fault-injection point that holds the actor in the "stopped but still
+//! registered" state a test otherwise can't reach, because deregistration rides
+//! on a synchronous `Drop`. `None` in production.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -159,6 +164,17 @@ where
             }
         }
     }
+    // Fault-injection seam. The loop has exited — this actor no longer serves
+    // messages — but its `DeregisterGuard` has not fired, so it is still in the
+    // receptionist: `lookup` finds it, listings include it, watches are silent.
+    // Awaiting here holds the actor in that "accepted its stop, not yet gone"
+    // state, which is zero-width otherwise (deregistration rides on a
+    // synchronous `Drop`) and therefore untestable. `None` in production.
+    if let Some(hook) = ctx.receptionist.terminate_hook() {
+        let reason = exit_reason.lock().unwrap().clone();
+        hook.before_deregister(&ctx.label, &reason).await;
+    }
+
     // _deregister_guard is dropped here → calls receptionist.deregister_with_reason(label, reason)
     (mailbox_rx, dispatch_rx)
 }
@@ -376,5 +392,50 @@ mod tests {
             }
         }
         assert_eq!(delivered, FLOOD, "every local message should be handled");
+    }
+
+    /// The terminate hook is a real seam on the production (Tokio) path too, not
+    /// just under simulation — the sim tests in `sim.rs` cover the virtual-clock
+    /// behavior; this one covers that the branch is live on `TokioRuntime`.
+    #[tokio::test]
+    async fn terminate_hook_delays_deregistration_on_the_tokio_path() {
+        use crate::lifecycle::TerminateHook;
+        use crate::runtime::{BoxFuture, Runtime, TokioRuntime};
+        use std::time::Duration;
+
+        struct SlowToDie;
+
+        impl TerminateHook for SlowToDie {
+            fn before_deregister(
+                &self,
+                label: &str,
+                _reason: &TerminationReason,
+            ) -> BoxFuture<'static, ()> {
+                assert_eq!(label, "flood/dying");
+                // Through the seam, like a real hook would: the same impl works
+                // unchanged when handed a `SimRuntime` instead.
+                TokioRuntime.sleep(Duration::from_millis(200))
+            }
+        }
+
+        let receptionist = Receptionist::new();
+        receptionist.set_terminate_hook(Some(Arc::new(SlowToDie)));
+
+        let _ep = receptionist.start("flood/dying", FloodActor, FloodState { local_processed: 0 });
+        receptionist.stop("flood/dying");
+
+        // Well inside the hook's delay: stop accepted, actor still registered.
+        TokioRuntime.sleep(Duration::from_millis(50)).await;
+        assert!(
+            receptionist.lookup::<FloodActor>("flood/dying").is_some(),
+            "actor must stay registered while the terminate hook is pending"
+        );
+
+        // Past it: the hook completes, the guard drops, the entry goes.
+        TokioRuntime.sleep(Duration::from_millis(300)).await;
+        assert!(
+            receptionist.lookup::<FloodActor>("flood/dying").is_none(),
+            "actor must de-register once the terminate hook completes"
+        );
     }
 }
