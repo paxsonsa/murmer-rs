@@ -214,6 +214,92 @@ pub trait ActorFactory: Send + 'static {
     fn create(&mut self) -> (Self::Actor, <Self::Actor as Actor>::State);
 }
 
+// =============================================================================
+// TERMINATE HOOK (fault-injection seam)
+// =============================================================================
+
+/// Fault-injection seam fired between an actor's supervisor loop exiting and
+/// the actor's removal from the receptionist.
+///
+/// # Why this exists
+///
+/// Deregistration is normally instantaneous: the supervisor loop breaks and the
+/// `DeregisterGuard` fires in `Drop`, which is synchronous. Real systems are not
+/// so tidy — an actor can accept its stop, then take time to drain a mailbox or
+/// tear down external resources, staying *registered but not serving* for a
+/// while. Callers must tolerate that window (murmer's own eviction paths wait on
+/// deregistration with a deadline), but without a seam there is no way to *test*
+/// that tolerance, because the window is zero-width by construction.
+///
+/// Install a hook and the returned future is awaited inside that window. While
+/// it is pending the actor is still in the receptionist — `lookup` finds it,
+/// listings include it, watches have not fired — and its supervisor is no longer
+/// processing messages. That is precisely the "slow to die" state.
+///
+/// # Determinism
+///
+/// The hook returns a future, so a simulation test builds its delay from the
+/// [`Runtime`](crate::runtime::Runtime) seam (`runtime.sleep(d)`) and the wait
+/// runs on virtual time — reproducible from the world seed like everything else.
+/// Do not sleep on wall-clock time inside a hook used under simulation.
+///
+/// # Scope
+///
+/// This is a test/fault-injection seam. It is not a place to do real work:
+/// it runs on the supervisor's task, it blocks the actor's deregistration for as
+/// long as it is pending, and a hook that never completes leaks a registry entry.
+/// It fires on every terminating actor on the node, including murmer's internal
+/// ones, so a hook that only wants one actor must filter on `label`.
+///
+/// It does *not* fire on the restart-limit-exceeded path
+/// (`TerminationReason::RestartLimitExceeded`), where the receptionist
+/// deregisters directly rather than through a supervisor exit.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use murmer::lifecycle::{TerminateHook, TerminationReason};
+/// use murmer::runtime::{BoxFuture, Runtime};
+/// use std::sync::Arc;
+/// use std::time::Duration;
+///
+/// /// Makes one labelled actor take `delay` of virtual time to de-register.
+/// struct SlowToDie {
+///     label: String,
+///     delay: Duration,
+///     runtime: Arc<dyn Runtime>,
+/// }
+///
+/// impl TerminateHook for SlowToDie {
+///     fn before_deregister(
+///         &self,
+///         label: &str,
+///         _reason: &TerminationReason,
+///     ) -> BoxFuture<'static, ()> {
+///         if label == self.label {
+///             self.runtime.sleep(self.delay)
+///         } else {
+///             Box::pin(std::future::ready(()))
+///         }
+///     }
+/// }
+///
+/// world.system().receptionist().set_terminate_hook(Some(Arc::new(SlowToDie {
+///     label: "cache/user".into(),
+///     delay: Duration::from_secs(5),
+///     runtime: Arc::new(world.runtime().clone()),
+/// })));
+/// ```
+pub trait TerminateHook: Send + Sync + 'static {
+    /// Called with the terminating actor's label and exit reason. The actor is
+    /// still registered until the returned future completes.
+    fn before_deregister(
+        &self,
+        label: &str,
+        reason: &TerminationReason,
+    ) -> crate::runtime::BoxFuture<'static, ()>;
+}
+
 /// Internal: signals delivered to actors from the system.
 pub(crate) enum SystemSignal {
     ActorTerminated(ActorTerminated),
