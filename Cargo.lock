@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "murmer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-cluster-tests"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bincode",
  "iroh",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-examples"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bincode",
  "iroh",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "murmer-macros"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "proc-macro2",
  "quote",
