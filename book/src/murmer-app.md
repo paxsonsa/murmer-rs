@@ -8,7 +8,7 @@ Enable the feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-murmer = { version = "0.3", features = ["app"] }
+murmer = { version = "0.4", features = ["app"] }
 ```
 
 ## Overview

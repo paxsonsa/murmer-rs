@@ -6,7 +6,7 @@ This chapter goes deeper into the components you saw in the [introduction](./int
 
 ```toml
 [dependencies]
-murmer = "0.3"
+murmer = "0.4"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```

@@ -10,7 +10,7 @@ Enable the `sim` feature:
 
 ```toml
 [dev-dependencies]
-murmer = { version = "0.3", features = ["sim"] }
+murmer = { version = "0.4", features = ["sim"] }
 ```
 
 ## The idea
