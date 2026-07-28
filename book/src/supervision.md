@@ -106,6 +106,42 @@ When a supervised actor restarts:
 
 This means endpoints held by other actors remain valid through restarts — messages sent during the brief restart window are queued in the supervisor's mailbox and delivered to the new instance.
 
+### Deregistration on termination
+
+When a supervisor exits, whatever the reason, a `DeregisterGuard` removes the
+actor from the receptionist and fires any watches. That guard runs in `Drop`, so
+in normal operation deregistration is instantaneous. There is no moment where an
+actor has stopped serving messages but is still discoverable.
+
+Real deployments are messier. An actor can accept its stop and then take time to
+drain a mailbox or tear down an external resource, staying registered but not
+serving for a while. Code that waits on deregistration has to tolerate that
+window, and the tolerance is hard to test when the window is zero-width by
+construction.
+
+`Receptionist::set_terminate_hook` opens it:
+
+```rust,ignore
+receptionist.set_terminate_hook(Some(Arc::new(my_hook)));  // None clears it
+```
+
+The hook is awaited between the supervisor exiting and the guard firing. While
+it is pending, `lookup` still finds the actor, listings still include it, and its
+watches have not fired. It returns a future rather than taking a duration, so
+under simulation you build the delay from the runtime seam and the window runs
+on virtual time, reproducible from the seed.
+
+It is a fault-injection seam. Do not do real work in it. It runs on the
+supervisor's task and holds the registry entry for as long as it stays pending,
+so a hook that never completes leaks the entry. It fires for every actor
+terminating on the node, including murmer's internal ones, so a hook aimed at one
+actor has to filter on the label it is handed. It does not fire on the
+restart-limit-exceeded path, where the receptionist deregisters directly instead
+of through a supervisor exit.
+
+See [Extending Simulation](./simulation-extending.md) for a worked example that
+holds one named actor in that state for five seconds of virtual time.
+
 ## Watching actors
 
 Any actor can monitor another actor for termination using `ctx.watch()`. When the watched actor terminates (for any reason), the watcher receives an `ActorTerminated` notification via `on_actor_terminated`.

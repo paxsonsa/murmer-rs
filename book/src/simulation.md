@@ -98,6 +98,14 @@ complete (every task is parked, no timer is pending). That almost always means
 the future is awaiting a reply or message that no actor will ever send, which is
 a real bug worth seeing.
 
+Actor teardown has a fault seam of its own. `Receptionist::set_terminate_hook`
+holds an actor in the "accepted its stop, not yet deregistered" state for as long
+as you like on the virtual clock. That state is zero-width in normal operation,
+because deregistration rides on a synchronous `Drop`, so without the hook there
+is no way to test the code that waits on it. See
+[Supervision](./supervision.md) for the contract and
+[Extending Simulation](./simulation-extending.md) for a worked example.
+
 ## Running a whole actor stack
 
 The first test showed one actor. The thing you will actually do most is stand up
