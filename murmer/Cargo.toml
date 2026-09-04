@@ -35,7 +35,7 @@ murmer-macros = { workspace = true, optional = true }
 
 # Networking & clustering
 rustls = { version = "0.23", features = ["ring"] }
-foca = { version = "0.19", features = ["bincode-codec"] }
+foca = { version = "1.0", features = ["bincode-codec"] }
 mdns-sd = "0.20"
 rand = { workspace = true }
 bytes = "1"
