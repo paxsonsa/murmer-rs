@@ -520,7 +520,7 @@ impl SimWorld {
     fn drain_inbox(&mut self) {
         let futs: Vec<BoxFuture<'static, ()>> = {
             let mut s = self.runtime.shared.lock().unwrap();
-            s.inbox.drain(..).collect()
+            std::mem::take(&mut s.inbox)
         };
         for fut in futs {
             // The inbox holds `Send` futures (`BoxFuture`); the executor stores
