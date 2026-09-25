@@ -19,6 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --all-features
 
   test:
     name: Test
@@ -29,6 +30,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
+      - run: cargo nextest run --workspace --all-features
 
   # The deterministic-simulation suites. These run the sim runtime + the
   # multi-node fault rig and never ran under the default-feature `test` job,
@@ -76,6 +78,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p murmer --features sim,app --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   fmt:
     name: Format

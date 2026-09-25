@@ -38,6 +38,8 @@
 //! ```
 
 pub mod events;
+// Preserve the public murmer::monitor::monitor module path.
+#[allow(clippy::module_inception)]
 pub mod monitor;
 pub mod prometheus_setup;
 
